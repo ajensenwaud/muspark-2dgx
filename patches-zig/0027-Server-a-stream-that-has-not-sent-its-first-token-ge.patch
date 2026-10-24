@@ -1,0 +1,444 @@
+From f69db943e6b1b097dc5f6b38154c34c0c8508f72 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 14:53:36 +0700
+Subject: [PATCH 27/60] Server: a stream that has not sent its first token gets
+ keepalives every TF_SSE_KEEPALIVE_S seconds (default 15).
+
+Queueing and a long prefill send nothing after the head, and clients or proxies
+that time out a silent body leave and retry from zero. Chat, completions and
+responses streams get an SSE comment (": keepalive"); Anthropic streams get its
+ping event. A keepalive that cannot be written cancels the request as a client
+that left.
+
+(cherry picked from commit 9fbc2b3edc2e772d28124dfea2da0a0be554de86)
+---
+ zig/src/server/anthropic.zig       |  8 +++-
+ zig/src/server/chat_generation.zig | 13 ++++++
+ zig/src/server/drain_test.zig      | 29 ++++++++----
+ zig/src/server/keepalive_test.zig  | 75 ++++++++++++++++++++++++++++++
+ zig/src/server/openai.zig          | 21 ++++++++-
+ zig/src/server/openai_run.zig      |  5 +-
+ zig/src/server/responses.zig       |  7 ++-
+ zig/src/server/root.zig            |  1 +
+ zig/src/server/serve.zig           |  7 ++-
+ zig/src/server/server.zig          |  2 +
+ zig/src/server/sse.zig             |  5 ++
+ 11 files changed, 158 insertions(+), 15 deletions(-)
+ create mode 100644 zig/src/server/keepalive_test.zig
+
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index a8ec8132..f1d8e0ec 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -105,7 +105,7 @@ const Wire = struct {
+     payload: Value = .null,
+ 
+     fn out(w: *Wire) openai.Out {
+-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = ping } };
+     }
+ 
+     fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
+@@ -130,6 +130,12 @@ const Wire = struct {
+         w.status = status;
+         w.payload = payload;
+     }
++
++    /// Anthropic's own keepalive event.
++    fn ping(ctx: *anyopaque) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        return w.reply.send("ping", try w.reply.obj("ping"));
++    }
+ };
+ 
+ const Call = struct { id: []const u8 = "", name: []const u8 = "", arguments: []const u8 = "", sent: usize = 0, done: bool = false };
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index bf315753..5a074d42 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -75,6 +75,8 @@ pub const Generation = struct {
+     streaming_done: bool = false,
+     first_ns: ?i96 = null,
+     last_ns: ?i96 = null,
++    /// when the stream last carried bytes (a keepalive goes out after a silence)
++    wrote_ns: ?i96 = null,
+     reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
+     engine_done: bool = false,
+     consumed: usize = 0,
+@@ -166,6 +168,7 @@ pub const Generation = struct {
+             g.cancel();
+             return error.Cancelled;
+         };
++        g.wrote_ns = nowNs(g.srv.io);
+     }
+ 
+     pub const cancel = chat.cancel; // in chat.zig with its doc
+@@ -206,6 +209,16 @@ pub const Generation = struct {
+                 g.cancel();
+                 return error.Cancelled;
+             }
++            if (chunk == null and @hasDecl(@TypeOf(gone), "beat")) {
++                // queueing and a long prefill send nothing: a client that times out a silent stream would leave
++                const now = nowNs(g.srv.io);
++                const since = g.wrote_ns orelse now;
++                if (g.wrote_ns == null) g.wrote_ns = now;
++                if (gone.beat(now - since) catch {
++                    g.cancel();
++                    return error.Cancelled;
++                }) g.wrote_ns = now;
++            }
+             const tokens = chunk orelse continue;
+             if (g.reason == null) try g.commit(tokens);
+         }
+diff --git a/zig/src/server/drain_test.zig b/zig/src/server/drain_test.zig
+index 2bdc9f4a..411b651c 100644
+--- a/zig/src/server/drain_test.zig
++++ b/zig/src/server/drain_test.zig
+@@ -10,7 +10,7 @@ const Allocator = std.mem.Allocator;
+ const testing = std.testing;
+ 
+ /// Slow enough to stop mid-reply: "@short" ends after a dozen tokens, "@long" only when halted or cancelled.
+-const Slow = struct {
++pub const Slow = struct {
+     gpa: Allocator,
+     io: std.Io,
+     halted: std.atomic.Value(bool) = .init(false),
+@@ -65,6 +65,15 @@ const Slow = struct {
+         for (r.prompt, prompt) |t, *b| b.* = @truncate(t);
+         const long = std.mem.indexOf(u8, prompt, "@long") != null;
+         const word: []const u32 = if (long) &.{ ' ', 'l', 'a' } else &.{ ' ', 'o', 'k' };
++        const hang = std.mem.indexOf(u8, prompt, "@hang") != null;
++        const wait = std.mem.indexOf(u8, prompt, "@wait") != null;
++        // a long prefill: nothing for 800 ms ("@wait"), or nothing until stopped ("@hang")
++        var quiet: u32 = 0;
++        while (hang or (wait and quiet < 80)) : (quiet += 1) {
++            if (s.halted.load(.acquire)) return sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .failed, .message = s.reason } });
++            if (s.cancelled.load(.acquire) == id) return sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .cancelled } });
++            std.Io.sleep(s.io, .fromMilliseconds(10), .awake) catch {};
++        }
+         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+         var n: usize = 0;
+         while (true) : (n += 1) {
+@@ -93,7 +102,7 @@ const Slow = struct {
+ };
+ 
+ /// Bytes as tokens; a prompt renders as its messages' JSON, so the engine sees the client's marker.
+-const TestText = struct {
++pub const TestText = struct {
+     fn text(t: *@This()) model_text.Text {
+         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
+     }
+@@ -135,16 +144,16 @@ const TestText = struct {
+     }
+ };
+ 
+-var listen_port: std.atomic.Value(u16) = .init(0);
++pub var listen_port: std.atomic.Value(u16) = .init(0);
+ 
+ fn onListen(port: u16) void {
+     listen_port.store(port, .release);
+ }
+ 
+-const Reply = struct { status: u16, head: []const u8, body: []const u8 };
++pub const Reply = struct { status: u16, head: []const u8, body: []const u8 };
+ 
+ /// One request on its own connection (closed by us after it), the whole response read.
+-fn request(a: Allocator, io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8) !Reply {
++pub fn request(a: Allocator, io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8) !Reply {
+     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+     const stream = try addr.connect(io, .{ .mode = .stream });
+     defer stream.close(io);
+@@ -175,7 +184,7 @@ fn unchunk(a: Allocator, s: []const u8) ![]const u8 {
+     return out.items;
+ }
+ 
+-const Background = struct {
++pub const Background = struct {
+     a: Allocator,
+     io: std.Io,
+     port: u16,
+@@ -191,11 +200,11 @@ const Background = struct {
+     }
+ };
+ 
+-fn chatBody(a: Allocator, marker: []const u8, stream: bool) ![]const u8 {
++pub fn chatBody(a: Allocator, marker: []const u8, stream: bool) ![]const u8 {
+     return std.fmt.allocPrint(a, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"go {s}\"}}],\"stream\":{},\"max_tokens\":4000}}", .{ marker, stream });
+ }
+ 
+-const Served = struct {
++pub const Served = struct {
+     code: u8 = 255,
+     fn run(x: *Served, gpa: Allocator, io: std.Io, setup: serve.Setup) void {
+         x.code = serve.run(gpa, io, .{ .host = "127.0.0.1", .port = 0 }, setup);
+@@ -203,7 +212,7 @@ const Served = struct {
+ };
+ 
+ /// serve.run on its own thread with `drain_s`, the engine `slow`; the port once it listens.
+-fn start(gpa: Allocator, io: std.Io, env: *std.process.Environ.Map, slow: *Slow, tt: *TestText, x: *Served) !std.Thread {
++pub fn start(gpa: Allocator, io: std.Io, env: *std.process.Environ.Map, slow: *Slow, tt: *TestText, x: *Served) !std.Thread {
+     listen_port.store(0, .release);
+     const t = try std.Thread.spawn(.{}, Served.run, .{ x, gpa, io, serve.Setup{
+         .engine = slow.engine(),
+@@ -217,7 +226,7 @@ fn start(gpa: Allocator, io: std.Io, env: *std.process.Environ.Map, slow: *Slow,
+     return t;
+ }
+ 
+-fn waitActive(io: std.Io, slow: *Slow, n: u32) void {
++pub fn waitActive(io: std.Io, slow: *Slow, n: u32) void {
+     while (slow.active.load(.acquire) < n) std.Io.sleep(io, .fromMilliseconds(2), .awake) catch {};
+ }
+ 
+diff --git a/zig/src/server/keepalive_test.zig b/zig/src/server/keepalive_test.zig
+new file mode 100644
+index 00000000..43435c1d
+--- /dev/null
++++ b/zig/src/server/keepalive_test.zig
+@@ -0,0 +1,75 @@
++//! A silent stream keeps its client: keepalives on both routes before the first token; a failed one ends the request.
++const std = @import("std");
++const server = @import("server.zig");
++const d = @import("drain_test.zig");
++const testing = std.testing;
++
++/// A raw request whose response is read until the connection ends.
++fn messagesBody(a: std.mem.Allocator, marker: []const u8) ![]const u8 {
++    return std.fmt.allocPrint(a, "{{\"model\":\"x\",\"max_tokens\":50,\"stream\":true,\"messages\":[{{\"role\":\"user\",\"content\":\"go {s}\"}}]}}", .{marker});
++}
++
++/// Sends `body` streamed and hangs up once the response head arrived and the request reached `slow`.
++fn leave(a: std.mem.Allocator, io: std.Io, port: u16, body: []const u8, slow: *d.Slow) !void {
++    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
++    const stream = try addr.connect(io, .{ .mode = .stream });
++    defer stream.close(io);
++    const head = try std.fmt.allocPrint(a, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
++    var wbuf: [4096]u8 = undefined;
++    var w = std.Io.net.Stream.Writer.init(stream, io, &wbuf);
++    try w.interface.writeAll(head);
++    try w.interface.flush();
++    var rbuf: [64]u8 = undefined;
++    var r = std.Io.net.Stream.Reader.init(stream, io, &rbuf);
++    _ = try r.interface.peek(1);
++    // the head goes out before the engine has the request: a hang-up before that leaves nothing to cancel
++    d.waitActive(io, slow, 1);
++}
++
++test "a silent engine's stream gets keepalives before its first token (chat: SSE comments, messages: ping events)" {
++    const period = comptime std.meta.fieldInfo(server.Config, .sse_keepalive_s).attrs.defaultValue(f64).?;
++    try testing.expect(period > 0 and period <= 15);
++    const gpa = testing.allocator;
++    const io = testing.io;
++    var tt: d.TestText = .{};
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var env = std.process.Environ.Map.init(gpa);
++    defer env.deinit();
++    try env.put("TENSORFOLD_NO_LIVE", "1");
++    try env.put("TF_DRAIN_S", "5");
++    try env.put("TF_SSE_KEEPALIVE_S", "0.1");
++    var slow: d.Slow = .{ .gpa = gpa, .io = io };
++    var x: d.Served = .{};
++    const t = try d.start(gpa, io, &env, &slow, &tt, &x);
++    const port = d.listen_port.load(.acquire);
++
++    const chat = try d.request(a, io, port, "POST", "/v1/chat/completions", try d.chatBody(a, "@wait", true));
++    try testing.expectEqual(@as(u16, 200), chat.status);
++    const first_token = std.mem.indexOf(u8, chat.body, "\" ok\"") orelse {
++        std.debug.print("{s}\n", .{chat.body[0..@min(chat.body.len, 1500)]});
++        return error.NoToken;
++    };
++    try testing.expect(std.mem.count(u8, chat.body[0..first_token], ": keepalive\n\n") >= 3);
++    try testing.expect(std.mem.indexOf(u8, chat.body, "data: [DONE]") != null);
++
++    const msg = try d.request(a, io, port, "POST", "/v1/messages", try messagesBody(a, "@wait"));
++    try testing.expectEqual(@as(u16, 200), msg.status);
++    const start = std.mem.indexOf(u8, msg.body, "event: message_start") orelse return error.NoStart;
++    const ping = std.mem.indexOf(u8, msg.body, "event: ping\ndata: {\"type\": \"ping\"}") orelse return error.NoPing;
++    const delta = std.mem.indexOf(u8, msg.body, "event: content_block_delta") orelse return error.NoDelta;
++    try testing.expect(start < ping and ping < delta);
++
++    // a client that leaves a silent stream: the request is cancelled (the disconnect poll or a failed keepalive)
++    var idle: u32 = 0;
++    while (slow.active.load(.acquire) > 0 and idle < 300) : (idle += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
++    try leave(a, io, port, try d.chatBody(a, "@hang", true), &slow);
++    var waited: u32 = 0;
++    while (slow.cancelled.load(.acquire) == 0 and waited < 300) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
++    try testing.expect(slow.cancelled.load(.acquire) != 0);
++
++    try std.posix.raise(.TERM);
++    t.join();
++    try testing.expectEqual(@as(u8, 0), x.code);
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 70bf4141..36d7e3bb 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -38,6 +38,8 @@ pub const Out = struct {
+         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
+         /// A whole JSON reply.
+         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
++        /// Bytes that keep a silent stream alive (an SSE comment, or the API's ping); null: none.
++        keepalive: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+     };
+ };
+ 
+@@ -58,7 +60,7 @@ const ClientOut = struct {
+     a: Allocator,
+ 
+     fn out(c: *ClientOut) Out {
+-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
++        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
+     }
+ 
+     fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
+@@ -75,14 +77,31 @@ const ClientOut = struct {
+         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+         routes.sendValue(c.conn, c.a, status, payload);
+     }
++
++    fn keepalive(ctx: *anyopaque) error{Closed}!void {
++        const c: *ClientOut = @ptrCast(@alignCast(ctx));
++        return sse.comment(c.conn);
++    }
+ };
+ 
+ /// Whether the client has gone, read between rounds (Python's socket_cancellation).
+ pub const Gone = struct {
+     conn: *Conn,
++    /// The stream a keepalive goes to once it has been silent `every_ns` (0: never)
++    out: ?Out = null,
++    every_ns: i96 = 0,
+     pub fn check(g: Gone) bool {
+         return g.conn.peerGone();
+     }
++
++    /// A keepalive if the stream has been silent long enough; a failed write means the client left.
++    pub fn beat(g: Gone, silent_ns: i96) error{Closed}!bool {
++        const o = g.out orelse return false;
++        const send = o.vt.keepalive orelse return false;
++        if (g.every_ns <= 0 or silent_ns < g.every_ns) return false;
++        try send(o.ctx);
++        return true;
++    }
+ };
+ 
+ /// ``error_body``: OpenAI's error object, with param and code where clients key on them.
+diff --git a/zig/src/server/openai_run.zig b/zig/src/server/openai_run.zig
+index d6cb2b46..9f045dae 100644
+--- a/zig/src/server/openai_run.zig
++++ b/zig/src/server/openai_run.zig
+@@ -279,8 +279,11 @@ pub const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
++        var live = gone;
++        live.out = r.out;
++        live.every_ns = @intFromFloat(r.srv.config.sse_keepalive_s * std.time.ns_per_s);
+         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call };
+-        var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
++        var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, live) else chat.generate(r.srv, &cx, prepared, sink, live)) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+diff --git a/zig/src/server/responses.zig b/zig/src/server/responses.zig
+index 2e096025..598d4b33 100644
+--- a/zig/src/server/responses.zig
++++ b/zig/src/server/responses.zig
+@@ -203,7 +203,7 @@ const Wire = struct {
+     payload: Value = .null,
+ 
+     fn out(w: *Wire) openai.Out {
+-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = keepalive } };
+     }
+ 
+     fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
+@@ -223,6 +223,11 @@ const Wire = struct {
+         w.status = status;
+         w.payload = payload;
+     }
++
++    fn keepalive(ctx: *anyopaque) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        return sse.comment(w.reply.conn);
++    }
+ };
+ 
+ /// A Response built from chat-completion deltas, in order: reasoning, text, calls; streamed as typed events.
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index af6e3057..0db752b8 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -44,6 +44,7 @@ test {
+     _ = @import("stream_dsml_test.zig");
+     _ = @import("logprobs_test.zig");
+     _ = @import("drain_test.zig");
++    _ = @import("keepalive_test.zig");
+     _ = @import("late_system_test.zig");
+     _ = @import("compact_test.zig");
+     _ = @import("completion_prompt_test.zig");
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index e83a9bbf..4fa490d1 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -135,6 +135,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         std.debug.print("tensorfold: TF_DRAIN_S: seconds, a number >= 0\n", .{});
+         return 1;
+     };
++    const keepalive_s = seconds(env(s, "TF_SSE_KEEPALIVE_S"), 15) orelse {
++        std.debug.print("tensorfold: TF_SSE_KEEPALIVE_S: seconds, a number >= 0\n", .{});
++        return 1;
++    };
+     const config: server_mod.Config = .{
+         .served_name = s.served,
+         .model_dir = s.model_dir,
+@@ -148,6 +152,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .default_sampling = s.sampling,
+         .use_drafts = !args.no_drafts,
+         .seed_salt = salt,
++        .sse_keepalive_s = keepalive_s,
+         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
+         .dashboard = args.dashboard,
+         .family = s.family,
+@@ -239,7 +244,7 @@ fn drain(srv: *server_mod.Server, io: std.Io, stop: ?EngineStop, drain_s: f64) v
+     while (srv.generating.load(.seq_cst) > 0 and waited < 100) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+ }
+ 
+-/// A seconds setting (TF_DRAIN_S): unset or blank keeps the default; null: not a number >= 0.
++/// A seconds setting (TF_DRAIN_S, TF_SSE_KEEPALIVE_S): unset or blank keeps the default; null: not a number >= 0.
+ fn seconds(raw: ?[]const u8, default: f64) ?f64 {
+     const t = std.mem.trim(u8, raw orelse "", " \t");
+     if (t.len == 0) return default;
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 79efe48e..505fbdc3 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -63,6 +63,8 @@ pub const Config = struct {
+     /// BRAVE_SEARCH_API_KEY: Cortheon searches through Brave instead of DuckDuckGo.
+     cortheon_search_key: ?[]const u8 = null,
+     timeouts: http_conn.Timeouts = .{},
++    /// TF_SSE_KEEPALIVE_S: a silent stream's keepalive period before its first token (serve.zig; 0: none)
++    sse_keepalive_s: f64 = 15,
+     /// The checkpoint family's own chat rules (family.zig); null: the chat template path.
+     family: ?family_mod.Family = null,
+ };
+diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
+index de30ac12..bcdcf56f 100644
+--- a/zig/src/server/sse.zig
++++ b/zig/src/server/sse.zig
+@@ -19,6 +19,11 @@ pub fn data(conn: *Conn, a: Allocator, payload: json.Value) error{Closed}!void {
+     return conn.writeAll(std.mem.concat(a, u8, &.{ "data: ", text, "\n\n" }) catch return error.Closed);
+ }
+ 
++/// An SSE comment line, which clients skip: it keeps a stream alive while nothing else is sent.
++pub fn comment(conn: *Conn) error{Closed}!void {
++    return conn.writeAll(": keepalive\n\n");
++}
++
+ pub fn done(conn: *Conn) error{Closed}!void {
+     return conn.writeAll("data: [DONE]\n\n");
+ }
+-- 
+2.53.0
+

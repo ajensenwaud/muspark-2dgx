@@ -1,0 +1,47 @@
+From b53a488010bf68f9c5d729a84a03944194633f5f Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:17:56 +1100
+Subject: [PATCH 3/3] convert: --no_compile, stop after the last module without
+ compiling
+
+For split conversions: a job resumed from a state produced elsewhere holds only
+some modules' qtensors in its work dir, so compiling there cannot succeed. The
+modules are compiled later from a merged work dir resumed past the last module.
+---
+ exllamav3/conversion/convert_model.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/exllamav3/conversion/convert_model.py b/exllamav3/conversion/convert_model.py
+index b91089e..ab96e17 100644
+--- a/exllamav3/conversion/convert_model.py
++++ b/exllamav3/conversion/convert_model.py
+@@ -99,6 +99,7 @@ parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Fa
+ parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
+ parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
+ parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
++parser.add_argument("--no_compile", action = "store_true", help = "Stop after the last module without compiling the output model (split conversions: this work dir holds only some modules' qtensors; compile from a merged work dir resumed past the last module)")
+ 
+ group = parser.add_mutually_exclusive_group()
+ group.add_argument("--out_scales", type = str, default = "auto", choices = ["auto", "always", "never", "yaqa"], help = "Output channel scales: always, never, auto (default): always, except for gate and up projections of gated MLPs whose calibration statistics predict a lower error without, or yaqa: per-channel scales that account for how much each output channel matters, from the diagonal of the output-side Hessians in --hessians (tensors without one are treated as in auto)")
+@@ -316,6 +317,7 @@ def prepare(args) -> (dict, dict, bool, str):
+     if in_args["hessians_one_sided"] and not in_args["hessians"]:
+         return None, None, False, "--hessians_one_sided needs --hessians"
+     in_args["max_module"] = args.max_module
++    in_args["no_compile"] = args.no_compile
+ 
+     if args.resume:
+         job_state = load_dict("ckpt/job.json", in_args)
+@@ -1683,6 +1685,10 @@ def main(args, job_state):
+     if vision_model:
+         quantize_side_model(vision_model, "vision model")
+ 
++    if args.get("no_compile"):
++        print(" -- All modules done, not compiling (--no_compile)")
++        return
++
+     # Compile model
+     compile_model(args, model, config, tokenizer, mtp_model, vision_model)
+ 
+-- 
+2.53.0
+

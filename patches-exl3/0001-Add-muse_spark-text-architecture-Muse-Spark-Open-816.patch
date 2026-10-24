@@ -1,0 +1,899 @@
+From 83de9bd5bad7481017585e1897a825a688945873 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 07:16:04 +1100
+Subject: [PATCH 1/2] Add muse_spark text architecture (Muse Spark Open
+ 816B-A42B)
+
+- architecture/muse_spark.py: MuseSparkForConditionalGeneration, text model only (vision/audio towers ignored)
+- modules/arch_specific/muse_spark.py: latent MoE with fp32 sigmoid+bias router and per-expert
+  input-scaled post norm, input-scaled RMSNorm, decoder block with learned residual gates
+- Attention/SlidingAttention: optional weightless per-head o_norm ahead of the output gate
+  (eager paths only; graphed decode and TP export decline it)
+---
+ exllamav3/architecture/architectures.py       |   2 +
+ exllamav3/architecture/muse_spark.py          | 305 +++++++++++++
+ exllamav3/modules/arch_specific/muse_spark.py | 410 ++++++++++++++++++
+ exllamav3/modules/attention_fn/bc_attn.py     |   2 +
+ exllamav3/modules/attn.py                     |  11 +
+ exllamav3/modules/sliding_attn.py             |  11 +
+ 6 files changed, 741 insertions(+)
+ create mode 100644 exllamav3/architecture/muse_spark.py
+ create mode 100644 exllamav3/modules/arch_specific/muse_spark.py
+
+diff --git a/exllamav3/architecture/architectures.py b/exllamav3/architecture/architectures.py
+index 24a8d21..2460075 100644
+--- a/exllamav3/architecture/architectures.py
++++ b/exllamav3/architecture/architectures.py
+@@ -42,6 +42,7 @@ from .mistral3 import Mistral3Model
+ from .mixtral import MixtralModel
+ from .muse_glimmer import MuseGlimmerTextModel
+ from .muse_glimmer_assistant import MuseGlimmerAssistantModel
++from .muse_spark import MuseSparkTextModel
+ from .nemotronh import NemotronHModel
+ from .olmo3 import Olmo3Model
+ from .olmohybrid import OlmoHybridModel
+@@ -114,6 +115,7 @@ ARCHITECTURES = {
+         MixtralModel,
+         MuseGlimmerTextModel,
+         MuseGlimmerAssistantModel,
++        MuseSparkTextModel,
+         NemotronHModel,
+         Olmo3Model,
+         OlmoHybridModel,
+diff --git a/exllamav3/architecture/muse_spark.py b/exllamav3/architecture/muse_spark.py
+new file mode 100644
+index 0000000..3e6f841
+--- /dev/null
++++ b/exllamav3/architecture/muse_spark.py
+@@ -0,0 +1,305 @@
++from __future__ import annotations
++from dataclasses import replace
++from typing_extensions import override
++import torch
++from ..model.config import Config, no_default
++from ..model.model import Model
++from ..modules import (
++    Attention,
++    Embedding,
++    Linear,
++    RMSNorm,
++    SlidingAttention,
++    SWAState,
++)
++from ..modules.arch_specific.muse_spark import (
++    MuseSparkBlock,
++    MuseSparkInputScaledRMSNorm,
++    MuseSparkMoE,
++)
++from ..modules.attn import prepare_for_attn
++from ..cache.recurrent_util import prepare_for_recurrence
++from ..util.rope import RoPE, RopeStyle
++
++"""
++Muse Spark Open (meta-models/Muse-Spark-Open-816B-A42B and its quantized exports), text model only. The vision
++and audio towers in the checkpoint are ignored.
++
++Decoder layer (transformers MuseSparkTextDecoderLayer):
++    h = alpha_a * x + beta_a * rms(o_proj(sigmoid(gate_proj(n)) * o_norm(attn(n))))      n = centered_rms(x)
++    x = alpha_f * h + beta_f * input_scaled_rms(moe(centered_rms(h)))
++Attention: 128 q / 16 kv heads of 64, weightless QK norm with q scaled by qk_scale_factor, RoPE (NeoX) on the
++sliding layers (window 2048 incl. self), NoPE on the full layers, weightless per-head o_norm ahead of the full
++sigmoid output gate. MoE: latent (see modules/arch_specific/muse_spark.py) on every layer.
++Embedding followed by a weightless RMSNorm; final norm weighted (w, not 1 + w); untied head with
++logits = T * tanh(logits * output_multiplier / T).
++"""
++
++
++class MuseSparkConfig(Config):
++    arch_string = "MuseSparkForConditionalGeneration"
++
++    def __init__(
++        self,
++        directory: str,
++        **kwargs,
++    ):
++        super().__init__(
++            directory,
++            {"text": MuseSparkTextModel},
++            **kwargs
++        )
++
++        # Layers
++        self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
++        self.tie_word_embeddings = self.read_cfg(bool, "text_config->tie_word_embeddings", False)
++
++        # Attention params
++        self.head_dim = self.read_cfg(int, "text_config->head_dim", None)
++        self.hidden_size = self.read_cfg(int, "text_config->hidden_size", no_default)
++        self.num_q_heads = self.read_cfg(int, "text_config->num_attention_heads", no_default)
++        self.num_kv_heads = self.read_cfg(int, "text_config->num_key_value_heads", self.num_q_heads)
++        if not self.head_dim:
++            self.head_dim = self.hidden_size // self.num_q_heads
++        self.assert_cfg(bool, "text_config->attention_bias", False, True)
++
++        self.layer_types = self.read_cfg(list, "text_config->layer_types", no_default)
++        assert len(self.layer_types) == self.num_hidden_layers, \
++            "Length of text_config->layer_types doesn't match number of hidden layers"
++        # The reference mask attends to sliding_window tokens including self; the internal (FA)
++        # convention counts past tokens only, hence the -1
++        self.sliding_window = self.read_cfg(int, "text_config->sliding_window", 0) - 1
++        assert self.sliding_window > 0, "Expected text_config->sliding_window > 1"
++
++        # Scaleless QK norm, q additionally scaled by qk_scale_factor (folds into sm_scale)
++        self.qk_scale_factor = self.read_cfg(float, "text_config->qk_scale_factor", 1.0)
++
++        # MoE params
++        self.assert_cfg(str, "text_config->hidden_act", "silu", True)
++        mlp_layer_types = self.read_cfg(list, "text_config->mlp_layer_types", ["sparse"] * self.num_hidden_layers)
++        assert all(t == "sparse" for t in mlp_layer_types), "Muse Spark: only sparse (MoE) layers are supported"
++        self.assert_cfg(int, "text_config->num_shared_experts", 0, True)
++        self.moe_hidden_size = self.read_cfg(int, "text_config->moe_hidden_size", no_default)
++        self.moe_intermediate_size = self.read_cfg(int, "text_config->moe_intermediate_size", no_default)
++        self.num_experts = self.read_cfg(int, "text_config->num_local_experts", no_default)
++        self.num_experts_per_tok = self.read_cfg(int, "text_config->num_experts_per_tok", no_default)
++        self.routed_scaling_factor = self.read_cfg(float, "text_config->routed_scaling_factor", 1.0)
++        self.residual_gate_temperature = self.read_cfg(float, "text_config->residual_gate_temperature", no_default)
++
++        # Norms: pre norms use rms_norm_eps, the post norms use post_norm_eps
++        self.rms_norm_eps = self.read_cfg(float, "text_config->rms_norm_eps", no_default)
++        self.post_norm_eps = self.read_cfg(float, "text_config->post_norm_eps", self.rms_norm_eps)
++
++        # Router logit multiplier and output softcap pre-scale share output_multiplier
++        self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
++        self.output_multiplier = self.read_cfg(float, "text_config->output_multiplier", 1.0)
++
++        # RoPE: per-layer theta, 0 = NoPE (the full-attention layers)
++        text_config_dict = self.read_cfg(dict, "text_config", no_default)
++        self.rope_settings = self.read_rope_settings_default(
++            RopeStyle.NEOX,
++            default_rope_theta = 500000.0,
++            config_dict = text_config_dict,
++        )
++        self.layer_rope_theta = self.read_cfg(
++            list,
++            "text_config->layer_rope_theta",
++            [self.rope_settings.rope_theta] * self.num_hidden_layers,
++        )
++        assert len(self.layer_rope_theta) == self.num_hidden_layers, \
++            "Length of text_config->layer_rope_theta doesn't match number of hidden layers"
++        self.layer_rope_settings = []
++        for theta in self.layer_rope_theta:
++            if not theta:
++                self.layer_rope_settings.append(None)
++            elif theta == self.rope_settings.rope_theta:
++                self.layer_rope_settings.append(self.rope_settings)
++            else:
++                self.layer_rope_settings.append(replace(self.rope_settings, rope_theta = float(theta)))
++
++
++class MuseSparkTextModel(Model):
++    config_class = MuseSparkConfig
++
++    def __init__(
++        self,
++        config: MuseSparkConfig,
++        key_prefix: str = "model.language_model",
++        swa_full: bool = False,
++        **kwargs
++    ):
++        super().__init__(config, **kwargs)
++        self.swa_full = swa_full
++
++        self.modules += [
++            Embedding(
++                config = config,
++                key = f"{key_prefix}.embed_tokens",
++                vocab_size = config.vocab_size,
++                hidden_size = config.hidden_size,
++            ),
++            # Scaleless RMSNorm on top of the embeddings (reference embed_norm)
++            RMSNorm(
++                config = config,
++                key = f"{key_prefix}.embed_tokens.embed_norm",
++                rms_norm_eps = config.rms_norm_eps,
++                unweighted = True,
++                out_dtype = torch.float,
++            ),
++        ]
++
++        self.first_block_idx = len(self.modules)
++
++        for idx in range(config.num_hidden_layers):
++            is_swa = config.layer_types[idx] == "sliding_attention"
++            attn_cls = Attention if swa_full or not is_swa else SlidingAttention
++            lkey = f"{key_prefix}.layers.{idx}"
++
++            self.modules += [
++                MuseSparkBlock(
++                    config = config,
++                    key = lkey,
++                    layer_idx = idx,
++                    residual_gate_temperature = config.residual_gate_temperature,
++                    attn_norm = RMSNorm(
++                        config = config,
++                        key = f"{lkey}.input_layernorm",
++                        rms_norm_eps = config.rms_norm_eps,
++                        constant_bias = 1.0,
++                    ),
++                    attn = attn_cls(
++                        config = config,
++                        key = f"{lkey}.self_attn",
++                        layer_idx = idx,
++                        hidden_size = config.hidden_size,
++                        head_dim = config.head_dim,
++                        num_q_heads = config.num_q_heads,
++                        num_kv_heads = config.num_kv_heads,
++                        rope_settings = config.layer_rope_settings[idx],
++                        sm_scale = config.qk_scale_factor * config.head_dim ** (-0.5),
++                        sliding_window = config.sliding_window if is_swa else -1,
++                        key_q = "q_proj",
++                        key_k = "k_proj",
++                        key_v = "v_proj",
++                        key_o = "o_proj",
++                        key_g = "gate_proj",
++                        full_gate = True,
++                        qmap = "block.attn",
++                        select_hq_bits = 2,
++                        q_norm = RMSNorm(
++                            config = config,
++                            key = f"{lkey}.self_attn.qk_norm",
++                            rms_norm_eps = config.rms_norm_eps,
++                            unweighted = True,
++                        ),
++                        k_norm = RMSNorm(
++                            config = config,
++                            key = f"{lkey}.self_attn.qk_norm",
++                            rms_norm_eps = config.rms_norm_eps,
++                            unweighted = True,
++                        ),
++                        o_norm = RMSNorm(
++                            config = config,
++                            key = f"{lkey}.self_attn.o_norm",
++                            rms_norm_eps = config.rms_norm_eps,
++                            unweighted = True,
++                        ),
++                        out_dtype = torch.float,
++                    ),
++                    attn_post_norm = RMSNorm(
++                        config = config,
++                        key = f"{lkey}.post_attention_layernorm",
++                        rms_norm_eps = config.post_norm_eps,
++                        unweighted = True,
++                        out_dtype = torch.float,
++                    ),
++                    mlp_norm = RMSNorm(
++                        config = config,
++                        key = f"{lkey}.pre_feedforward_layernorm",
++                        rms_norm_eps = config.rms_norm_eps,
++                        constant_bias = 1.0,
++                    ),
++                    mlp = MuseSparkMoE(
++                        config = config,
++                        key = f"{lkey}.mlp",
++                        hidden_size = config.hidden_size,
++                        latent_size = config.moe_hidden_size,
++                        intermediate_size = config.moe_intermediate_size,
++                        num_experts = config.num_experts,
++                        num_experts_per_tok = config.num_experts_per_tok,
++                        output_multiplier = config.output_multiplier,
++                        routed_scaling_factor = config.routed_scaling_factor,
++                        rms_norm_eps = config.rms_norm_eps,
++                        post_norm_eps = config.post_norm_eps,
++                        qmap = "block.mlp",
++                        latent_hq_bits = 2,
++                    ),
++                    mlp_post_norm = MuseSparkInputScaledRMSNorm(
++                        config = config,
++                        key = f"{lkey}.post_feedforward_layernorm",
++                        rms_norm_eps = config.post_norm_eps,
++                        out_dtype = torch.float,
++                    ),
++                )
++            ]
++
++        self.last_kv_module_idx = len(self.modules) - 1
++
++        head_alt_key = None
++        if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):
++            head_alt_key = f"{key_prefix}.embed_tokens"
++
++        self.modules += [
++            RMSNorm(
++                config = config,
++                key = f"{key_prefix}.norm",
++                rms_norm_eps = config.rms_norm_eps,
++                out_dtype = torch.half,
++            ),
++            Linear(
++                config = config,
++                key = "lm_head",
++                qbits_key = "head_bits",
++                alt_key = head_alt_key,
++                in_features = config.hidden_size,
++                out_features = config.vocab_size,
++                qmap = "block",
++                pre_scale = config.output_multiplier,
++                softcap = config.final_logit_softcapping,
++                caps = {"logits_output": True},
++            )
++        ]
++
++        self.logit_layer_idx = len(self.modules) - 1
++        self.g_rope = RoPE("cpu", config.rope_settings)
++
++        # Hessians for every expert's down projection need every expert to see calibration rows
++        self.calibration_all_experts = True
++
++        # No TP path (the MoE runs per expert in torch); SWA layers are recurrent, optionally
++        self.caps.update({"supports_tp": False})
++        self.recurrent_state_cls = None
++        if not self.swa_full:
++            self.caps.update({
++                "recurrent_states": True,
++                "default_recurrent_checkpoint_interval": 6144,
++            })
++            self.recurrent_state_cls = SWAState
++
++
++    @override
++    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
++        if not self.swa_full:
++            prepare_for_recurrence(input_ids, params, self)
++        input_ids = prepare_for_attn(input_ids, params)
++        return input_ids
++
++
++    @override
++    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
++        p = "<|begin_of_text|>"
++        if system_prompt:
++            p += f"<|start|>system<|message|>{system_prompt}<|eot|>"
++        p += f"<|start|>user<|message|>{prompt}<|eot|>"
++        p += "<|start|>assistant"
++        return p
+diff --git a/exllamav3/modules/arch_specific/muse_spark.py b/exllamav3/modules/arch_specific/muse_spark.py
+new file mode 100644
+index 0000000..4ed77e3
+--- /dev/null
++++ b/exllamav3/modules/arch_specific/muse_spark.py
+@@ -0,0 +1,410 @@
++from __future__ import annotations
++from typing_extensions import override
++import torch
++import torch.nn.functional as F
++from ...model.config import Config
++from ...util.tensor import to2
++from .. import Module, Linear, RMSNorm, TransformerBlock
++from ..mlp import capture_out_sensitivity
++
++"""
++Muse Spark (meta-models/Muse-Spark-Open-816B-A42B) text-model pieces that the generic modules don't cover:
++
++- MuseSparkInputScaledRMSNorm: scale by (1 + w) first, round to bf16 (the reference's type_as on a bf16
++  model), then a plain RMS normalization. Used after every routed expert and after the MoE block.
++- MuseSparkMoE: latent MoE. The router reads the full-width block input in fp32 (logits x output_multiplier,
++  sigmoid, + e_score_correction_bias for the choice only, top-k, renormalized, x routed_scaling_factor);
++  the experts run at the latent width between pre_expert_proj (+ centered RMSNorm) and post_expert_proj, and
++  each expert's output is normalized (post_expert_norm, shared weight) before its routing weight is applied.
++  The per-expert norm sits inside the routed sum, which none of the fused BlockSparseMLP kernels express, so
++  this module runs the experts through their Linear layers one expert at a time. It is the reference forward
++  and the conversion path; serving is done by a separate engine.
++- MuseSparkBlock: decoder layer with the learned residual gates (out = alpha * residual + beta * branch).
++
++Reference: transformers models/muse_spark/modeling_muse_spark.py (MuseSparkTextInputScaledRMSNorm,
++MuseSparkTopkRouter, MuseSparkExperts, MuseSparkMoE, MuseSparkResidualGate, MuseSparkTextDecoderLayer).
++"""
++
++
++class MuseSparkInputScaledRMSNorm(Module):
++
++    def __init__(
++        self,
++        config: Config | None,
++        key: str,
++        rms_norm_eps: float,
++        out_dtype: torch.dtype | None = None,
++        round_bf16: bool = True,
++    ):
++        super().__init__(config, key, None)
++        self.module_name = "MuseSparkInputScaledRMSNorm"
++        self.rms_norm_eps = rms_norm_eps
++        self.out_dtype = out_dtype
++        self.round_bf16 = round_bf16
++        self.weight = None
++        self.scale = None
++        self._numel = None
++
++    @override
++    def optimizer_targets(self):
++        return []
++
++    @override
++    def load(self, device: torch.device, **kwargs):
++        self.device = device
++        self.weight = self.config.stc.get_tensor(f"{self.key}.weight", device, allow_bf16 = True, no_defer = True)
++        self._numel = self.weight.numel()
++        self.scale = (1.0 + self.weight.float()).contiguous()
++
++    @override
++    def unload(self):
++        self.device = None
++        self.weight = None
++        self.scale = None
++
++    @override
++    def get_tensors(self):
++        return {f"{self.key}.weight": self.weight.contiguous()}
++
++    @override
++    def weights_numel(self):
++        return self._numel
++
++    @override
++    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
++        y = x.float() * self.scale
++        if self.round_bf16:
++            y = y.to(torch.bfloat16).float()
++        y = y * torch.rsqrt(y.square().mean(dim = -1, keepdim = True) + self.rms_norm_eps)
++        return to2(y, out_dtype, self.out_dtype)
++
++
++class MuseSparkMoE(Module):
++
++    def __init__(
++        self,
++        config: Config | None,
++        key: str,
++        hidden_size: int,
++        latent_size: int,
++        intermediate_size: int,
++        num_experts: int,
++        num_experts_per_tok: int,
++        output_multiplier: float,
++        routed_scaling_factor: float,
++        rms_norm_eps: float,
++        post_norm_eps: float,
++        qmap: str | None = None,
++        latent_hq_bits: int = 0,
++        key_router: str = "gate",
++        key_latent_in: str = "pre_expert_proj",
++        key_latent_norm: str = "pre_expert_norm",
++        key_latent_out: str = "post_expert_proj",
++        key_experts: str = "experts",
++        key_post_expert_norm: str = "experts.post_expert_norm",
++        out_dtype: torch.dtype | None = torch.float,
++    ):
++        super().__init__(config, key, None)
++        self.module_name = "MuseSparkMoE"
++        self.hidden_size = hidden_size
++        self.latent_size = latent_size
++        self.intermediate_size = intermediate_size
++        self.num_experts = num_experts
++        self.num_experts_per_tok = num_experts_per_tok
++        self.output_multiplier = output_multiplier
++        self.routed_scaling_factor = routed_scaling_factor
++        self.norm_topk_eps = 1e-15
++        self.out_dtype = out_dtype
++        self.activation_fn = "silu"
++
++        self.router_key = f"{key}.{key_router}.weight"
++        self.e_score_bias_key = f"{key}.{key_router}.e_score_correction_bias"
++        self.router_weight = None
++        self.e_score_correction_bias = None
++
++        # Projection to the latent width and back. The down projection reads the block input (shared Hessian
++        # key with nothing else in the block); the up projection reads the routed sum
++        self.latent_in = Linear(
++            config = config,
++            key = f"{key}.{key_latent_in}",
++            in_features = hidden_size,
++            out_features = latent_size,
++            qmap = qmap + ".input" if qmap else None,
++            out_dtype = torch.half,
++            select_hq_bits = latent_hq_bits,
++            qgroup = key + ".latent",
++        )
++        self.latent_norm = RMSNorm(
++            config = config,
++            key = f"{key}.{key_latent_norm}",
++            rms_norm_eps = rms_norm_eps,
++            constant_bias = 1.0,
++            out_dtype = torch.half,
++        )
++        self.latent_out = Linear(
++            config = config,
++            key = f"{key}.{key_latent_out}",
++            in_features = latent_size,
++            out_features = hidden_size,
++            qmap = qmap + ".latent_out" if qmap else None,
++            out_dtype = torch.float,
++            select_hq_bits = latent_hq_bits,
++            qgroup = key + ".latent",
++        )
++        self.post_expert_norm = MuseSparkInputScaledRMSNorm(
++            config = config,
++            key = f"{key}.{key_post_expert_norm}",
++            rms_norm_eps = post_norm_eps,
++            out_dtype = torch.float,
++        )
++        self.register_submodule(self.latent_in)
++        self.register_submodule(self.latent_norm)
++        self.register_submodule(self.latent_out)
++        self.register_submodule(self.post_expert_norm)
++
++        # Routed experts, stored per expert as experts.N.{gate,up,down}_proj (MXFP4 or BF16 in the source).
++        # Gate/up of every expert read the same latent state (one Hessian), each down has its own
++        expert_qmap = qmap + ".latent" if qmap else None
++        self.gates, self.ups, self.downs = [], [], []
++        for idx in range(num_experts):
++            ekey = f"{key}.{key_experts}.{idx}"
++            gate = Linear(
++                config = config,
++                key = f"{ekey}.gate_proj",
++                in_features = latent_size,
++                out_features = intermediate_size,
++                qmap = expert_qmap,
++                out_dtype = torch.half,
++                qgroup = key + ".block_gud",
++            )
++            up = Linear(
++                config = config,
++                key = f"{ekey}.up_proj",
++                in_features = latent_size,
++                out_features = intermediate_size,
++                qmap = expert_qmap,
++                out_dtype = torch.half,
++                qgroup = key + ".block_gud",
++            )
++            down = Linear(
++                config = config,
++                key = f"{ekey}.down_proj",
++                in_features = intermediate_size,
++                out_features = latent_size,
++                qmap = qmap + f".{idx}.down" if qmap else None,
++                out_dtype = torch.float,
++                allow_input_padding = True,
++                trim_padded_out = True,
++                qgroup = key + ".block_gud",
++            )
++            self.gates.append(gate)
++            self.ups.append(up)
++            self.downs.append(down)
++            self.register_submodule(gate)
++            self.register_submodule(up)
++            self.register_submodule(down)
++
++        self.caps.update({"supports_tp": False})
++
++    @override
++    def optimizer_targets(self):
++        g, u, d = [], [], []
++        for m in self.gates: g += m.optimizer_targets()
++        for m in self.ups: u += m.optimizer_targets()
++        for m in self.downs: d += m.optimizer_targets()
++        u = self.latent_in.optimizer_targets() + u
++        d = d + self.latent_out.optimizer_targets()
++        return [[g + u, d]]
++
++    @override
++    def load(self, device: torch.device, **kwargs):
++        super().load(device, **kwargs)
++        self.router_weight = self.config.stc.get_tensor(
++            self.router_key, device, allow_bf16 = True, no_defer = True
++        ).float().contiguous()
++        self.e_score_correction_bias = self.config.stc.get_tensor(
++            self.e_score_bias_key, device, allow_bf16 = True, no_defer = True
++        ).float().contiguous()
++
++    @override
++    def unload(self):
++        super().unload()
++        self.router_weight = None
++        self.e_score_correction_bias = None
++
++    @override
++    def get_tensors(self):
++        return {
++            self.router_key: self.router_weight.contiguous(),
++            self.e_score_bias_key: self.e_score_correction_bias.contiguous(),
++        }
++
++    def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """x: (rows, hidden) -> (selected (rows, k) long, weights (rows, k) fp32), as MuseSparkTopkRouter"""
++        logits = F.linear(x.float(), self.router_weight) * self.output_multiplier
++        scores = torch.sigmoid(logits)
++        choice = scores + self.e_score_correction_bias
++        selected = torch.topk(choice, k = self.num_experts_per_tok, dim = -1, sorted = False)[1]
++        weights = scores.gather(1, selected)
++        weights = weights / (weights.sum(dim = -1, keepdim = True) + self.norm_topk_eps)
++        weights = weights * self.routed_scaling_factor
++        return selected, weights
++
++    def expert_forward(self, idx: int, z: torch.Tensor, params: dict, sens_w: torch.Tensor | None = None):
++        g = self.gates[idx].forward(z, params)
++        u = self.ups[idx].forward(z, params)
++        if sens_w is not None:
++            routed = sens_w.nonzero().flatten()
++            if routed.numel():
++                capture_out_sensitivity(
++                    params["capture_sens"], self.gates[idx], self.ups[idx], self.downs[idx],
++                    g[routed], u[routed], self.activation_fn, 0.0, sens_w[routed]
++                )
++        a = (F.silu(g.float()) * u.float()).half()
++        d = self.downs[idx].forward(a, params)
++        return self.post_expert_norm.forward(d, params)
++
++    @override
++    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
++        shape = x.shape
++        y = x.view(-1, self.hidden_size)
++        rows = y.shape[0]
++
++        selected, weights = self.route(y)
++
++        z = self.latent_in.forward(y.half(), params)
++        z = self.latent_norm.forward(z, params, out_dtype = torch.half)
++
++        acc = torch.zeros((rows, self.latent_size), dtype = torch.float, device = y.device)
++
++        if params.get("activate_all_experts"):
++            # Calibration: every expert sees every row, so every down projection gets Hessian data. The
++            # returned state is not used by the converter (it reruns the module with real routing)
++            sens = None
++            if "capture_sens" in params:
++                sens = torch.zeros((rows, self.num_experts), dtype = torch.float, device = y.device)
++                sens.scatter_(1, selected, weights)
++            for idx in range(self.num_experts):
++                self.expert_forward(idx, z, params, sens[:, idx] if sens is not None else None)
++
++        flat_e = selected.reshape(-1)
++        flat_w = weights.reshape(-1)
++        flat_t = torch.arange(rows, device = y.device).repeat_interleave(self.num_experts_per_tok)
++        order = flat_e.argsort(stable = True)
++        flat_e, flat_w, flat_t = flat_e[order], flat_w[order], flat_t[order]
++        counts = torch.bincount(flat_e, minlength = self.num_experts).tolist()
++
++        start = 0
++        all_active = bool(params.get("activate_all_experts"))
++        for idx, count in enumerate(counts):
++            if count == 0:
++                continue
++            end = start + count
++            t = flat_t[start:end]
++            o = self.expert_forward(idx, z.index_select(0, t), params if not all_active else {})
++            o.mul_(flat_w[start:end].unsqueeze(1))
++            acc.index_add_(0, t, o)
++            start = end
++
++        out = self.latent_out.forward(acc.half(), params)
++        out = out.view(shape[:-1] + (self.hidden_size,))
++        return to2(out, out_dtype, self.out_dtype)
++
++
++class MuseSparkBlock(TransformerBlock):
++    """
++    TransformerBlock with Muse Spark's learned residual gates: after each sublayer (and its post norm),
++    out = alpha * residual + beta * branch with w = gate / temperature, beta = sigmoid(w),
++    alpha = sqrt(max(sigmoid(-w) * (1 + beta), eps)). Gate parameters are kept as stored and expanded to
++    fp32 alpha/beta at load.
++    """
++
++    def __init__(
++        self,
++        *args,
++        residual_gate_temperature: float,
++        residual_gate_eps: float = 1e-3,
++        key_attn_gate: str = "post_attention_residual_gate.gate",
++        key_mlp_gate: str = "post_feedforward_residual_gate.gate",
++        **kwargs,
++    ):
++        super().__init__(*args, **kwargs)
++        self.residual_gate_temperature = residual_gate_temperature
++        self.residual_gate_eps = residual_gate_eps
++        self.key_attn_gate = key_attn_gate
++        self.key_mlp_gate = key_mlp_gate
++        self.attn_gate_t = None
++        self.mlp_gate_t = None
++        self.attn_ab = None
++        self.mlp_ab = None
++        self.caps.update({"supports_tp": False})
++
++    def _alpha_beta(self, g: torch.Tensor):
++        w = g.float() / self.residual_gate_temperature
++        beta = torch.sigmoid(w)
++        alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min = self.residual_gate_eps))
++        return alpha.contiguous(), beta.contiguous()
++
++    @override
++    def load(self, device: torch.device, **kwargs):
++        super().load(device, **kwargs)
++        get = lambda k: self.config.stc.get_tensor(f"{self.key}.{k}", device, allow_bf16 = True, no_defer = True)
++        self.attn_gate_t = get(self.key_attn_gate)
++        self.mlp_gate_t = get(self.key_mlp_gate)
++        self.attn_ab = self._alpha_beta(self.attn_gate_t)
++        self.mlp_ab = self._alpha_beta(self.mlp_gate_t)
++
++    @override
++    def unload(self):
++        super().unload()
++        self.attn_gate_t = None
++        self.mlp_gate_t = None
++        self.attn_ab = None
++        self.mlp_ab = None
++
++    @override
++    def get_tensors(self):
++        t = super().get_tensors()
++        t[f"{self.key}.{self.key_attn_gate}"] = self.attn_gate_t.contiguous()
++        t[f"{self.key}.{self.key_mlp_gate}"] = self.mlp_gate_t.contiguous()
++        return t
++
++    @override
++    def weights_numel(self):
++        return super().weights_numel() + self.attn_gate_t.numel() + self.mlp_gate_t.numel()
++
++    @staticmethod
++    def _gate_(x: torch.Tensor, y: torch.Tensor, ab: tuple) -> torch.Tensor:
++        alpha, beta = ab
++        if x.dtype != torch.float:
++            x = x.float()
++        x.mul_(alpha).add_(y.float().mul_(beta))
++        return x
++
++    @override
++    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
++        export_state = params.get("export_state_layers")
++        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
++
++        y = self.attn_norm.forward(x, params, out_dtype = torch.half)
++        y = self.attn.forward(y, params)
++        if params.get("prefill") and not export_state:
++            return x
++        y = self.attn_post_norm.forward(y, params, out_dtype = torch.float)
++        x = self._gate_(x, y, self.attn_ab)
++
++        y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
++        y = self.mlp.forward(y, params)
++        y = self.mlp_post_norm.forward(y, params, out_dtype = torch.float)
++        x = self._gate_(x, y, self.mlp_ab)
++
++        if export_state:
++            s = params.get("export_states")
++            if not s:
++                s = params["export_states"] = []
++            s.append(x.half().clamp_(-65504.0, 65504.0))
++
++        return to2(x, out_dtype, self.out_dtype)
++
++    def tp_export(self, plan, producer):
++        raise NotImplementedError("Muse Spark has no TP path in exllamav3")
+diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
+index f38c077..cd238c7 100644
+--- a/exllamav3/modules/attention_fn/bc_attn.py
++++ b/exllamav3/modules/attention_fn/bc_attn.py
+@@ -697,6 +697,8 @@ def _module_eligible(m):
+             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
+             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
+         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
++        # Output head norm (Muse Spark o_norm) runs on the eager path only
++        getattr(m, "o_norm", None) is None and
+         # Asymmetric V head dim (MiMo-V2): the combine kernel writes the trimmed V lanes into
+         # the o_proj input directly; the gate stages and the QSA sparse kernels assume the full
+         # head width, so those combinations stay on the eager path
+diff --git a/exllamav3/modules/attn.py b/exllamav3/modules/attn.py
+index 0da0f94..8d390fc 100644
+--- a/exllamav3/modules/attn.py
++++ b/exllamav3/modules/attn.py
+@@ -177,6 +177,7 @@ class Attention(Module):
+         q_norm: RMSNorm | LayerNorm | None = None,
+         k_norm: RMSNorm | LayerNorm | None = None,
+         v_norm: RMSNorm | LayerNorm | None = None,
++        o_norm: RMSNorm | None = None,
+         q_proj: Linear | Module | None = None,
+         k_proj: Linear | Module | None = None,
+         v_proj: Linear | Module | None = None,
+@@ -245,6 +246,7 @@ class Attention(Module):
+ 
+         self.q_norm_tensor = None
+         self.k_norm_tensor = None
++        self.o_norm = None
+ 
+         self.has_split_cache = False
+ 
+@@ -388,6 +390,10 @@ class Attention(Module):
+         else:
+             self.v_norm = None
+ 
++        # Per-head norm on the attention output, ahead of the output gate (Muse Spark o_norm)
++        self.o_norm = o_norm
++        self.register_submodule(self.o_norm)
++
+         # Register headwise gate
+         if key_g:
+             assert not interleaved_gate, \
+@@ -943,6 +949,8 @@ class Attention(Module):
+                 dispatch_cache = self.dispatch_cache,
+             )
+ 
++        if self.o_norm is not None:
++            o = self.o_norm.forward(o.reshape(bsz, seqlen, self.num_q_heads, self.head_dim), params, out_dtype = torch.half)
+         if self.headwise_gate:
+             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+             else: ext.mul_sigmoid_broadcast_(o, g)
+@@ -1206,6 +1214,8 @@ class Attention(Module):
+                 staging_pages = staging_pages,
+             )
+ 
++        if self.o_norm is not None:
++            o = self.o_norm.forward(o.reshape(bsz, seqlen, self.num_q_heads, self.head_dim), params, out_dtype = torch.half)
+         if self.headwise_gate:
+             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+             else: ext.mul_sigmoid_broadcast_(o, g)
+@@ -1277,6 +1287,7 @@ class Attention(Module):
+ 
+     def tp_export(self, plan, producer):
+         assert self.device is not None, "Cannot export module for TP before loading."
++        assert self.o_norm is None, "TP export of Attention with o_norm is not implemented"
+ 
+         def _export(child):
+             nonlocal producer
+diff --git a/exllamav3/modules/sliding_attn.py b/exllamav3/modules/sliding_attn.py
+index b53f517..4ba15b2 100644
+--- a/exllamav3/modules/sliding_attn.py
++++ b/exllamav3/modules/sliding_attn.py
+@@ -284,6 +284,7 @@ class SlidingAttention(Module):
+         q_norm: RMSNorm | LayerNorm | None = None,
+         k_norm: RMSNorm | LayerNorm | None = None,
+         v_norm: RMSNorm | LayerNorm | None = None,
++        o_norm: RMSNorm | None = None,
+         q_proj: Linear | Module | None = None,
+         k_proj: Linear | Module | None = None,
+         v_proj: Linear | Module | None = None,
+@@ -355,6 +356,7 @@ class SlidingAttention(Module):
+         self.g_proj = None
+         self.key_sinks = key_sinks
+         self.sinks = None
++        self.o_norm = None
+ 
+         if self.num_kv_heads == 0:
+             return
+@@ -476,6 +478,10 @@ class SlidingAttention(Module):
+         else:
+             self.v_norm = None
+ 
++        # Per-head norm on the attention output, ahead of the output gate (Muse Spark o_norm)
++        self.o_norm = o_norm
++        self.register_submodule(self.o_norm)
++
+         # Register headwise gate
+         if key_g:
+             gate_features = num_q_heads * head_dim if full_gate else num_q_heads
+@@ -1026,6 +1032,8 @@ class SlidingAttention(Module):
+             v_new = v,
+         )
+ 
++        if self.o_norm is not None:
++            o = self.o_norm.forward(o.reshape(bsz, seqlen, self.num_q_heads, self.head_dim), params, out_dtype = torch.half)
+         if self.headwise_gate:
+             if self.gate_softplus: o *= torch.nn.functional.softplus(g.float()).to(o.dtype).unsqueeze(-1)
+             else: o *= g.sigmoid().unsqueeze(-1)
+@@ -1192,6 +1200,8 @@ class SlidingAttention(Module):
+                         k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
+                         v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
+ 
++        if self.o_norm is not None:
++            o = self.o_norm.forward(o.reshape(bsz, seqlen, self.num_q_heads, self.head_dim), params, out_dtype = torch.half)
+         if self.headwise_gate:
+             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+             else: ext.mul_sigmoid_broadcast_(o, g)
+@@ -1253,6 +1263,7 @@ class SlidingAttention(Module):
+         assert self.device is not None, "Cannot export module for TP before loading."
+         assert not (self.q_norm is not None and isinstance(self.q_norm, RMSNorm) and self.q_norm.span_heads), \
+             "TP export of SlidingAttention with span_heads norms is not implemented"
++        assert self.o_norm is None, "TP export of SlidingAttention with o_norm is not implemented"
+ 
+         def _export(child):
+             nonlocal producer
+-- 
+2.53.0
+

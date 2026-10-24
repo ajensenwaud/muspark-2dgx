@@ -1,0 +1,41 @@
+From bbf461065aac993cf6666511f98580b3a621a7d5 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:10:52 +1100
+Subject: [PATCH 4/4] muse_spark: route on the fp32 normed MoE input
+
+The block handed the MoE its pre-feedforward norm output rounded to fp16, so the
+router's fp32 logits came from fp16-rounded inputs. Muse Spark's top-8 choice has
+near-ties (k-th vs (k+1)-th choice score margins of 1e-6..2e-4 on ~0.2% of tokens
+of real layer-61 states), which that rounding flips: 2-3 tokens per 1024 routed
+differently from an fp32 reference, 1 with fp32 router input. The experts still
+read the fp16 cast (latent_in), so expert numerics are unchanged.
+
+Layer 61's large G2 layer-check deviation (MoE rel_l2 0.040) was this routing
+effect on an out-of-distribution input (layer 1's output fed to layer 61), not
+fp16 overflow: with the reference's routing forced the MoE is at 1.3e-3 there,
+and on real layer-61 states 4.7e-4. Expert maxima on real states stay far inside
+fp16 (|silu(g)*u| <= 3242, |down| <= 3159 over all 62 layers), so no weight fold
+is needed.
+---
+ exllamav3/modules/arch_specific/muse_spark.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/modules/arch_specific/muse_spark.py b/exllamav3/modules/arch_specific/muse_spark.py
+index f7a98d8..d0ebb97 100644
+--- a/exllamav3/modules/arch_specific/muse_spark.py
++++ b/exllamav3/modules/arch_specific/muse_spark.py
+@@ -396,7 +396,10 @@ class MuseSparkBlock(TransformerBlock):
+         y = self.attn_post_norm.forward(y, params, out_dtype = torch.float)
+         x = self._gate_(x, y, self.attn_ab)
+ 
+-        y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
++        # The router reads the normed input in fp32 (as the reference: fp32 logits of the full-width hidden
++        # state); the experts read its fp16 cast (MuseSparkMoE.forward). Routing on the fp16-rounded input
++        # flips near-tied top-k choices (choice margins ~1e-5 occur on ~0.2% of tokens) about twice as often
++        y = self.mlp_norm.forward(x, params, out_dtype = torch.float)
+         y = self.mlp.forward(y, params)
+         y = self.mlp_post_norm.forward(y, params, out_dtype = torch.float)
+         x = self._gate_(x, y, self.mlp_ab)
+-- 
+2.53.0
+

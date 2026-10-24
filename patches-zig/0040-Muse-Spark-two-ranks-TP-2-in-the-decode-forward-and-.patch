@@ -1,0 +1,419 @@
+From b4f937ff6b25ad0382ccee3b241080218ed46d26 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:09:15 +1100
+Subject: [PATCH 40/60] Muse Spark: two ranks (TP=2) in the decode forward and
+ tf-muse m1
+
+Each rank runs its 64 query heads / 8 KV heads, its latent half of pre_expert_proj and post_expert_proj and its
+half of every expert's width. Four fp32 all-gathers a layer, summed in rank order inside the kernels that
+consume them: o_proj partials (post-attention gate), the latent halves (fp16, read in place by the latent norm),
+the experts' down partials (the per-expert norm needs each expert's whole output), post_expert_proj partials
+(post-ffn gate); the head's uneven 128-row block slices are gathered at the wider rank's stride. tf-muse m1 opens
+a TP session when TF_TP_WORLD is set; rank 0 writes the dumps. One-GPU bits unchanged (the 2-layer logits are
+byte-equal to the previous build's); the two-rank path has not run yet (both GPUs busy).
+---
+ zig/build/cuda.zig                      |  3 +-
+ zig/kernels/cuda/muse_spark/glue.cu     | 30 +++++-----
+ zig/src/families/muse_spark/forward.zig | 78 ++++++++++++++++++++-----
+ zig/src/families/muse_spark/load.zig    |  4 +-
+ zig/src/families/muse_spark/m1_main.zig | 26 +++++++--
+ 5 files changed, 104 insertions(+), 37 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index b4251a66..37ab7971 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -157,7 +157,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     // tf-muse: Muse Spark's decode forward against exllamav3's answer key
+     const muse = museModule(b, target, optimize, cuda, mimo);
+     const muse_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+-    muse_exe.addImport("cuda", cuda);
++    for ([_][]const u8{ "cuda", "tp", "tp_kernel" }) |name| muse_exe.addImport(name, mimo.import_table.get(name).?);
+     muse_exe.addImport("muse_spark", muse);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-muse", .root_module = muse_exe }));
+ }
+@@ -192,6 +192,7 @@ fn museModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+     m.addImport("core", mimo.import_table.get("core").?);
++    m.addImport("tp", mimo.import_table.get("tp").?);
+     m.addImport("mimo_v2", mimo);
+     return m;
+ }
+diff --git a/zig/kernels/cuda/muse_spark/glue.cu b/zig/kernels/cuda/muse_spark/glue.cu
+index 28b139df..3797fb86 100644
+--- a/zig/kernels/cuda/muse_spark/glue.cu
++++ b/zig/kernels/cuda/muse_spark/glue.cu
+@@ -57,15 +57,17 @@ extern "C" __global__ void muse_embed_norm(const uint16_t* __restrict__ table, c
+ }
+ 
+ // out = half(x * rsqrt(mean(x^2) + eps) * w) (RMSNorm: w = 1 + weight for the centred norms, weight, or none).
+-// x fp32 (x_half 0) or fp16 (1). A block a row.
++// x fp32 (x_half 0) or fp16 (1); parts 0: x is [rows, D]; parts P: x is the ranks' gathered column slices
++// [D / P, rows, P] (rank-major all-gather of each rank's [rows, P]). A block a row.
+ extern "C" __global__ void muse_rms(const void* __restrict__ x, int x_half, const float* __restrict__ w,
+-                                    __half* __restrict__ out, int D, float eps) {
+-    const int64_t r = blockIdx.x;
++                                    __half* __restrict__ out, int D, float eps, int parts) {
++    const int64_t r = blockIdx.x, rows = gridDim.x;
+     float v[kMaxPer];
+     float ss = 0.f;
+     int n = 0;
+     for (int d = threadIdx.x; d < D; d += blockDim.x, ++n) {
+-        v[n] = x_half ? __half2float(((const __half*)x)[r * D + d]) : ((const float*)x)[r * D + d];
++        const int64_t at = parts ? ((int64_t)(d / parts) * rows + r) * parts + d % parts : r * D + d;
++        v[n] = x_half ? __half2float(((const __half*)x)[at]) : ((const float*)x)[at];
+         ss += v[n] * v[n];
+     }
+     const float rs = rsqrtf(block_sum(ss) / (float)D + eps);
+@@ -192,10 +194,11 @@ extern "C" __global__ void muse_topk(const float* __restrict__ logits, const flo
+ }
+ 
+ // The routed sum (MuseSparkMoE.forward): per slot, y (+ y2) [L] scaled by (1 + w) and rounded to bf16, normalised
+-// (post_expert_norm, eps), times its routing weight, added in slot order to acc = 0; out = half(acc). A block a row.
++// (post_expert_norm, eps), times its routing weight, added in slot order to acc = 0; out = half(acc), only columns
++// [out_lo, out_lo + out_w) as out [rows, out_w] (a rank's post_expert_proj inputs under TP). A block a row.
+ extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const float* __restrict__ y2,
+                                            const float* __restrict__ wts, const float* __restrict__ scale, float eps,
+-                                           __half* __restrict__ out, int L, int K) {
++                                           __half* __restrict__ out, int L, int K, int out_lo, int out_w) {
+     const int64_t r = blockIdx.x;
+     float acc[kMaxPer];
+     float v[kMaxPer];
+@@ -218,7 +221,8 @@ extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const fl
+         for (int d = threadIdx.x; d < L; d += blockDim.x, ++n) acc[n] = acc[n] + (v[n] * rs) * wk;
+     }
+     n = 0;
+-    for (int d = threadIdx.x; d < L; d += blockDim.x, ++n) out[r * L + d] = __float2half_rn(acc[n]);
++    for (int d = threadIdx.x; d < L; d += blockDim.x, ++n)
++        if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
+ }
+ 
+ // The head: x = x * mult, then cap * tanh(x / cap) when cap > 0 (Linear pre_scale, ext.softcap), in place.
+@@ -230,18 +234,18 @@ extern "C" __global__ void muse_softcap(float* __restrict__ x, int64_t n, float
+     }
+ }
+ 
+-// argmax over the first `vocab` columns of the gathered head (rank-major [world, n, stride]; rank k's columns are
+-// vocabulary rows k * stride ..): the first index of the maximum; a NaN counts as the maximum. out int32 [n].
+-extern "C" __global__ void muse_argmax(const float* __restrict__ recv, int32_t* __restrict__ out, int n, int stride,
+-                                       int vocab) {
++// argmax over the first `vocab` columns of the head: rank 0's [n, w0] at recv, rank 1's [n, w1] at recv + part
++// (the gathered slices; part 0 and w0 = the head's rows on one GPU). The first index of the maximum; a NaN counts
++// as the maximum. out int32 [n].
++extern "C" __global__ void muse_argmax(const float* __restrict__ recv, int32_t* __restrict__ out, int w0, int w1,
++                                       int64_t part, int vocab) {
+     __shared__ float bv[256];
+     __shared__ int bi[256];
+     const int r = blockIdx.x, tid = threadIdx.x;
+     float best = -CUDART_INF_F;
+     int idx = 0x7fffffff;
+     for (int c = tid; c < vocab; c += 256) {
+-        const int k = c / stride, j = c % stride;
+-        const float v = recv[((int64_t)k * n + r) * stride + j];
++        const float v = c < w0 ? recv[(int64_t)r * w0 + c] : recv[part + (int64_t)r * w1 + (c - w0)];
+         const bool nan_v = v != v, nan_b = best != best;
+         if (idx == 0x7fffffff || (nan_v && !nan_b) || (!nan_b && v > best)) {
+             best = v;
+diff --git a/zig/src/families/muse_spark/forward.zig b/zig/src/families/muse_spark/forward.zig
+index 1f3ea075..65b8e6ac 100644
+--- a/zig/src/families/muse_spark/forward.zig
++++ b/zig/src/families/muse_spark/forward.zig
+@@ -1,8 +1,10 @@
+ //! Muse Spark's decode forward on one GPU: windows of decode rows (any slots, any positions), EXL3 projections and
+-//! experts (the MiMo-V2 kernels), hand CUDA attention and glue (kernels/cuda/muse_spark). TP=2 is planned, not wired.
++//! experts (the MiMo-V2 kernels), hand CUDA attention and glue (kernels/cuda/muse_spark). Under TP=2 each rank runs
++//! its heads, latent half and expert width; four all-gathers a layer (docs/ZIG-MUSE.md in the recipe).
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
++const tp = @import("tp");
+ const load_ = @import("load.zig");
+ const exl3 = cuda.exl3;
+ const Weights = load_.Weights;
+@@ -52,7 +54,9 @@ const Bufs = struct {
+     lat: u64, // f16 [R, latent]
+     latn: u64, // f16 [R, latent]
+     acc: u64, // f16 [R, latent]
+-    head: u64, // f32 [R, head rows]
++    head: u64, // f32 [R, head stride]: this rank's head rows
++    recv: u64, // f32 [world, R, max(D, K * latent, head stride)]: all-gathers
++    latg: u64, // f16 [world, R, latent / world]: the gathered latent halves
+     am: u64, // i32 [R]
+     sc: exl3.Scratch,
+ };
+@@ -61,6 +65,7 @@ pub const Model = struct {
+     w: *const Weights,
+     d: *const cuda.Driver,
+     k3: *const exl3.Kernels,
++    comm: ?tp.Collective,
+     glue: cuda.Module,
+     attn: cuda.Module,
+     f_embed: cuda.Function,
+@@ -91,14 +96,15 @@ pub const Model = struct {
+     arena: load_.Arena,
+     gpa: std.mem.Allocator,
+ 
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, context: usize, rows: usize, slots: usize, s: Stream) !Model {
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
+         const cfg = w.cfg;
+-        if (w.world != 1) return error.TensorParallelNotWired;
++        if (w.world > 1 and comm == null) return error.NeedComm;
+         if (rows > DECODE_ROWS or rows == 0) return error.TooManyRows;
+         var m: Model = undefined;
+         m.w = w;
+         m.d = d;
+         m.k3 = k3;
++        m.comm = if (w.world > 1) comm else null;
+         m.context = context;
+         m.graphs = .empty;
+         m.replays = 0;
+@@ -159,7 +165,7 @@ pub const Model = struct {
+         const HQ = cfg.heads * hd;
+         const HKD = HK * hd;
+         const lat = cfg.latent;
+-        const vr = w.head.n;
++        const vr = w.head_stride;
+         var max_z: usize = zBytes(w.head, R);
+         for (w.layers) |ly| inline for (.{ "q", "k", "v", "g", "o", "pre", "post" }) |f| {
+             max_z = @max(max_z, zBytes(@field(ly, f), R));
+@@ -189,6 +195,8 @@ pub const Model = struct {
+         b.latn = try ar.zeros(R * lat * 2);
+         b.acc = try ar.zeros(R * lat * 2);
+         b.head = try ar.zeros(R * vr * 4);
++        b.recv = if (w.world > 1) try ar.zeros(w.world * R * @max(@max(D, cfg.top_k * lat), vr) * 4) else 0;
++        b.latg = if (w.world > 1) try ar.zeros(R * lat * 2) else 0;
+         b.am = try ar.zeros(R * 4);
+         const first = w.layers[0].experts;
+         const cfg_gu = try exl3.defaultConfig(first.dims, first.width, true);
+@@ -291,6 +299,11 @@ pub const Model = struct {
+     }
+ 
+     fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
++        return m.normParts(s, x, x_half, w, out, n, dim, eps, 0);
++    }
++
++    /// RMS norm of n rows; `parts` > 0: x is the ranks' gathered column slices of that width.
++    fn normParts(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64, parts: usize) !void {
+         var a: cuda.Args = .{};
+         a.add(x);
+         a.add(@as(c_int, @intFromBool(x_half)));
+@@ -298,16 +311,26 @@ pub const Model = struct {
+         a.add(out);
+         a.add(ci(dim));
+         a.add(@as(f32, @floatCast(eps)));
++        a.add(ci(parts));
+         try cuda.launch.launch(m.f_rms, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+-    /// res = res * alpha + rms(y') * beta, then x = half(rms(res) * w_next) (muse_gate_norm).
+-    fn gateNorm(m: *Model, s: Stream, y: u64, scale: u64, ab: u64, w_next: u64, n: usize) !void {
++    /// The ranks' fp32 partials [n, count]: all-gathered into recv (rank-major); returns (rank 0's, rank 1's or 0).
++    fn gather(m: *Model, s: Stream, part: u64, count: usize) ![2]u64 {
++        const c = m.comm orelse return .{ part, 0 };
++        try c.allGather(part, m.b.recv, count, .f32, s.handle);
++        return .{ m.b.recv, m.b.recv + count * 4 };
++    }
++
++    /// res = res * alpha + rms(y') * beta with y = the ranks' partials summed in rank order, then x = half(rms(res) *
++    /// w_next) (muse_gate_norm).
++    fn gateNorm(m: *Model, s: Stream, part: u64, scale: u64, ab: u64, w_next: u64, n: usize) !void {
+         const cfg = m.w.cfg;
++        const y = try m.gather(s, part, n * cfg.hidden);
+         var a: cuda.Args = .{};
+         a.add(m.b.res);
+-        a.add(y);
+-        a.add(@as(u64, 0));
++        a.add(y[0]);
++        a.add(y[1]);
+         a.add(scale);
+         a.add(@as(c_int, @intFromBool(scale != 0)));
+         a.add(@as(f32, @floatCast(cfg.post_eps)));
+@@ -398,7 +421,11 @@ pub const Model = struct {
+             try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(t), .y = 1, .z = 1 } }, s, &a);
+         }
+         try m.proj(s, L.pre, m.b.x, m.b.lat, false, n);
+-        try m.norm(s, m.b.lat, true, L.pre_norm, m.b.latn, n, cfg.latent, cfg.eps);
++        if (m.comm) |c| {
++            const half = L.pre.n; // this rank's latent outputs
++            try c.allGather(m.b.lat, m.b.latg, n * half, .f16, s.handle);
++            try m.normParts(s, m.b.latg, true, L.pre_norm, m.b.latn, n, cfg.latent, cfg.eps, half);
++        } else try m.norm(s, m.b.lat, true, L.pre_norm, m.b.latn, n, cfg.latent, cfg.eps);
+         // routed experts: group, rotate, gate / up, SwiGLU (fp32), down; per-slot outputs in sc.y [n * K, latent]
+         const k3 = m.k3;
+         const e = L.experts;
+@@ -414,15 +441,18 @@ pub const Model = struct {
+         try k3.grouped(s, .{ .x0 = sc.xd, .x1 = sc.xd, .tp0 = e.down_ptr, .tp1 = e.down_ptr, .k2_0 = e.down_k2, .k2_1 = e.down_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 1, .k = e.width, .n = e.dims, .p = p, .sk = dn[2], .slots = K, .maxm = w[1], .nexp_max = w[0], .nt = dn[0], .warps = dn[1], .pf = dn[3], .lo = e.k2_d[0], .hi = e.k2_d[1] });
+         try k3.downEpilogue(s, sc.z, m.b.pick, e.svh_d, sc.y, n, p, e.dims, dn[2], K, E);
+         {
++            const y = try m.gather(s, sc.y, p * e.dims); // each rank's partial over its half of every expert's width
+             var a: cuda.Args = .{};
+-            a.add(sc.y);
+-            a.add(@as(u64, 0));
++            a.add(y[0]);
++            a.add(y[1]);
+             a.add(m.b.wts);
+             a.add(L.expert_norm);
+             a.add(@as(f32, @floatCast(cfg.post_eps)));
+             a.add(m.b.acc);
+             a.add(ci(cfg.latent));
+             a.add(ci(K));
++            a.add(ci(m.w.rank * L.post.k)); // this rank's post_expert_proj inputs
++            a.add(ci(L.post.k));
+             try cuda.launch.launch(m.f_esum, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+         }
+         try m.proj(s, L.post, m.b.acc, m.b.part, true, n);
+@@ -469,15 +499,26 @@ pub const Model = struct {
+         a.add(@as(f32, @floatCast(cfgf.out_mult)));
+         a.add(@as(f32, @floatCast(cfgf.softcap)));
+         try cuda.launch.launch(m.f_softcap, .{ .grid = .{ .x = u(@min((n * m.w.head.n + 255) / 256, 4096)), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        // each rank's [n, its rows] block, gathered as n * stride elements a rank (rank 1's slice is a block shorter)
++        if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, n * m.w.head_stride, .f32, s.handle);
++    }
++
++    /// Where the rows' head slices are: (rank 0's [n, w0], rank 1's [n, w1] offset in elements, w0, w1).
++    fn heads(m: *const Model, n: usize) struct { base: u64, part: usize, w0: usize, w1: usize } {
++        if (m.comm == null) return .{ .base = m.b.head, .part = 0, .w0 = m.w.head.n, .w1 = 0 };
++        const st = m.w.head_stride;
++        return .{ .base = m.b.recv, .part = n * st, .w0 = st, .w1 = m.w.head_rows - st }; // rank 1: the padded head's rest
+     }
+ 
+     /// Each row's argmax over the real vocabulary on the device; only the ids reach the host.
+     pub fn argmaxTo(m: *Model, s: Stream, n: usize, out: []i32) !void {
++        const h = m.heads(n);
+         var a: cuda.Args = .{};
+-        a.add(m.b.head);
++        a.add(h.base);
+         a.add(m.b.am);
+-        a.add(ci(n));
+-        a.add(ci(m.w.head.n));
++        a.add(ci(h.w0));
++        a.add(ci(h.w1));
++        a.add(@as(i64, @intCast(h.part)));
+         a.add(ci(m.w.full.vocab));
+         try cuda.launch.launch(m.f_argmax, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+         try s.synchronize();
+@@ -487,8 +528,13 @@ pub const Model = struct {
+     /// The window's logits on the host: [n, vocab] (the head's padding rows dropped).
+     pub fn logitsTo(m: *Model, s: Stream, n: usize, out: []f32) !void {
+         const V = m.w.full.vocab;
++        const h = m.heads(n);
+         try s.synchronize();
+-        for (0..n) |r| try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[r * V ..].ptr), m.b.head + r * m.w.head.n * 4, V * 4), "logits");
++        for (0..n) |r| {
++            const c0 = @min(V, h.w0);
++            try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[r * V ..].ptr), h.base + r * h.w0 * 4, c0 * 4), "logits");
++            if (V > c0) try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[r * V + c0 ..].ptr), h.base + (h.part + r * h.w1) * 4, (V - c0) * 4), "logits");
++        }
+     }
+ };
+ 
+diff --git a/zig/src/families/muse_spark/load.zig b/zig/src/families/muse_spark/load.zig
+index 3bd328be..20fb0e02 100644
+--- a/zig/src/families/muse_spark/load.zig
++++ b/zig/src/families/muse_spark/load.zig
+@@ -45,6 +45,7 @@ pub const Weights = struct {
+     head: exl3.Linear, // a rank's 128-row blocks of the padded head
+     head_lo: usize, // its first vocabulary row
+     head_stride: usize, // columns a rank's slice takes in a gather
++    head_rows: usize, // the padded head's rows, every rank's together (202112)
+     arena: Arena,
+     gpa: std.mem.Allocator,
+ 
+@@ -71,7 +72,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
+     const view = try full.rankView(world);
+     var ck = try core.Checkpoint.openModel(gpa, io, model_dir);
+     defer ck.close();
+-    var w: Weights = .{ .full = full, .cfg = view, .rank = rank, .world = world, .embed = 0, .layers = &.{}, .norm = 0, .head = undefined, .head_lo = 0, .head_stride = 0, .arena = .{ .d = d, .gpa = gpa }, .gpa = gpa };
++    var w: Weights = .{ .full = full, .cfg = view, .rank = rank, .world = world, .embed = 0, .layers = &.{}, .norm = 0, .head = undefined, .head_lo = 0, .head_stride = 0, .head_rows = 0, .arena = .{ .d = d, .gpa = gpa }, .gpa = gpa };
+     errdefer w.deinit();
+     const ar = &w.arena;
+     const emb = try ck.get(P ++ "embed_tokens.weight");
+@@ -140,6 +141,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
+     const hc = config.headCut(hm.n(), rank, world);
+     w.head_lo = hc.lo;
+     w.head_stride = config.headStride(hm.n(), world);
++    w.head_rows = hm.n();
+     w.head = try ml.linear(gpa, ar, try ml.cut(gpa, hm, mc(hc)));
+     return w;
+ }
+diff --git a/zig/src/families/muse_spark/m1_main.zig b/zig/src/families/muse_spark/m1_main.zig
+index ff529031..6db5dd5c 100644
+--- a/zig/src/families/muse_spark/m1_main.zig
++++ b/zig/src/families/muse_spark/m1_main.zig
+@@ -6,9 +6,12 @@
+ //! <name>.greedy.i32, and with MUSE_CAPTURE=1 <name>.res.f32 / <name>.attn.f32 (fp32 [layers, T, D]).
+ //! Knobs: MUSE_ROWS (prompt rows a text a window, 1), MUSE_SLOTS (texts sharing a window, 1), MUSE_LAYERS (first
+ //! layers only), MUSE_CONTEXT (4096), MUSE_GREEDY (32), MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS.
++//! TP=2: TF_TP_WORLD=2 / TF_TP_RANK / TF_TP_MASTER / TF_TP_PORT on both nodes (same IN_DIR files on each); both
++//! ranks run the same windows, rank 0 writes OUT_DIR.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
++const tp = @import("tp");
+ const muse = @import("muse_spark");
+ const Model = muse.forward.Model;
+ 
+@@ -110,23 +113,32 @@ pub fn main(init: std.process.Init) !u8 {
+     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
+     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
+ 
++    const tpc: ?tp.Config = if (std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
++    const world: usize = if (tpc) |c| c.world else 1;
++    const rank: usize = if (tpc) |c| c.rank else 0;
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+-    var ctx = try cuda.Context.init(&driver, 0);
++    var ctx = try cuda.Context.init(&driver, if (tpc) |c| @intCast(c.device) else 0);
+     defer ctx.deinit();
++    var session: tp.Session = undefined;
++    if (world > 1) try session.open(&driver, tpc.?, @import("tp_kernel").mailbox);
++    defer if (world > 1) {
++        session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast when this rank ends first
++        session.close();
++    };
+     var s = try cuda.Stream.init(&driver, false);
+     defer s.deinit();
+     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-    var w = try muse.load.load(gpa, io, &driver, args[2], 0, 1, .{ .max_layers = max_layers, .log = true });
++    var w = try muse.load.load(gpa, io, &driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0 });
+     defer w.deinit();
+     var k3 = try cuda.exl3.Kernels.load(&driver);
+     defer k3.deinit();
+-    var model = try Model.init(gpa, &driver, &w, &k3, context, rows_per * slots, slots, s);
++    var model = try Model.init(gpa, &driver, &w, &k3, if (world > 1) session.comm() else null, context, rows_per * slots, slots, s);
+     defer model.deinit();
+     const L = w.layers.len;
+     const D = w.cfg.hidden;
+     const V = w.full.vocab;
+-    std.debug.print("[m1] loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), rows_per, slots, context });
++    std.debug.print("[m1] rank {d}/{d}: loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ rank, world, L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), rows_per, slots, context });
+ 
+     // texts
+     const names_path = try std.fs.path.join(ar, &.{ args[3], "names.txt" });
+@@ -202,18 +214,20 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t1)) / 1e9;
+     std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s ({s}; not a speed number); graphs captured {d}, replayed {d}\n", .{ windows, total_rows, secs, if (graphs) "graphed" else "eager", model.captures, model.replays });
+-    for (texts.items) |*t| {
++    for (texts.items) |*t| if (rank == 0) {
+         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.logits.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.logits));
+         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.greedy.i32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.greedy.items));
+         if (t.res) |x| try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.res.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(x));
+         if (t.attn) |x| try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.attn.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(x));
+         std.debug.print("[m1] {s}: {d} tokens, greedy {any}\n", .{ t.name, t.ids.len, t.greedy.items[0..@min(8, t.greedy.items.len)] });
++    };
++    for (texts.items) |*t| {
+         gpa.free(t.logits);
+         if (t.res) |x| gpa.free(x);
+         if (t.attn) |x| gpa.free(x);
+         if (t.states) |x| gpa.free(std.mem.sliceAsBytes(x));
+         t.greedy.deinit(gpa);
+     }
+-    std.debug.print("DONE m1\n", .{});
++    std.debug.print("DONE m1 rank {d}\n", .{rank});
+     return 0;
+ }
+-- 
+2.53.0
+

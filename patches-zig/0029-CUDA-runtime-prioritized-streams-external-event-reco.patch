@@ -1,0 +1,143 @@
+From 6256a6b32483374327516b65a0b5235474370d0c Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:36:28 +0700
+Subject: [PATCH 29/60] CUDA runtime: prioritized streams, external event
+ records, 2D async copies and the primary context's schedule
+
+(cherry picked from commit 6d44dab6efa4c66ea89ddb92b2de5626033b5252)
+---
+ zig/src/cuda/abi.zig     | 31 +++++++++++++++++++++++++++++++
+ zig/src/cuda/context.zig | 10 ++++++++++
+ zig/src/cuda/stream.zig  | 21 +++++++++++++++++++++
+ 3 files changed, 62 insertions(+)
+
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 5418ce01..ba7da3f0 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -151,6 +151,12 @@ pub const ExecUpdateResultInfo = extern struct {
+     error_from_node: GraphNode,
+ };
+ 
++/// CU_EVENT_RECORD_EXTERNAL: in a capture, an event record node outside work can wait on; else a plain record.
++pub const event_record_external: c_uint = 0x1;
++
++/// CU_MEMORYTYPE_DEVICE
++pub const memory_type_device: c_uint = 2;
++
+ pub const jit_info_log_buffer: c_int = 3;
+ pub const jit_info_log_buffer_size: c_int = 4;
+ pub const jit_error_log_buffer: c_int = 5;
+@@ -171,6 +177,7 @@ pub const Api = struct {
+     cuDeviceGetAttribute: *const fn (*c_int, DeviceAttribute, Device) callconv(.c) R,
+     cuDeviceTotalMem_v2: *const fn (*usize, Device) callconv(.c) R,
+     cuDevicePrimaryCtxRetain: *const fn (*Context, Device) callconv(.c) R,
++    cuDevicePrimaryCtxSetFlags_v2: *const fn (Device, c_uint) callconv(.c) R,
+     cuDevicePrimaryCtxRelease_v2: *const fn (Device) callconv(.c) R,
+     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
+     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
+@@ -195,6 +202,8 @@ pub const Api = struct {
+     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
+     cuMemsetD32Async: *const fn (DevicePtr, c_uint, usize, Stream) callconv(.c) R,
+     cuStreamCreate: *const fn (*Stream, c_uint) callconv(.c) R,
++    cuStreamCreateWithPriority: *const fn (*Stream, c_uint, c_int) callconv(.c) R,
++    cuCtxGetStreamPriorityRange: *const fn (*c_int, *c_int) callconv(.c) R,
+     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
+     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
+     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
+@@ -202,6 +211,7 @@ pub const Api = struct {
+     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
+     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
+     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
++    cuEventRecordWithFlags: *const fn (Event, Stream, c_uint) callconv(.c) R,
+     cuEventSynchronize: *const fn (Event) callconv(.c) R,
+     cuEventQuery: *const fn (Event) callconv(.c) R,
+     cuEventElapsedTime: *const fn (*f32, Event, Event) callconv(.c) R,
+@@ -250,3 +260,24 @@ test "CUDA device attribute matches the RDMA VMM capability ABI" {
+         DeviceAttribute.gpu_direct_rdma_with_cuda_vmm_supported,
+     ));
+ }
++
++test "Memcpy2D has CUDA_MEMCPY2D's layout: each side's five fields, then the copy's width and rows" {
++    const t = @import("std").testing;
++    const want = [_]struct { []const u8, usize }{
++        .{ "src_x", 0 },  .{ "src_y", 8 },        .{ "src_type", 16 },  .{ "src_host", 24 },
++        .{ "src", 32 },   .{ "src_array", 40 },   .{ "src_pitch", 48 }, .{ "dst_x", 56 },
++        .{ "dst_y", 64 }, .{ "dst_type", 72 },    .{ "dst_host", 80 },  .{ "dst", 88 },
++        .{ "dst_array", 96 }, .{ "dst_pitch", 104 }, .{ "width", 112 }, .{ "height", 120 },
++    };
++    const names = @typeInfo(Memcpy2D).@"struct".field_names;
++    try t.expectEqual(want.len, names.len);
++    inline for (names, 0..) |name, i| {
++        try t.expectEqualStrings(want[i][0], name);
++        try t.expectEqual(want[i][1], @offsetOf(Memcpy2D, name));
++    }
++    try t.expectEqual(@as(usize, 128), @sizeOf(Memcpy2D));
++    // a default copy is device to device, so a caller sets only addresses, pitches and the extent
++    const c: Memcpy2D = .{ .src = 0, .src_pitch = 0, .dst = 0, .dst_pitch = 0, .width = 0, .height = 0 };
++    try t.expectEqual(memory_type_device, @as(c_uint, @intCast(c.src_type)));
++    try t.expectEqual(memory_type_device, @as(c_uint, @intCast(c.dst_type)));
++}
+diff --git a/zig/src/cuda/context.zig b/zig/src/cuda/context.zig
+index c9e15ab6..b70d872d 100644
+--- a/zig/src/cuda/context.zig
++++ b/zig/src/cuda/context.zig
+@@ -10,6 +10,16 @@ pub const Context = struct {
+     device: abi.Device,
+     handle: abi.Context,
+ 
++    /// How the host waits for the device (CU_CTX_SCHED_*); host scheduling only, no launch or value changes.
++    pub const Schedule = enum(c_uint) { auto = 0, spin = 1, yield = 2, blocking = 4 };
++
++    /// The device's primary context's schedule, before any `init` of it (the driver ignores it on an active context).
++    pub fn setSchedule(d: *const Driver, ordinal: c_int, s: Schedule) Error!void {
++        var dev: abi.Device = 0;
++        try d.check(d.api.cuDeviceGet(&dev, ordinal), "cuDeviceGet");
++        try d.check(d.api.cuDevicePrimaryCtxSetFlags_v2(dev, @backingInt(s)), "cuDevicePrimaryCtxSetFlags");
++    }
++
+     pub fn init(d: *const Driver, ordinal: c_int) Error!Context {
+         var dev: abi.Device = 0;
+         try d.check(d.api.cuDeviceGet(&dev, ordinal), "cuDeviceGet");
+diff --git a/zig/src/cuda/stream.zig b/zig/src/cuda/stream.zig
+index dcf2d207..f31f724d 100644
+--- a/zig/src/cuda/stream.zig
++++ b/zig/src/cuda/stream.zig
+@@ -15,6 +15,22 @@ pub const Stream = struct {
+         return .{ .d = d, .handle = s };
+     }
+ 
++    /// A non-blocking stream at `priority`, clamped to the context's range (lower numbers run first).
++    pub const Priority = enum { default, highest };
++
++    pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
++        var least: c_int = 0;
++        var greatest: c_int = 0;
++        try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
++        var s: abi.Stream = null;
++        const p: c_int = switch (priority) {
++            .default => 0,
++            .highest => greatest,
++        };
++        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, p), "cuStreamCreateWithPriority");
++        return .{ .d = d, .handle = s };
++    }
++
+     pub fn deinit(self: *Stream) void {
+         _ = self.d.api.cuStreamDestroy_v2(self.handle);
+         self.* = undefined;
+@@ -58,6 +74,11 @@ pub const Event = struct {
+         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
+     }
+ 
++    /// A record a capture keeps as an event record node: outside waits after a launch wait for that point of it.
++    pub fn recordExternal(self: Event, stream: Stream) Error!void {
++        try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, abi.event_record_external), "cuEventRecordWithFlags");
++    }
++
+     pub fn synchronize(self: Event) Error!void {
+         try self.d.check(self.d.api.cuEventSynchronize(self.handle), "cuEventSynchronize");
+     }
+-- 
+2.53.0
+

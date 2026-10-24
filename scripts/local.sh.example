@@ -1,0 +1,13 @@
+# Copy to scripts/local.sh (gitignored) and set your own nodes. scripts/config.sh sources it last, so anything set
+# here overrides config.sh. The values below are placeholders.
+
+HEAD=spark-a                 # rank 0: the node you run ./start.sh on; serves the API
+WORKER=user@192.0.2.2        # rank 1 as ssh reaches it from the head, over the CX7 link
+MASTER=192.0.2.1             # the head's CX7 address (rank rendezvous and NCCL)
+SRC_NODE=spark-b             # only for making the pack yourself: the node that holds the MXFP4 source
+# WORKER_IP=192.0.2.2        # the worker's CX7 address; defaults to WORKER's host part
+
+# Other common overrides:
+# MODELS_ROOT=/data/models/muse-spark
+# NCCL_IFNAME=enp1s0f0np0    # DGX Spark defaults; change if your CX7 ports are named differently
+# NCCL_HCAS=rocep1s0f0,roceP2p1s0f0

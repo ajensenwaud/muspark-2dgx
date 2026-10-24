@@ -1,0 +1,76 @@
+From fd733cbe34ea75b04849994eaa24e998451f1f4e Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:09:44 +0700
+Subject: [PATCH 10/60] TP test runner: a binary built without the mailbox
+ kernel refuses the kernel backends up front; run_hosts.sh passes HCA picks
+
+- `tf-tp-test kernel` reports the embedded kernel and exits 1 without one. `suite` and `failfast` on the mailbox or
+  RoCE backend stop at once with a message that names `-Dtp-nvcc`, instead of failing later on a missing kernel.
+- `run_hosts.sh` stops before any step when the kernel is missing. It exports TF_TP_ROCE_HCA and NCCL_IB_HCA (derived
+  from TF_TP_ROCE_HCA when unset), warns when a host has more than one RDMA device and neither is set, and records all
+  three variables in host.txt.
+
+(cherry picked from commit d7510ef8834b9b988e14891ca20b6da81aa69862)
+---
+ zig/src/fabric/tp/gpu_main.zig | 13 +++++++++++--
+ zig/src/fabric/tp/run_hosts.sh | 11 ++++++++++-
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/fabric/tp/gpu_main.zig b/zig/src/fabric/tp/gpu_main.zig
+index c5668a7b..e3b9a420 100644
+--- a/zig/src/fabric/tp/gpu_main.zig
++++ b/zig/src/fabric/tp/gpu_main.zig
+@@ -1,4 +1,4 @@
+-//! `tf-tp-test suite | failfast RANK fatal|kill | roce-host`: one rank of a two-process TP=2 test on real GPUs.
++//! `tf-tp-test suite | failfast RANK fatal|kill | roce-host | kernel`: one rank of a two-process TP=2 test.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const tp = @import("tp");
+@@ -11,11 +11,20 @@ const max_bytes = (4 << 20) + 4096;
+ pub fn main(init: std.process.Init) !u8 {
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+     if (args.len < 2) {
+-        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill | roce-host\n", .{});
++        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill | roce-host | kernel\n", .{});
+         return 2;
+     }
++    // `kernel`: whether the build embeds the mailbox kernel (-Dtp-nvcc or -Dtp-fatbin), for scripts to check first
++    if (std.mem.eql(u8, args[1], "kernel")) {
++        std.debug.print("mailbox kernel {d} B\n", .{tp_kernel.mailbox.len});
++        return if (tp_kernel.mailbox.len > 0) 0 else 1;
++    }
+     const cfg = try tp.Config.fromEnv();
+     if (std.mem.eql(u8, args[1], "roce-host")) return @import("roce_host.zig").run(cfg, init.gpa);
++    if (cfg.backend != .nccl and tp_kernel.mailbox.len == 0) {
++        std.debug.print("FAIL TF_COMM_BACKEND={t} needs the mailbox kernel: rebuild with -Dtp-nvcc or -Dtp-fatbin\n", .{cfg.backend});
++        return 2;
++    }
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+     var ctx = try cuda.Context.init(&driver, @intCast(cfg.device));
+diff --git a/zig/src/fabric/tp/run_hosts.sh b/zig/src/fabric/tp/run_hosts.sh
+index 17a4ccbe..5f00168f 100644
+--- a/zig/src/fabric/tp/run_hosts.sh
++++ b/zig/src/fabric/tp/run_hosts.sh
+@@ -4,8 +4,17 @@ set -u
+ RANK=${1:?rank}; MASTER=${2:?master address}; BIN=${3:?tf-tp-test}; OUT=${4:?outdir}
+ mkdir -p "$OUT"
+ [ -n "${NCCL_SOCKET_IFNAME:-}" ] && export NCCL_SOCKET_IFNAME # else NCCL picks the interface
++# NCCL uses the RoCE wire's devices unless NCCL_IB_HCA is set: the names without `:gid` (NCCL reads `:N` as a port)
++[ -n "${TF_TP_ROCE_HCA:-}" ] && [ -z "${NCCL_IB_HCA:-}" ] && NCCL_IB_HCA=$(echo "$TF_TP_ROCE_HCA" | sed 's/:[0-9]*//g; s/ //g')
++[ -n "${TF_TP_ROCE_HCA:-}" ] && export TF_TP_ROCE_HCA
++[ -n "${NCCL_IB_HCA:-}" ] && export NCCL_IB_HCA
++"$BIN" kernel > /dev/null 2>&1 || { echo "error: $BIN has no mailbox kernel: rebuild with -Dtp-nvcc=PATH or -Dtp-fatbin=PATH" >&2; exit 2; }
+ ulimit -l unlimited 2> /dev/null || echo "warning: memlock is $(ulimit -l) KiB: ibv_reg_mr of the RoCE region may fail" >&2
+-{ hostname; nvidia-smi -L; ibv_devices 2>&1; ulimit -l; } > "$OUT/host.txt" 2>&1
++DEVICES=$(ibv_devices 2> /dev/null | tail -n +3 | grep -c .)
++if [ "$DEVICES" -gt 1 ] && [ -z "${TF_TP_ROCE_HCA:-}${NCCL_IB_HCA:-}" ]; then
++    echo "warning: $DEVICES RDMA devices and no TF_TP_ROCE_HCA / NCCL_IB_HCA: name the peer's ports (README.md)" >&2
++fi
++{ hostname; nvidia-smi -L; ibv_devices 2>&1; ulimit -l; env | grep -E '^(TF_TP_ROCE_HCA|NCCL_IB_HCA|NCCL_SOCKET_IFNAME)='; } > "$OUT/host.txt" 2>&1
+ PORT=29700
+ step() { # NAME BACKEND ARGS...: this host's rank; log OUT/NAME.log ending with an EXIT line
+     local name=$1 backend=$2; shift 2
+-- 
+2.53.0
+

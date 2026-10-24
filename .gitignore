@@ -1,0 +1,4 @@
+scripts/local.sh
+logs/
+__pycache__/
+vendor/

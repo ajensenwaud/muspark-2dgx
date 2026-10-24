@@ -1,0 +1,894 @@
+From e8deac5b0bf296137bc6f36011e976e5ffd1a645 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:00:59 +1100
+Subject: [PATCH 50/60] Muse Spark: the prompt path (TF_MUSE_PROMPT=1): prompt
+ chunks as wide windows, experts in 512-row grouped windows, the head on the
+ last row; bit-exact with decode rows; Op.prompt on the plan link, tf-muse
+ prompt check
+
+---
+ zig/src/families/muse_spark/dflash2.zig     |  19 +-
+ zig/src/families/muse_spark/engine.zig      |  65 +++-
+ zig/src/families/muse_spark/forward.zig     |  43 ++-
+ zig/src/families/muse_spark/m1_main.zig     |  10 +-
+ zig/src/families/muse_spark/native.zig      |  23 +-
+ zig/src/families/muse_spark/prompt.zig      | 312 ++++++++++++++++++++
+ zig/src/families/muse_spark/prompt_main.zig | 127 ++++++++
+ zig/src/families/muse_spark/root.zig        |   2 +
+ 8 files changed, 573 insertions(+), 28 deletions(-)
+ create mode 100644 zig/src/families/muse_spark/prompt.zig
+ create mode 100644 zig/src/families/muse_spark/prompt_main.zig
+
+diff --git a/zig/src/families/muse_spark/dflash2.zig b/zig/src/families/muse_spark/dflash2.zig
+index 1c691a24..ff0298ba 100644
+--- a/zig/src/families/muse_spark/dflash2.zig
++++ b/zig/src/families/muse_spark/dflash2.zig
+@@ -344,10 +344,15 @@ pub const Drafter = struct {
+ 
+     /// The target's tap: residual rows after target layer `layer` (when tapped) into the tap buffer (fp16).
+     pub fn tap(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize) !void {
++        return dr.tapInto(s, layer, res, n, dr.b.tapbuf);
++    }
++
++    /// tap into another buffer of the same row layout ([rows, taps, D] fp16): the prompt path's chunk-wide taps.
++    pub fn tapInto(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize, buf: u64) !void {
+         for (dr.taps, 0..) |t, j| if (t == layer) {
+             var a: cuda.Args = .{};
+             a.add(res);
+-            a.add(dr.b.tapbuf);
++            a.add(buf);
+             a.add(ci(dr.c.hidden));
+             a.add(ci(dr.taps.len));
+             a.add(ci(j));
+@@ -358,17 +363,23 @@ pub const Drafter = struct {
+     /// The context update of the target's n rows (positions / slots staged in its buffers): fc, hidden_norm, then each
+     /// layer's k (k_norm, RoPE at the row's position) and v into the window ring.
+     pub fn update(dr: *Drafter, s: Stream, n: usize) !void {
++        return dr.updateAt(s, dr.b.tapbuf, dr.m.b.pos, dr.m.b.slot, n);
++    }
++
++    /// update from explicit taps [n, taps, D] fp16 and the rows' positions / slots (n <= the target's window rows).
++    pub fn updateAt(dr: *Drafter, s: Stream, taps: u64, pos: u64, slot: u64, n: usize) !void {
+         const m = dr.m;
+-        try dr.proj(s, dr.fc, dr.b.tapbuf, dr.b.ctx16, false, n);
++        if (n > m.rows) return error.WindowTooWide;
++        try dr.proj(s, dr.fc, taps, dr.b.ctx16, false, n);
+         if (m.comm) |comm| {
+             try comm.allGather(dr.b.ctx16, dr.b.ctxg, n * dr.fc.n, .f16, s.handle);
+             try dr.rms(s, dr.b.ctxg, true, dr.fc_norm, dr.b.ctx, n, dr.fc.n);
+         } else try dr.rms(s, dr.b.ctx16, true, dr.fc_norm, dr.b.ctx, n, 0);
+         for (dr.layers, 0..) |L, i| {
+             try dr.proj(s, L.k, dr.b.ctx, dr.b.kb, false, n);
+-            try dr.normRope(s, dr.b.kb, L.k_norm, m.b.pos, m.b.slot, 0, dr.kc[i], dr.c.kv_heads, n);
++            try dr.normRope(s, dr.b.kb, L.k_norm, pos, slot, 0, dr.kc[i], dr.c.kv_heads, n);
+             try dr.proj(s, L.v, dr.b.ctx, dr.b.vb, false, n);
+-            try dr.store(s, dr.b.vb, m.b.pos, m.b.slot, dr.vc[i], n);
++            try dr.store(s, dr.b.vb, pos, slot, dr.vc[i], n);
+         }
+     }
+ 
+diff --git a/zig/src/families/muse_spark/engine.zig b/zig/src/families/muse_spark/engine.zig
+index dc1fb032..b7df32e7 100644
+--- a/zig/src/families/muse_spark/engine.zig
++++ b/zig/src/families/muse_spark/engine.zig
+@@ -7,22 +7,44 @@ const tp = @import("tp");
+ const load_ = @import("load.zig");
+ const fwd = @import("forward.zig");
+ const dflash2 = @import("dflash2.zig");
++const prompt_ = @import("prompt.zig");
+ 
+ /// The plan link's words: one GPU step each, executed by every rank in order.
+-pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3 };
++pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, prompt = 4 };
+ 
+ /// What rank 0 announces first so every rank builds the same model.
+-pub const Setup = struct { context: usize, slots: usize, drafts: bool = false };
++/// prompt_rows > 0: the prompt path (prompt.zig) with chunks of that many rows, experts in prompt_ewin-row windows.
++pub const Setup = struct { context: usize, slots: usize, drafts: bool = false, prompt_rows: usize = 0, prompt_ewin: usize = prompt_.EWIN, prompt_exact: bool = true };
+ 
+-/// The hello words: [hello, 3, context, slots, drafts].
+-pub fn hello(su: Setup) [5]i64 {
+-    return .{ @backingInt(Op.hello), 3, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts) };
++/// The hello words: [hello, 6, context, slots, drafts, prompt rows, experts window, exact].
++pub fn hello(su: Setup) [8]i64 {
++    return .{ @backingInt(Op.hello), 6, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), @intCast(su.prompt_rows), @intCast(su.prompt_ewin), @intFromBool(su.prompt_exact) };
+ }
+ 
+ /// The setup a follower reads from rank 0's hello.
+ pub fn setupOf(words: []const i64) !Setup {
+     if (words.len < 4 or words[0] != @backingInt(Op.hello)) return error.NoHello;
+-    return .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words.len >= 5 and words[4] != 0 };
++    var su: Setup = .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words.len >= 5 and words[4] != 0 };
++    if (words.len >= 8) {
++        su.prompt_rows = @intCast(words[5]);
++        su.prompt_ewin = @intCast(words[6]);
++        su.prompt_exact = words[7] != 0;
++    }
++    return su;
++}
++
++/// The prompt path's settings from the environment (rank 0): TF_MUSE_PROMPT=1 turns it on; TF_MUSE_PROMPT_ROWS
++/// (chunk rows, 1024), TF_MUSE_PROMPT_EWIN (experts window, 512), TF_MUSE_PROMPT_EXACT=0 (unsplit gate / up).
++pub fn promptEnv(su: *Setup) void {
++    const on = envUsize("TF_MUSE_PROMPT", 0) != 0;
++    su.prompt_rows = if (on) envUsize("TF_MUSE_PROMPT_ROWS", prompt_.CAP) else 0;
++    su.prompt_ewin = envUsize("TF_MUSE_PROMPT_EWIN", prompt_.EWIN);
++    su.prompt_exact = envUsize("TF_MUSE_PROMPT_EXACT", 1) != 0;
++}
++
++pub fn envUsize(name: [*:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+ }
+ 
+ /// The drafter pack: TF_MUSE_DRAFTER (the same path on every rank), else `<pack>/dflash2`.
+@@ -51,6 +73,7 @@ pub const Engine = struct {
+     k3: cuda.exl3.Kernels,
+     model: fwd.Model,
+     dr: ?*dflash2.Drafter = null,
++    pr: ?*prompt_.Prompt = null,
+     session: ?*tp.Session = null,
+     s: cuda.Stream,
+     logits: []f32, // [DECODE_ROWS, V] host
+@@ -82,6 +105,11 @@ pub const Engine = struct {
+             if (rank == 0) std.log.info("muse drafter: {s}, block {d}, {d:.2} GiB on this rank (split over {d})", .{ ddir, e.dr.?.block, @as(f64, @floatFromInt(e.dr.?.bytes())) / (1 << 30), world });
+         }
+         errdefer if (e.dr) |dr| dr.deinit();
++        if (su.prompt_rows > 0) {
++            e.pr = try prompt_.Prompt.init(&e.model, gpa, su.prompt_rows, su.prompt_ewin, su.prompt_exact, e.s);
++            if (rank == 0) std.log.info("muse prompt path: chunks of {d} rows, experts in {d}-row windows ({s}), {d:.2} GiB scratch", .{ e.pr.?.cap, e.pr.?.ewin, if (e.pr.?.exact) "exact" else "unsplit", @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
++        }
++        errdefer if (e.pr) |pr| pr.deinit();
+         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
+         return e;
+     }
+@@ -90,6 +118,7 @@ pub const Engine = struct {
+         const gpa = e.gpa;
+         e.words.deinit(gpa);
+         gpa.free(e.logits);
++        if (e.pr) |pr| pr.deinit();
+         if (e.dr) |dr| dr.deinit();
+         e.model.deinit();
+         e.k3.deinit();
+@@ -114,6 +143,22 @@ pub const Engine = struct {
+         if (want == .ids) try e.model.argmaxTo(e.s, rows.len, e.ids[0..rows.len]);
+     }
+ 
++    /// A prompt chunk on every rank (prompt.zig): `tokens` at [p0, p0 + n) of `slot`; the last row's argmax in ids[0]
++    /// (`ids`) or its logits in logits[0 .. V] (`logits`).
++    pub fn prompt(e: *Engine, slot: u32, p0: usize, tokens: []const i64, want: Want) !void {
++        const pr = e.pr orelse return error.NoPromptPath;
++        e.words.clearRetainingCapacity();
++        try e.words.appendSlice(e.gpa, &.{ @backingInt(Op.prompt), @intCast(tokens.len), slot, @intCast(p0) });
++        try e.words.appendSlice(e.gpa, tokens);
++        try e.send(e.words.items);
++        try pr.chunk(e.s, slot, p0, tokens);
++        switch (want) {
++            .none => try e.s.synchronize(),
++            .ids => try e.model.argmaxTo(e.s, 1, e.ids[0..1]),
++            .logits => try e.model.logitsTo(e.s, 1, e.logits[0..e.w.full.vocab]),
++        }
++    }
++
+     /// A draft pass on every rank: drafts [S, block - 1] into `out` (each stream's anchor token, position, slot).
+     pub fn draft(e: *Engine, tokens: []const i64, pos0: []const u32, slots: []const u32, out: []i32) !void {
+         e.words.clearRetainingCapacity();
+@@ -149,6 +194,12 @@ pub const Engine = struct {
+                 }
+                 try dr.draft(e.s, t[0..n], p[0..n], sl[0..n], &out);
+             },
++            .prompt => {
++                const pr = e.pr orelse return error.NoPromptPath;
++                if (words.len != 4 + n or n > pr.cap) return error.BadPlan;
++                try pr.chunk(e.s, @intCast(words[2]), @intCast(words[3]), words[4..]);
++                try e.s.synchronize();
++            },
+             .stop => return false,
+             .hello => return error.LateHello,
+         }
+@@ -161,6 +212,8 @@ test "the hello carries the setup" {
+     try std.testing.expectEqual(su, try setupOf(&hello(su)));
+     const plain: Setup = .{ .context = 65536, .slots = 2 };
+     try std.testing.expectEqual(plain, try setupOf(&hello(plain)));
++    const pp: Setup = .{ .context = 32768, .slots = 4, .drafts = true, .prompt_rows = 1024, .prompt_ewin = 256, .prompt_exact = false };
++    try std.testing.expectEqual(pp, try setupOf(&hello(pp)));
+     try std.testing.expectEqual(plain, try setupOf(&.{ @backingInt(Op.hello), 2, 65536, 2 })); // an older rank 0
+     try std.testing.expectError(error.NoHello, setupOf(&.{ 3, 0 }));
+ }
+diff --git a/zig/src/families/muse_spark/forward.zig b/zig/src/families/muse_spark/forward.zig
+index 0c940da9..e44a42fe 100644
+--- a/zig/src/families/muse_spark/forward.zig
++++ b/zig/src/families/muse_spark/forward.zig
+@@ -30,6 +30,11 @@ pub fn chunkKeys(bucket: usize) usize {
+     return @max(CK, std.mem.alignForward(usize, (bucket + MAX_CHUNKS - 1) / MAX_CHUNKS, CK));
+ }
+ 
++/// Key chunks a full layer's row at position pos reads eagerly (its own chunk width).
++pub fn rowChunks(context: usize, pos: usize) usize {
++    return pos / chunkKeys(bucketOf(context, pos + 1)) + 1;
++}
++
+ /// One decode row: a stream's cache slot, its position, its input token.
+ pub const Row = struct { slot: u32, pos: u32, token: i64 };
+ 
+@@ -279,7 +284,7 @@ pub const Model = struct {
+     pub fn forward(m: *Model, s: Stream, rows: []const Row, out: ?[]f32, cap: ?Capture) !void {
+         try m.stage(rows);
+         var chunks: usize = 1; // the most any row's own chunking takes
+-        for (rows) |r| chunks = @max(chunks, r.pos / chunkKeys(bucketOf(m.context, r.pos + 1)) + 1);
++        for (rows) |r| chunks = @max(chunks, rowChunks(m.context, r.pos));
+         try m.run(s, rows.len, chunks, cap);
+         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+     }
+@@ -318,12 +323,12 @@ pub const Model = struct {
+         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+     }
+ 
+-    fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
++    pub fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
+         return m.normParts(s, x, x_half, w, out, n, dim, eps, 0);
+     }
+ 
+     /// RMS norm of n rows; `parts` > 0: x is the ranks' gathered column slices of that width.
+-    fn normParts(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64, parts: usize) !void {
++    pub fn normParts(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64, parts: usize) !void {
+         var a: cuda.Args = .{};
+         a.add(x);
+         a.add(@as(c_int, @intFromBool(x_half)));
+@@ -345,10 +350,15 @@ pub const Model = struct {
+     /// res = res * alpha + rms(y') * beta with y = the ranks' partials summed in rank order, then x = half(rms(res) *
+     /// w_next) (muse_gate_norm).
+     fn gateNorm(m: *Model, s: Stream, part: u64, scale: u64, ab: u64, w_next: u64, xf: u64, n: usize) !void {
++        const y = try m.gather(s, part, n * m.w.cfg.hidden);
++        try m.gateNormAt(s, m.b.res, y, scale, ab, w_next, m.b.x, xf, n);
++    }
++
++    /// muse_gate_norm on explicit buffers: res [n, D] fp32 in place, y the ranks' partials, x [n, D] fp16 out.
++    pub fn gateNormAt(m: *Model, s: Stream, res: u64, y: [2]u64, scale: u64, ab: u64, w_next: u64, x: u64, xf: u64, n: usize) !void {
+         const cfg = m.w.cfg;
+-        const y = try m.gather(s, part, n * cfg.hidden);
+         var a: cuda.Args = .{};
+-        a.add(m.b.res);
++        a.add(res);
+         a.add(y[0]);
+         a.add(y[1]);
+         a.add(scale);
+@@ -357,18 +367,27 @@ pub const Model = struct {
+         a.add(ab);
+         a.add(w_next);
+         a.add(@as(f32, @floatCast(cfg.eps)));
+-        a.add(m.b.x);
++        a.add(x);
+         a.add(xf);
+         a.add(ci(cfg.hidden));
+         try cuda.launch.launch(m.f_gate, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// An EXL3 projection of n rows: x [n, K] fp16 -> out [n, N] fp16 or fp32.
+-    fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
++    pub fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
+         try m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, if (l.split[0] > 1) m.b.z else 0, n);
+     }
+ 
++    /// A window's attention buffers: q, k, v, g in; qo scratch; att out; the rows' positions and slots.
++    pub const AttnIo = struct { q: u64, k: u64, v: u64, g: u64, qo: u64, att: u64, pos: u64, slot: u64 };
++
+     fn attention(m: *Model, s: Stream, i: usize, n: usize, chunks: usize) !void {
++        return m.attentionIo(s, i, n, chunks, .{ .q = m.b.q, .k = m.b.k, .v = m.b.v, .g = m.b.g, .qo = m.b.qo, .att = m.b.att, .pos = m.b.pos, .slot = m.b.slot });
++    }
++
++    /// Attention of n <= rows rows (partials in the decode buffers): QK prep and cache write, chunks, merge + gate.
++    pub fn attentionIo(m: *Model, s: Stream, i: usize, n: usize, chunks: usize, io: AttnIo) !void {
++        if (n > m.rows) return error.WindowTooWide;
+         const cfg = m.w.cfg;
+         const H = cfg.heads;
+         const HK = cfg.kv_heads;
+@@ -376,9 +395,9 @@ pub const Model = struct {
+         const len = if (full) m.context else m.ring;
+         {
+             var a: cuda.Args = .{};
+-            inline for (.{ m.b.q, m.b.k, m.b.v, m.cos, m.sin }) |p| a.add(p);
++            inline for (.{ io.q, io.k, io.v, m.cos, m.sin }) |p| a.add(p);
+             a.add(@as(c_int, @intFromBool(cfg.rope(i))));
+-            inline for (.{ m.b.pos, m.b.slot, m.b.qo, m.kc[i], m.vc[i] }) |p| a.add(p);
++            inline for (.{ io.pos, io.slot, io.qo, m.kc[i], m.vc[i] }) |p| a.add(p);
+             a.add(ci(len));
+             a.add(ci(H));
+             a.add(ci(HK));
+@@ -389,7 +408,7 @@ pub const Model = struct {
+         const nch: usize = if (full) chunks else (cfg.window + 1 + CK - 1) / CK;
+         {
+             var a: cuda.Args = .{};
+-            inline for (.{ m.b.qo, m.kc[i], m.vc[i], m.b.pos, m.b.slot, m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
++            inline for (.{ io.qo, m.kc[i], m.vc[i], io.pos, io.slot, m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
+             a.add(ci(len));
+             a.add(ci(nch));
+             a.add(if (full) -ci((m.context + CK - 1) / CK * CK) else ci(CK)); // full: each row's own chunk width
+@@ -403,8 +422,8 @@ pub const Model = struct {
+             var a: cuda.Args = .{};
+             inline for (.{ m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
+             a.add(ci(nch));
+-            a.add(m.b.g);
+-            a.add(m.b.att);
++            a.add(io.g);
++            a.add(io.att);
+             a.add(ci(H));
+             a.add(@as(f32, @floatCast(cfg.eps)));
+             a.add(@as(c_int, @intFromBool(full)));
+diff --git a/zig/src/families/muse_spark/m1_main.zig b/zig/src/families/muse_spark/m1_main.zig
+index c6e6335f..95fff3fa 100644
+--- a/zig/src/families/muse_spark/m1_main.zig
++++ b/zig/src/families/muse_spark/m1_main.zig
+@@ -15,6 +15,7 @@ const tp = @import("tp");
+ const muse = @import("muse_spark");
+ const pair = @import("pair.zig");
+ const draft_main = @import("draft_main.zig");
++const prompt_main = @import("prompt_main.zig");
+ const Model = muse.forward.Model;
+ 
+ fn env(name: [*:0]const u8, default: usize) usize {
+@@ -99,9 +100,11 @@ pub fn main(init: std.process.Init) !u8 {
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+     if (args.len >= 3 and std.mem.eql(u8, args[1], "follow")) return follow(init.gpa, init.io, args[2]);
+     const mode: ?draft_main.Mode = if (args.len >= 2) std.meta.stringToEnum(draft_main.Mode, args[1]) else null;
+-    if (args.len < 5 or (mode == null and !std.mem.eql(u8, args[1], "m1"))) {
++    const prompt_check = args.len >= 2 and std.mem.eql(u8, args[1], "prompt");
++    if (args.len < 5 or (mode == null and !prompt_check and !std.mem.eql(u8, args[1], "m1"))) {
+         std.debug.print("usage: tf-muse m1 MODEL IN_DIR OUT_DIR   (knobs: MUSE_ROWS, MUSE_SLOTS, MUSE_LAYERS, MUSE_CONTEXT, MUSE_GREEDY, MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS)\n" ++
+             "       tf-muse dflash|drafted MODEL IN_DIR OUT_DIR   (the DFlash2 drafter's gates, TF_MUSE_DRAFTER: draft_main.zig)\n" ++
++            "       tf-muse prompt MODEL IN_DIR OUT_DIR   (the prompt path against decode rows: prompt_main.zig)\n" ++
+             "       tf-muse follow MODEL   (TP rank 1 behind tensorfold-native serve on rank 0; TF_TP_* as rank 0's)\n", .{});
+         return 2;
+     }
+@@ -119,7 +122,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
+     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
+ 
+-    const kn: Knobs = .{ .rows_per = rows_per, .slots = slots, .context = context, .n_greedy = n_greedy, .capture = capture, .teacher = teacher, .graphs = graphs, .max_layers = max_layers, .mode = mode, .dk = .{ .context = env("MUSE_CONTEXT", 8192), .n_greedy = env("MUSE_GREEDY", 64), .graphs = env("MUSE_GRAPHS", 1) != 0 and env("MUSE_PAIR", 0) == 0, .max_layers = max_layers, .rows_per = env("MUSE_ROWS", 32), .dump_taps = env("MUSE_DUMP_TAPS", 0) != 0 } };
++    const kn: Knobs = .{ .rows_per = rows_per, .slots = slots, .context = context, .n_greedy = n_greedy, .capture = capture, .teacher = teacher, .graphs = graphs, .max_layers = max_layers, .mode = mode, .dk = .{ .context = env("MUSE_CONTEXT", 8192), .n_greedy = env("MUSE_GREEDY", 64), .graphs = env("MUSE_GRAPHS", 1) != 0 and env("MUSE_PAIR", 0) == 0, .max_layers = max_layers, .rows_per = env("MUSE_ROWS", 32), .dump_taps = env("MUSE_DUMP_TAPS", 0) != 0 }, .prompt = prompt_check };
+     const pair_mode = env("MUSE_PAIR", 0) != 0; // both ranks of TP=2 in this process on one GPU (an in-process gather)
+     const tpc: ?tp.Config = if (!pair_mode and std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
+     const world: usize = if (pair_mode) 2 else if (tpc) |c| c.world else 1;
+@@ -158,7 +161,7 @@ pub fn main(init: std.process.Init) !u8 {
+     return 0;
+ }
+ 
+-const Knobs = struct { rows_per: usize, slots: usize, context: usize, n_greedy: usize, capture: bool, teacher: bool, graphs: bool, max_layers: ?usize, mode: ?draft_main.Mode = null, dk: draft_main.Knobs };
++const Knobs = struct { rows_per: usize, slots: usize, context: usize, n_greedy: usize, capture: bool, teacher: bool, graphs: bool, max_layers: ?usize, mode: ?draft_main.Mode = null, dk: draft_main.Knobs, prompt: bool = false };
+ 
+ fn pairRank(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, ctx: *const cuda.Context, args: []const [:0]const u8, kn: Knobs, comm: tp.Collective, err: *?anyerror) void {
+     ctx.makeCurrent() catch |e| {
+@@ -177,6 +180,7 @@ fn pairRank(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, ctx:
+ /// One rank's m1: load, every text's windows, rank 0 writes the dumps.
+ fn runRank(gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, args: []const [:0]const u8, rank: usize, world: usize, comm: ?tp.Collective, kn: Knobs) !void {
+     if (kn.mode) |md| return draft_main.run(md, gpa, ar, io, driver, args, rank, world, comm, kn.dk);
++    if (kn.prompt) return prompt_main.run(gpa, ar, io, driver, args, rank, world, comm);
+     var s = try cuda.Stream.init(driver, false);
+     defer s.deinit();
+     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+diff --git a/zig/src/families/muse_spark/native.zig b/zig/src/families/muse_spark/native.zig
+index b7cce7f6..8f57221f 100644
+--- a/zig/src/families/muse_spark/native.zig
++++ b/zig/src/families/muse_spark/native.zig
+@@ -1,5 +1,6 @@
+ //! Muse Spark behind the native server: the lane backend over engine.zig, on one GPU or two TP ranks (rank 1 runs
+-//! `tf-muse follow`). After MiMo-V2's native.zig, without its prompt path: prompts run as decode windows. The DFlash2
++//! `tf-muse follow`). After MiMo-V2's native.zig: prompts of at least TF_MUSE_PROMPT_MIN rows run on the prompt path
++//! (prompt.zig, TF_MUSE_PROMPT=1), shorter ones (or all, without it) as decode windows. The DFlash2
+ //! drafter is opt-in: drafts on (the server's default) AND TF_MUSE_DRAFTER naming the drafter pack on every rank.
+ 
+ const std = @import("std");
+@@ -170,7 +171,7 @@ pub const Lanes = struct {
+         return l.e.logits[r * V ..][0..V];
+     }
+ 
+-    /// The prompt as decode windows of up to 128 rows; the last row's token drawn.
++    /// The prompt as prompt chunks (prompt path) or decode windows of up to 128 rows; the last row's token drawn.
+     fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+         const l = of(p);
+         const e = l.e;
+@@ -190,6 +191,21 @@ pub const Lanes = struct {
+         const slot = gop.value_ptr.slot;
+         s.cached = 0;
+         const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
++        if (e.pr) |pr| if (ids.len >= engine.envUsize("TF_MUSE_PROMPT_MIN", 33)) {
++            const toks = try l.gpa.alloc(i64, @min(ids.len, pr.cap));
++            defer l.gpa.free(toks);
++            var at: usize = 0;
++            while (at < ids.len) {
++                if (s.isCancelled()) return error.Cancelled;
++                const n = @min(pr.cap, ids.len - at);
++                for (0..n) |j| toks[j] = ids[at + j];
++                const last = at + n == ids.len;
++                try e.prompt(slot, at, toks[0..n], if (!last) .none else if (greedy) .ids else .logits);
++                if (last) _ = l.take(if (greedy) @intCast(e.ids[0]) else try draw(l.gpa, l.rowOf(0), s.sampling, ids.len));
++                at += n;
++            }
++            return;
++        };
+         var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
+         var at: usize = 0;
+         while (at < ids.len) {
+@@ -353,7 +369,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     if (o.lanes == 0 or o.lanes > 32) return error.Slots;
+     if (o.policy.len > 0) return error.Policy;
+     const drafting = o.drafts and std.c.getenv("TF_MUSE_DRAFTER") != null; // opt-in until the drafter's gates pass
+-    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = drafting };
++    var su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = drafting };
++    engine.promptEnv(&su);
+     var session: ?*tp.Session = null;
+     if (std.c.getenv("TF_TP_WORLD") != null) {
+         const c = try tp.Config.fromEnv();
+diff --git a/zig/src/families/muse_spark/prompt.zig b/zig/src/families/muse_spark/prompt.zig
+new file mode 100644
+index 00000000..4ab412b7
+--- /dev/null
++++ b/zig/src/families/muse_spark/prompt.zig
+@@ -0,0 +1,312 @@
++//! Muse Spark's prompt path: one slot's prompt chunk as wide windows. Dense projections and attention run in
++//! 128-row windows on the decode kernels, the routed experts in windows of up to `ewin` rows on the same grouped
++//! kernel (each expert's trellis read once a window instead of once per 128 rows), the head on the last row only.
++//! Every kernel's row bits are independent of its window, so a chunk gives the decode rows' bits (`exact`, the
++//! decode tile settings); `exact = false` runs gate / up unsplit (less scratch, other bits).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const load_ = @import("load.zig");
++const fwd = @import("forward.zig");
++const exl3 = cuda.exl3;
++const Stream = cuda.Stream;
++const Model = fwd.Model;
++
++pub const CAP = 1024; // rows a chunk (TF_MUSE_PROMPT_ROWS)
++pub const EWIN = 512; // rows an experts window (TF_MUSE_PROMPT_EWIN)
++const W = fwd.DECODE_ROWS; // the dense and attention windows
++
++fn u(x: usize) u32 {
++    return @intCast(x);
++}
++fn ci(x: usize) c_int {
++    return @intCast(x);
++}
++
++/// Bytes of the experts window's scratch: (xg + xu + xd, with y over them; z, also the gathers' landing).
++pub fn expertBytes(e: exl3.Experts, ewin: usize, slots: usize, cfg_gu: [4]u32, cfg_d: [4]u32, world: usize, chunk_d: usize) [2]usize {
++    const sz = exl3.Scratch.bytes(e, ewin, slots, cfg_gu, cfg_d);
++    const front = @max(2 * sz.xg + sz.xd, sz.y);
++    const land = world * @max(ewin * slots * e.dims, chunk_d) * 4;
++    return .{ front, @max(sz.z, if (world > 1) land else 0) };
++}
++
++pub const Prompt = struct {
++    m: *Model,
++    gpa: std.mem.Allocator,
++    cap: usize,
++    ewin: usize,
++    exact: bool,
++    ar: load_.Arena,
++    ids: u64, // i64 [cap]
++    pos: u64, // i32 [cap]
++    slot: u64,
++    res: u64, // f32 [cap, D]
++    x: u64, // f16 [cap, D]
++    xf: u64, // f32 [cap, D]
++    part: u64, // f32 [cap, D]
++    big: u64, // f32: the experts' split partials (z), else an all-gather's landing (never live together)
++    logits: u64, // f32 [cap, E]
++    pick: u64, // i32 [cap, K]
++    wts: u64, // f32 [cap, K]
++    lat: u64, // f16 [cap, latent / world]
++    latg: u64, // f16 [world, cap, latent / world]
++    latn: u64, // f16 [cap, latent]
++    acc: u64, // f16 [cap, post inputs]
++    sc: exl3.Scratch, // the grouped kernel's for ewin rows; y over xg / xu / xd, z = big
++    taps: u64, // drafter: the chunk's taps, f16 [cap, taps, D]
++    h_ids: []i64,
++    h_pos: []i32,
++    h_slot: []i32,
++
++    pub fn init(m: *Model, gpa: std.mem.Allocator, cap: usize, ewin_: usize, exact: bool, s: Stream) !*Prompt {
++        const w = m.w;
++        const cfg = w.cfg;
++        if (cap < 1 or ewin_ < 1) return error.PromptRows;
++        const ewin = @min(ewin_, cap);
++        if (ewin * cfg.top_k * 4 > 96 * 1024) return error.ExpertWindow; // the group kernel's picks in shared memory
++        const pr = try gpa.create(Prompt);
++        errdefer gpa.destroy(pr);
++        pr.* = undefined;
++        pr.m = m;
++        pr.gpa = gpa;
++        pr.cap = cap;
++        pr.ewin = ewin;
++        pr.exact = exact;
++        pr.ar = .{ .d = m.d, .gpa = gpa };
++        errdefer pr.ar.deinit();
++        const ar = &pr.ar;
++        const R = cap;
++        const D = cfg.hidden;
++        const L0 = w.layers[0];
++        const e0 = L0.experts;
++        pr.ids = try ar.zeros(R * 8);
++        pr.pos = try ar.zeros(R * 4);
++        pr.slot = try ar.zeros(R * 4);
++        pr.res = try ar.zeros(R * D * 4);
++        pr.x = try ar.zeros(R * D * 2);
++        pr.xf = try ar.zeros(R * D * 4);
++        pr.part = try ar.zeros(R * D * 4);
++        pr.logits = try ar.zeros(R * cfg.experts * 4);
++        pr.pick = try ar.zeros(R * cfg.top_k * 4);
++        pr.wts = try ar.zeros(R * cfg.top_k * 4);
++        pr.lat = try ar.zeros(R * L0.pre.n * 2);
++        pr.latg = try ar.zeros(R * cfg.latent * 2);
++        pr.latn = try ar.zeros(R * cfg.latent * 2);
++        pr.acc = try ar.zeros(R * L0.post.k * 2);
++        const cfg_gu = if (exact) m.b.sc.cfg_gu else try exl3.defaultConfig(e0.dims, e0.width, false); // unsplit: sk 1
++        const cfg_d = m.b.sc.cfg_d;
++        const eb = expertBytes(e0, ewin, cfg.top_k, cfg_gu, cfg_d, w.world, R * D);
++        const sz = exl3.Scratch.bytes(e0, ewin, cfg.top_k, cfg_gu, cfg_d);
++        const front = try ar.zeros(eb[0]);
++        pr.big = try ar.zeros(eb[1]);
++        pr.sc = .{ .xg = front, .xu = front + sz.xg, .xd = front + 2 * sz.xg, .z = pr.big, .y = front, .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = ewin, .slots = cfg.top_k, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
++        try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
++        pr.taps = if (m.dr) |dr| try ar.zeros(R * dr.taps.len * D * 2) else 0;
++        pr.h_ids = try gpa.alloc(i64, R);
++        errdefer gpa.free(pr.h_ids);
++        pr.h_pos = try gpa.alloc(i32, R);
++        errdefer gpa.free(pr.h_pos);
++        pr.h_slot = try gpa.alloc(i32, R);
++        try s.synchronize();
++        return pr;
++    }
++
++    pub fn deinit(pr: *Prompt) void {
++        pr.gpa.free(pr.h_ids);
++        pr.gpa.free(pr.h_pos);
++        pr.gpa.free(pr.h_slot);
++        pr.ar.deinit();
++        pr.gpa.destroy(pr);
++    }
++
++    pub fn bytes(pr: *const Prompt) usize {
++        return pr.ar.total;
++    }
++
++    /// The ranks' fp32 partials [count] gathered into big (rank-major); (rank 0's, rank 1's or 0).
++    fn gather(pr: *Prompt, s: Stream, part: u64, count: usize) ![2]u64 {
++        const c = pr.m.comm orelse return .{ part, 0 };
++        try c.allGather(part, pr.big, count, .f32, s.handle);
++        return .{ pr.big, pr.big + count * 4 };
++    }
++
++    /// An EXL3 projection of the chunk's n rows in 128-row windows: x [n, K] fp16 -> out [n, N].
++    fn proj(pr: *Prompt, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
++        var w0: usize = 0;
++        while (w0 < n) : (w0 += W) {
++            const k = @min(W, n - w0);
++            try pr.m.proj(s, l, x + w0 * l.k * 2, out + w0 * l.n * @as(usize, if (out_f32) 4 else 2), out_f32, k);
++        }
++    }
++
++    /// The attention half of layer i for the chunk's rows at [p0, p0 + n): 128-row windows of q / k / v / g,
++    /// attention (each window's keys written before it reads them) and o_proj into part.
++    fn attention(pr: *Prompt, s: Stream, L: load_.Layer, i: usize, p0: usize, n: usize) !void {
++        const m = pr.m;
++        const D = m.w.cfg.hidden;
++        var w0: usize = 0;
++        while (w0 < n) : (w0 += W) {
++            const k = @min(W, n - w0);
++            const x = pr.x + w0 * D * 2;
++            try m.proj(s, L.q, x, m.b.q, false, k);
++            try m.proj(s, L.k, x, m.b.k, false, k);
++            try m.proj(s, L.v, x, m.b.v, false, k);
++            try m.proj(s, L.g, x, m.b.g, false, k);
++            var chunks: usize = 1;
++            for (0..k) |j| chunks = @max(chunks, fwd.rowChunks(m.context, p0 + w0 + j));
++            try m.attentionIo(s, i, k, chunks, .{ .q = m.b.q, .k = m.b.k, .v = m.b.v, .g = m.b.g, .qo = m.b.qo, .att = m.b.att, .pos = pr.pos + w0 * 4, .slot = pr.slot + w0 * 4 });
++            try m.proj(s, L.o, m.b.att, pr.part + w0 * D * 4, true, k);
++        }
++    }
++
++    /// MuseSparkMoE over the chunk: router and latent for every row, routed experts in windows of ewin rows (per-slot
++    /// outputs gathered, normed and summed per window), post_expert_proj into part.
++    fn moe(pr: *Prompt, s: Stream, L: load_.Layer, n: usize) !void {
++        const m = pr.m;
++        const cfg = m.w.cfg;
++        const E = cfg.experts;
++        const K = cfg.top_k;
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.xf);
++            a.add(L.router);
++            a.add(@as(c_int, @intFromBool(L.router_bf16)));
++            a.add(pr.logits);
++            a.add(ci(cfg.hidden));
++            a.add(ci(E));
++            try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + 7) / 8), .y = u(n), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.logits);
++            a.add(L.bias);
++            a.add(ci(E));
++            a.add(ci(K));
++            a.add(@as(f32, @floatCast(cfg.out_mult)));
++            a.add(@as(f32, @floatCast(cfg.route_scale)));
++            a.add(pr.pick);
++            a.add(pr.wts);
++            const t = std.math.ceilPowerOfTwo(usize, @max(E, 32)) catch unreachable;
++            try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(t), .y = 1, .z = 1 } }, s, &a);
++        }
++        try pr.proj(s, L.pre, pr.x, pr.lat, false, n);
++        if (m.comm) |c| {
++            const half = L.pre.n;
++            try c.allGather(pr.lat, pr.latg, n * half, .f16, s.handle);
++            try m.normParts(s, pr.latg, true, L.pre_norm, pr.latn, n, cfg.latent, cfg.eps, half);
++        } else try m.norm(s, pr.lat, true, L.pre_norm, pr.latn, n, cfg.latent, cfg.eps);
++        const k3 = m.k3;
++        const e = L.experts;
++        const sc = pr.sc;
++        const gu = sc.cfg_gu;
++        const dn = sc.cfg_d;
++        var w0: usize = 0;
++        while (w0 < n) : (w0 += pr.ewin) {
++            const r = @min(pr.ewin, n - w0);
++            const p = r * K;
++            const nexp = @min(p, E);
++            const pick = pr.pick + w0 * K * 4;
++            try k3.group(s, pick, sc.ids, sc.count, sc.members, r, K, E, r);
++            try k3.expertsRotIn(s, pr.latn + w0 * cfg.latent * 2, false, cfg.latent, pick, e.suh_g, e.suh_u, sc.xg, sc.xu, r, e.dims, K, E);
++            try k3.grouped(s, .{ .x0 = sc.xg, .x1 = sc.xu, .tp0 = e.gate_ptr, .tp1 = e.up_ptr, .k2_0 = e.gate_k2, .k2_1 = e.up_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 2, .k = e.dims, .n = e.width, .p = p, .sk = gu[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = gu[0], .warps = gu[1], .pf = gu[3], .lo = e.k2_gu[0], .hi = e.k2_gu[1] });
++            try k3.gateupEpilogue(s, sc.z, pick, e.svh_g, e.svh_u, e.suh_d, sc.xd, r, p, e.width, gu[2], K, E, std.math.inf(f32), 1);
++            try k3.grouped(s, .{ .x0 = sc.xd, .x1 = sc.xd, .tp0 = e.down_ptr, .tp1 = e.down_ptr, .k2_0 = e.down_k2, .k2_1 = e.down_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 1, .k = e.width, .n = e.dims, .p = p, .sk = dn[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = dn[0], .warps = dn[1], .pf = dn[3], .lo = e.k2_d[0], .hi = e.k2_d[1] });
++            try k3.downEpilogue(s, sc.z, pick, e.svh_d, sc.y, r, p, e.dims, dn[2], K, E); // y over xg / xu / xd (dead now)
++            const y = try pr.gather(s, sc.y, p * e.dims); // z is dead too: the landing reuses it
++            var a: cuda.Args = .{};
++            a.add(y[0]);
++            a.add(y[1]);
++            a.add(pr.wts + w0 * K * 4);
++            a.add(L.expert_norm);
++            a.add(@as(f32, @floatCast(cfg.post_eps)));
++            a.add(pr.acc + w0 * L.post.k * 2);
++            a.add(ci(cfg.latent));
++            a.add(ci(K));
++            a.add(ci(m.w.rank * L.post.k));
++            a.add(ci(L.post.k));
++            try cuda.launch.launch(m.f_esum, .{ .grid = .{ .x = u(r), .y = 1, .z = 1 }, .block = .{ .x = fwd.NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
++        }
++        try pr.proj(s, L.post, pr.acc, pr.part, true, n);
++    }
++
++    /// One prompt chunk at [p0, p0 + n) of `slot`: every layer's caches written (and the drafter's context), the last
++    /// row's softcapped logits gathered into the model's decode head buffers (as a 1-row decode window leaves them).
++    pub fn chunk(pr: *Prompt, s: Stream, slot: u32, p0: usize, tokens: []const i64) !void {
++        const m = pr.m;
++        const cfg = m.w.cfg;
++        const D = cfg.hidden;
++        const n = tokens.len;
++        if (n == 0 or n > pr.cap) return error.ChunkTooWide;
++        if (p0 + n > m.context) return error.PastContext;
++        if (slot >= m.slots) return error.BadSlot;
++        for (tokens, 0..) |t, j| {
++            if (t < 0 or t >= m.w.full.vocab) return error.BadToken;
++            pr.h_ids[j] = t;
++            pr.h_pos[j] = @intCast(p0 + j);
++            pr.h_slot[j] = @intCast(slot);
++        }
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.ids, @ptrCast(pr.h_ids.ptr), n * 8), "ids");
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.pos, @ptrCast(pr.h_pos.ptr), n * 4), "pos");
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.slot, @ptrCast(pr.h_slot.ptr), n * 4), "slot");
++        {
++            var a: cuda.Args = .{};
++            a.add(m.w.embed);
++            a.add(pr.ids);
++            a.add(pr.res);
++            a.add(ci(D));
++            a.add(@as(f32, @floatCast(cfg.eps)));
++            try cuda.launch.launch(m.f_embed, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = fwd.NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
++        }
++        try m.norm(s, pr.res, false, m.w.layers[0].in_norm, pr.x, n, D, cfg.eps);
++        for (m.w.layers, 0..) |L, i| {
++            try pr.attention(s, L, i, p0, n);
++            try m.gateNormAt(s, pr.res, try pr.gather(s, pr.part, n * D), 0, L.attn_ab, L.ffn_norm, pr.x, pr.xf, n);
++            try pr.moe(s, L, n);
++            const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].in_norm else m.w.norm;
++            try m.gateNormAt(s, pr.res, try pr.gather(s, pr.part, n * D), L.post_ffn, L.mlp_ab, after, pr.x, 0, n);
++            if (m.dr) |dr| try dr.tapInto(s, i, pr.res, n, pr.taps);
++        }
++        if (m.dr) |dr| {
++            const row = dr.taps.len * D * 2;
++            var w0: usize = 0;
++            while (w0 < n) : (w0 += W) {
++                const k = @min(W, n - w0);
++                try dr.updateAt(s, pr.taps + w0 * row, pr.pos + w0 * 4, pr.slot + w0 * 4, k);
++            }
++        }
++        // the head on the last row: the decode GEMV, softcap and gather into the decode buffers
++        try m.proj(s, m.w.head, pr.x + (n - 1) * D * 2, m.b.head, true, 1);
++        const cfgf = m.w.full;
++        var a: cuda.Args = .{};
++        a.add(m.b.head);
++        a.add(@as(i64, @intCast(m.w.head.n)));
++        a.add(@as(f32, @floatCast(cfgf.out_mult)));
++        a.add(@as(f32, @floatCast(cfgf.softcap)));
++        try cuda.launch.launch(m.f_softcap, .{ .grid = .{ .x = u(@min((m.w.head.n + 255) / 256, 4096)), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, m.w.head_stride, .f32, s.handle);
++    }
++};
++
++/// The chunks of a prompt of `len` tokens: `cap` rows each, the rest last.
++pub fn planChunks(len: usize, cap: usize, out: *std.ArrayList(usize), gpa: std.mem.Allocator) !void {
++    out.clearRetainingCapacity();
++    var at: usize = 0;
++    while (at < len) {
++        const n = @min(cap, len - at);
++        try out.append(gpa, n);
++        at += n;
++    }
++}
++
++test "prompt chunks" {
++    const g = std.testing.allocator;
++    var c: std.ArrayList(usize) = .empty;
++    defer c.deinit(g);
++    try planChunks(40, 1024, &c, g);
++    try std.testing.expectEqualSlices(usize, &.{40}, c.items);
++    try planChunks(2500, 1024, &c, g);
++    try std.testing.expectEqualSlices(usize, &.{ 1024, 1024, 452 }, c.items);
++    try planChunks(2048, 1024, &c, g);
++    try std.testing.expectEqualSlices(usize, &.{ 1024, 1024 }, c.items);
++}
+diff --git a/zig/src/families/muse_spark/prompt_main.zig b/zig/src/families/muse_spark/prompt_main.zig
+new file mode 100644
+index 00000000..63b32f31
+--- /dev/null
++++ b/zig/src/families/muse_spark/prompt_main.zig
+@@ -0,0 +1,127 @@
++//! tf-muse prompt MODEL IN_DIR OUT_DIR: the prompt path (prompt.zig) against decode rows on the same pack. For every
++//! text (IN_DIR names.txt, <name>.ids) the decode-row reference (slot 0, 128-row windows, then MUSE_GREEDY greedy
++//! rows) and each chunk plan of MUSE_PROMPT_PLANS (slot 1; ';' between plans, ',' between chunk sizes, 'r' = the
++//! rest), then the same greedy rows. Prints per plan: last-row logits byte-equal (max |diff|), greedy x/G.
++//! Knobs: MUSE_CONTEXT (8192), MUSE_GREEDY (32), MUSE_LAYERS, TF_MUSE_PROMPT_ROWS / _EWIN / _EXACT.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const tp = @import("tp");
++const muse = @import("muse_spark");
++const Model = muse.forward.Model;
++const Row = muse.forward.Row;
++
++fn env(name: [*:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
++
++fn argmax(xs: []const f32) i32 {
++    var best: usize = 0;
++    for (xs, 0..) |x, i| if (x > xs[best]) {
++        best = i;
++    };
++    return @intCast(best);
++}
++
++/// Greedy decode rows on `slot` from position `pos` after the token `first`: n tokens into out.
++fn greedy(model: *Model, s: cuda.Stream, slot: u32, pos0: usize, first: i32, out: []i32, buf_all: []f32) !void {
++    const buf = buf_all[0..model.w.full.vocab];
++    var tok = first;
++    for (out, 0..) |*o, j| {
++        o.* = tok;
++        if (j + 1 == out.len) break;
++        try model.forward(s, &.{.{ .slot = slot, .pos = @intCast(pos0 + j), .token = tok }}, buf, null);
++        tok = argmax(buf);
++    }
++}
++
++pub fn run(gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, args: []const [:0]const u8, rank: usize, world: usize, comm: ?tp.Collective) !void {
++    var s = try cuda.Stream.init(driver, false);
++    defer s.deinit();
++    const context = env("MUSE_CONTEXT", 8192);
++    const G = env("MUSE_GREEDY", 32);
++    const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
++    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0 });
++    defer w.deinit();
++    var k3 = try cuda.exl3.Kernels.load(driver);
++    defer k3.deinit();
++    var model = try Model.init(gpa, driver, &w, &k3, comm, context, muse.forward.DECODE_ROWS, 2, s);
++    defer model.deinit();
++    var su: muse.engine.Setup = .{ .context = context, .slots = 2 };
++    muse.engine.promptEnv(&su);
++    if (su.prompt_rows == 0) su.prompt_rows = muse.prompt.CAP;
++    const pr = try muse.prompt.Prompt.init(&model, gpa, su.prompt_rows, su.prompt_ewin, su.prompt_exact, s);
++    defer pr.deinit();
++    const V = w.full.vocab;
++    if (rank == 0) std.debug.print("[prompt] {d} layers, chunks of {d} rows, experts window {d} ({s}), scratch {d:.2} GiB\n", .{ w.layers.len, pr.cap, pr.ewin, if (pr.exact) "exact" else "unsplit", @as(f64, @floatFromInt(pr.bytes())) / (1 << 30) });
++    const plans_text = if (std.c.getenv("MUSE_PROMPT_PLANS")) |v| std.mem.span(v) else "r;100,r;1,r;17,256,1000,r;513,700,r";
++    const names_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(ar, &.{ args[3], "names.txt" }), ar, .limited(1 << 20));
++    const buf = try gpa.alloc(f32, muse.forward.DECODE_ROWS * V);
++    defer gpa.free(buf);
++    const ref_logits = try gpa.alloc(f32, V);
++    defer gpa.free(ref_logits);
++    const got = try gpa.alloc(f32, V);
++    defer gpa.free(got);
++    const ref_g = try gpa.alloc(i32, G);
++    defer gpa.free(ref_g);
++    const got_g = try gpa.alloc(i32, G);
++    defer gpa.free(got_g);
++    var fails: usize = 0;
++    var nit = std.mem.tokenizeAny(u8, names_text, " \r\n\t");
++    while (nit.next()) |name| {
++        const raw = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(ar, "{s}/{s}.ids", .{ args[3], name }), ar, .limited(1 << 30));
++        const T = raw.len / 4;
++        if (T + G > context) return error.TextTooLong;
++        const ids = try ar.alloc(i64, T);
++        for (ids, 0..) |*x, j| x.* = std.mem.readInt(i32, raw[j * 4 ..][0..4], .little);
++        // the reference: decode windows of 128 rows on slot 0
++        var at: usize = 0;
++        var rows: [muse.forward.DECODE_ROWS]Row = undefined;
++        while (at < T) {
++            const n = @min(muse.forward.DECODE_ROWS, T - at);
++            for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(at + j), .token = ids[at + j] };
++            try model.forward(s, rows[0..n], buf[0 .. n * V], null);
++            if (at + n == T) @memcpy(ref_logits, buf[(n - 1) * V ..][0..V]);
++            at += n;
++        }
++        try greedy(&model, s, 0, T, argmax(ref_logits), ref_g, buf);
++        var pit = std.mem.tokenizeScalar(u8, plans_text, ';');
++        while (pit.next()) |plan| {
++            var sizes: std.ArrayList(usize) = .empty;
++            defer sizes.deinit(gpa);
++            var cit = std.mem.tokenizeScalar(u8, plan, ',');
++            var used: usize = 0;
++            while (cit.next()) |c| {
++                const n = if (std.mem.eql(u8, c, "r")) T - used else try std.fmt.parseInt(usize, c, 10);
++                if (n == 0 or used + n > T) break;
++                var left = n;
++                while (left > 0) { // a size over the chunk cap splits into cap-row chunks
++                    const k = @min(left, pr.cap);
++                    try sizes.append(gpa, k);
++                    left -= k;
++                }
++                used += n;
++            }
++            if (used != T) continue; // a plan longer than the text
++            at = 0;
++            for (sizes.items) |n| {
++                try pr.chunk(s, 1, at, ids[at .. at + n]);
++                at += n;
++            }
++            try model.logitsTo(s, 1, got);
++            var maxd: f32 = 0;
++            var equal = true;
++            for (ref_logits, got) |a, b| {
++                if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) equal = false;
++                maxd = @max(maxd, @abs(a - b));
++            }
++            try greedy(&model, s, 1, T, argmax(got), got_g, buf);
++            var same: usize = 0;
++            for (ref_g, got_g) |a, b| same += @intFromBool(a == b);
++            if (!equal or same != G) fails += 1;
++            if (rank == 0) std.debug.print("PROMPT {s} T={d} chunks {any}: logits {s} (max |diff| {e:.3}), argmax {d}/{d}, greedy {d}/{d}\n", .{ name, T, sizes.items, if (equal) "byte-equal" else "DIFFER", maxd, argmax(got), argmax(ref_logits), same, G });
++        }
++    }
++    if (rank == 0) std.debug.print("PROMPT {s}: {d} plan(s) differ from decode rows\n", .{ if (fails == 0) "PASS" else "FAIL", fails });
++}
+diff --git a/zig/src/families/muse_spark/root.zig b/zig/src/families/muse_spark/root.zig
+index 07514bd1..b1a35832 100644
+--- a/zig/src/families/muse_spark/root.zig
++++ b/zig/src/families/muse_spark/root.zig
+@@ -6,6 +6,7 @@ pub const forward = @import("forward.zig");
+ pub const engine = @import("engine.zig");
+ pub const native = @import("native.zig");
+ pub const dflash2 = @import("dflash2.zig");
++pub const prompt = @import("prompt.zig");
+ pub const dflash2_config = @import("dflash2_config.zig");
+ pub const Config = config.Config;
+ 
+@@ -16,5 +17,6 @@ test {
+     _ = engine;
+     _ = native;
+     _ = dflash2;
++    _ = prompt;
+     _ = dflash2_config;
+ }
+-- 
+2.53.0
+

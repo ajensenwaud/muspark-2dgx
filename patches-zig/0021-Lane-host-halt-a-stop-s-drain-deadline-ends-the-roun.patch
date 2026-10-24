@@ -1,0 +1,379 @@
+From 170773acd993706362e52ab53e70a3da5d0e2db3 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 03:39:17 +0700
+Subject: [PATCH 21/60] Lane host halt: a stop's drain deadline ends the rounds
+ at the next boundary, and every request queued, filling or running fails with
+ the reason.
+
+Opened.halt (optional) lets a server stop an engine between rounds instead of
+under a running one; LaneHost.halt is that hook for lane-host families. A
+request still filling its prompt a chunk a round fails too, with its lane
+freed, and a prompt pass the halt cancels mid-chunk reports the halt's reason
+rather than a cancel.
+
+(cherry picked from commit 361f06340a9c9aafb529ee8b172aeb8eb84dde70)
+---
+ zig/src/core/engine_api.zig     |   9 +-
+ zig/src/core/lane_halt.zig      |  34 ++++++
+ zig/src/core/lane_halt_test.zig | 210 ++++++++++++++++++++++++++++++++
+ zig/src/core/lane_host.zig      |  17 ++-
+ 4 files changed, 266 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/core/lane_halt.zig
+ create mode 100644 zig/src/core/lane_halt_test.zig
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 7e79e7ba..1ddedf8f 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -228,7 +228,13 @@ pub const Open = struct {
+ };
+ 
+ /// An opened engine; ``close`` stops its thread and frees its backend.
+-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
++pub const Opened = struct {
++    engine: Engine,
++    close: *const fn (ctx: *anyopaque) void,
++    ctx: *anyopaque,
++    /// A drain's deadline: rounds end at the next boundary, what is left fails with `reason`; null: `close` alone.
++    halt: ?*const fn (ctx: *anyopaque, reason: []const u8) void = null,
++};
+ 
+ pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
+ 
+@@ -421,6 +427,7 @@ test {
+     _ = @import("lane_host.zig");
+     _ = @import("lane_host_test.zig");
+     _ = @import("lane_rounds_test.zig");
++    _ = @import("lane_halt_test.zig");
+     _ = @import("lane_host_reuse_test.zig");
+     _ = @import("lane_host_warm_test.zig");
+     _ = @import("lane_host_fill_test.zig");
+diff --git a/zig/src/core/lane_halt.zig b/zig/src/core/lane_halt.zig
+new file mode 100644
+index 00000000..466de561
+--- /dev/null
++++ b/zig/src/core/lane_halt.zig
+@@ -0,0 +1,34 @@
++//! A stop's drain deadline on the lane host: the rounds end at a boundary and what is left fails with a reason.
++const std = @import("std");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Job = LaneHost.Job;
++
++/// `LaneHost.halt`: the engine thread stops at the next round boundary; what is left fails with `reason`.
++pub fn halt(h: *LaneHost, reason: []const u8) void {
++    h.mutex.lockUncancelable(h.io);
++    h.closing = true;
++    h.halt_reason = reason;
++    h.wake.broadcast(h.io);
++    h.mutex.unlock(h.io);
++    if (h.thread) |t| t.join();
++    h.thread = null;
++}
++
++/// `halt`: between rounds, every request queued, filling or running fails with `reason` (its stream discarded).
++pub fn haltAll(h: *LaneHost, reason: []const u8) void {
++    h.lock();
++    const queued = h.gpa.dupe(*Job, h.queued.items) catch &.{};
++    h.queued.clearRetainingCapacity();
++    const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
++    h.admitted.clearRetainingCapacity();
++    h.filling.clearRetainingCapacity(); // a job still filling is admitted: it fails below, its lane freed
++    h.unlock();
++    if (queued.len + jobs.len > 0) std.log.warn("lane host: stopping at a round boundary: {d} running and {d} queued request(s) end ({s})", .{ jobs.len, queued.len, reason });
++    for (jobs) |job| {
++        if (job.started and !job.stream.finished) h.core.discard(&job.stream);
++        h.finish(job, .failed, reason);
++    }
++    for (queued) |job| h.finish(job, .failed, reason);
++    h.gpa.free(queued);
++    h.gpa.free(jobs);
++}
+diff --git a/zig/src/core/lane_halt_test.zig b/zig/src/core/lane_halt_test.zig
+new file mode 100644
+index 00000000..87ba6710
+--- /dev/null
++++ b/zig/src/core/lane_halt_test.zig
+@@ -0,0 +1,210 @@
++//! The lane host's halt: a stop's drain deadline ends the rounds at a boundary, what is left fails with the reason.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Reason = api.Reason;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++
++test "halt (a stop's drain deadline): the rounds end at a round boundary, every request queued or running fails with the reason" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.pieceBackend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    // one prompt prefilling at a time (the next waits queued), 3 rows a round
++    const Plan = struct {
++        const Seq = struct { key: usize, n: u64, done: u64 = 0, decoding: bool = false };
++        seqs: std.ArrayList(Seq) = .empty,
++        rounds: u32 = 0,
++        fn self(ctx: *anyopaque) *@This() {
++            return @ptrCast(@alignCast(ctx));
++        }
++        fn beginAdmit(_: *anyopaque) void {}
++        fn admit(ctx: *anyopaque, ask: api.Rounds.Ask, _: *[]const u8) api.Rounds.Verdict {
++            const p = self(ctx);
++            for (p.seqs.items) |x| if (!x.decoding) return .wait;
++            p.seqs.append(gpa, .{ .key = ask.key, .n = ask.prompt.len }) catch return .refuse;
++            return .admit;
++        }
++        fn admitted(_: *anyopaque) anyerror!void {}
++        fn arm(_: *anyopaque, _: usize) void {}
++        fn began(_: *anyopaque, _: usize, _: bool) void {}
++        fn plan(ctx: *anyopaque, pieces: *std.ArrayList(api.Rounds.Piece), finals: *std.ArrayList(usize)) anyerror!void {
++            const p = self(ctx);
++            pieces.clearRetainingCapacity();
++            finals.clearRetainingCapacity();
++            for (p.seqs.items) |*x| if (!x.decoding) {
++                if (x.done < x.n - 1) {
++                    const end = @min(x.done + 3, x.n - 1);
++                    try pieces.append(gpa, .{ .key = x.key, .start = x.done, .end = end, .save = false });
++                    x.done = end;
++                }
++                if (x.done == x.n - 1) {
++                    try finals.append(gpa, x.key);
++                    x.decoding = true;
++                }
++            };
++            p.rounds += 1;
++        }
++        fn left(ctx: *anyopaque, key: usize) void {
++            const p = self(ctx);
++            for (p.seqs.items, 0..) |x, i| if (x.key == key) {
++                _ = p.seqs.orderedRemove(i);
++                return;
++            };
++        }
++        fn after(_: *anyopaque, _: f64, _: f64) void {}
++    };
++    var pl: Plan = .{};
++    defer pl.seqs.deinit(gpa);
++    host.rounds = .{ .ctx = &pl, .vtable = &.{ .begin_admit = Plan.beginAdmit, .admit = Plan.admit, .admitted = Plan.admitted, .arm = Plan.arm, .began = Plan.began, .plan = Plan.plan, .left = Plan.left, .after = Plan.after } };
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        done: ?Reason = null,
++        message: []const u8 = "",
++        /// the planner's rounds when the finish arrived (on the engine thread, between rounds)
++        rounds_at_end: u32 = 0,
++        plan: *Plan,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| {
++                    b.done = f.reason;
++                    b.message = f.message;
++                    b.rounds_at_end = b.plan.rounds;
++                },
++                else => {},
++            }
++        }
++        fn count(b: *@This()) usize {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return b.tokens.items.len;
++        }
++    };
++    var long_prompt: [600]u32 = undefined;
++    for (&long_prompt, 0..) |*t, i| t.* = @intCast(1 + i % 13);
++    const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++    var boxes: [3]Box = .{ .{ .plan = &pl }, .{ .plan = &pl }, .{ .plan = &pl } };
++    defer for (&boxes) |*b| b.tokens.deinit(gpa);
++    // 1: decoding (no end of its own), 2: prefilling a long prompt in pieces, 3: queued behind 2
++    const r1: Request = .{ .prompt = &p1, .max_tokens = 1 << 30 };
++    const r2: Request = .{ .prompt = &long_prompt, .max_tokens = 1 << 30 };
++    const r3: Request = .{ .prompt = &p1, .max_tokens = 8 };
++    const e = host.engine();
++    try host.start();
++    try e.submit(1, &r1, .{ .ctx = &boxes[0], .event = Box.event });
++    while (boxes[0].count() < 4) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    try e.submit(2, &r2, .{ .ctx = &boxes[1], .event = Box.event });
++    try e.submit(3, &r3, .{ .ctx = &boxes[2], .event = Box.event });
++    while (boxes[0].count() < 20) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    host.halt("server restarting: retry shortly");
++    const rounds = pl.rounds;
++    for (&boxes) |*b| {
++        try std.testing.expectEqual(@as(?Reason, .failed), b.done);
++        try std.testing.expectEqualStrings("server restarting: retry shortly", b.message);
++        // no round was planned after the finishes: the loop stopped at the boundary they were sent at
++        try std.testing.expectEqual(rounds, b.rounds_at_end);
++    }
++    // the decoding stream's tokens are whole rounds' (the fake's own sequence), the prefilling one had none yet
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, &p1);
++    for (boxes[0].tokens.items) |t| {
++        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++    try std.testing.expectEqual(@as(usize, 0), boxes[1].tokens.items.len);
++    try std.testing.expectEqual(@as(usize, 0), boxes[2].tokens.items.len);
++    try std.testing.expectEqual(@as(usize, 0), pl.seqs.items.len);
++    // nothing runs after it; the stop that follows (a close) finds the thread gone
++    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
++    try std.testing.expectEqual(rounds, pl.rounds);
++    host.stop();
++}
++
++test "halt fails a request still filling its prompt with the reason and frees its lane; a decoding one fails too" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 2 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    const Chunks = struct {
++        n: std.atomic.Value(usize) = .init(0), // chunks the second request's pass ran
++        fn call(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
++            const c: *@This() = @ptrCast(@alignCast(ctx));
++            _ = c.n.fetchAdd(1, .monotonic);
++        }
++    };
++    var chunks: Chunks = .{};
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        done: ?Reason = null,
++        message: []const u8 = "",
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| {
++                    b.done = f.reason;
++                    b.message = f.message;
++                },
++                else => {},
++            }
++        }
++        fn count(b: *@This()) usize {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return b.tokens.items.len;
++        }
++    };
++    const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    const p2 = [_]u32{ 2, 7, 1, 8, 2, 8 };
++    var boxes: [3]Box = .{ .{}, .{}, .{} };
++    defer for (&boxes) |*b| b.tokens.deinit(gpa);
++    // 1: decoding (no end of its own), 2: filling a prompt that never ends, 3: queued behind both lanes
++    const r1: Request = .{ .prompt = &p1, .max_tokens = 1 << 30 };
++    const r2: Request = .{ .prompt = &p2, .max_tokens = 8 };
++    const r3: Request = .{ .prompt = &p2, .max_tokens = 8 };
++    const e = host.engine();
++    try host.start();
++    try e.submit(1, &r1, .{ .ctx = &boxes[0], .event = Box.event });
++    while (boxes[0].count() < 4) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    // nothing fills now: the next pass takes chunks until the halt
++    target.prefill_chunks = std.math.maxInt(usize);
++    target.prefill_hook = Chunks.call;
++    target.prefill_hook_ctx = &chunks;
++    try e.submit(2, &r2, .{ .ctx = &boxes[1], .event = Box.event });
++    try e.submit(3, &r3, .{ .ctx = &boxes[2], .event = Box.event });
++    while (chunks.n.load(.monotonic) < 3) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    host.halt("server restarting: retry shortly");
++    for (&boxes) |*b| {
++        try std.testing.expectEqual(@as(?Reason, .failed), b.done);
++        try std.testing.expectEqualStrings("server restarting: retry shortly", b.message);
++    }
++    try std.testing.expect(boxes[0].tokens.items.len >= 4);
++    try std.testing.expectEqual(@as(usize, 0), boxes[1].tokens.items.len);
++    try std.testing.expectEqual(@as(usize, 0), boxes[2].tokens.items.len);
++    // every lane freed: the decoding stream's and the filling one's
++    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
++    try std.testing.expectEqual(@as(usize, 0), host.filling.items.len);
++    host.stop();
++}
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 2c835e33..f9d9a52d 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -22,6 +22,7 @@ pub const Rounds = rounds.Rounds;
+ pub const Proposers = rounds.Proposers;
+ const rounds = @import("lane_rounds.zig");
+ const lane_stream = @import("lane_stream.zig");
++const lane_halt = @import("lane_halt.zig");
+ 
+ pub const LaneHost = struct {
+     gpa: Allocator,
+@@ -38,6 +39,8 @@ pub const LaneHost = struct {
+     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+     cancels: std.ArrayList(Id) = .empty,
+     closing: bool = false,
++    /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
++    halt_reason: ?[]const u8 = null,
+     thread: ?std.Thread = null,
+     decoded: std.ArrayList(status.Mark) = .empty, // tokens a round landed, for the 2 s decode rate
+     prefill_rate: f64 = 0,
+@@ -120,7 +123,7 @@ pub const LaneHost = struct {
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+     }
+ 
+-    /// Stops admitting, cancels what is left and joins the engine thread.
++    /// Stops admitting, cancels what is left and joins the engine thread (after `halt`: the thread is gone already).
+     pub fn stop(h: *LaneHost) void {
+         h.mutex.lockUncancelable(h.io);
+         h.closing = true;
+@@ -141,6 +144,9 @@ pub const LaneHost = struct {
+         h.finals.deinit(h.gpa);
+     }
+ 
++    /// A drain's deadline: the round in flight completes on every rank, so the ranks stop at the same boundary.
++    pub const halt = lane_halt.halt;
++
+     pub fn engine(h: *LaneHost) Engine {
+         return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = status.read, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learn.submit } };
+     }
+@@ -454,10 +460,13 @@ pub const LaneHost = struct {
+ 
+     const alone_words = "the engine has no memory for this request's caches with nothing else running: lower --context or --parallel";
+ 
+-    /// A job cancelled in its prompt pass, its lane already released.
++    /// A job cancelled in its prompt pass, its lane already released (by a `halt`: failed with its reason).
+     pub fn cancel(h: *LaneHost, job: *Job) bool {
+         h.remove(job);
+-        h.finish(job, .cancelled, "");
++        h.lock();
++        const why = h.halt_reason;
++        h.unlock();
++        h.finish(job, if (why == null) .cancelled else .failed, why orelse "");
+         return true;
+     }
+ 
+@@ -541,6 +550,7 @@ pub const LaneHost = struct {
+     }
+ 
+     pub fn closeAll(h: *LaneHost) void {
++        if (h.halt_reason) |reason| return lane_halt.haltAll(h, reason);
+         h.lock();
+         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+@@ -557,4 +567,5 @@ pub fn born(r: *const Request) u32 {
+ test {
+     _ = @import("lane_host_test.zig");
+     _ = @import("lane_rounds_test.zig");
++    _ = @import("lane_halt_test.zig");
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,3547 @@
+From 03101cc21304ab55510b5127b35f1a734ca64e68 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:42:56 +0700
+Subject: [PATCH 18/60] Session memory for paged-KV families: page pool, prefix
+ trie, RAM residency budget, streamed NVMe tier.
+
+zig/src/sessions keeps a chat's KV pages after its request ends: entries are found by a trie over chained page
+digests, held in RAM within a residency budget (chats and pool bytes), and the least recently used idle chat is
+parked to an NVMe tier and streamed back on resume. Ranks that split KV run every store call in the same order, so
+their books stay identical. It complements core/prompt_cache, which snapshots a whole family state; a family that
+uses it reports the resident bytes as Memory.cache and its budget as Info.prompt_cache_plan. No family uses it yet;
+zig build test-sessions runs the host tests, the NVMe tier on real files.
+
+(cherry picked from commit 05c5213a6934a6f11249a738b0903cec58c7bbb8)
+---
+ build.zig                       |   2 +
+ zig/build/sessions.zig          |  13 +
+ zig/src/sessions/disk.zig       | 587 ++++++++++++++++++++++++++++++++
+ zig/src/sessions/disk_test.zig  | 125 +++++++
+ zig/src/sessions/format.zig     | 197 +++++++++++
+ zig/src/sessions/freeset.zig    | 114 +++++++
+ zig/src/sessions/jobs.zig       | 150 ++++++++
+ zig/src/sessions/lanes.zig      | 336 ++++++++++++++++++
+ zig/src/sessions/pagestore.zig  | 129 +++++++
+ zig/src/sessions/pool.zig       | 475 ++++++++++++++++++++++++++
+ zig/src/sessions/prefix.zig     | 457 +++++++++++++++++++++++++
+ zig/src/sessions/sessions.zig   |  33 ++
+ zig/src/sessions/store.zig      | 570 +++++++++++++++++++++++++++++++
+ zig/src/sessions/store_test.zig | 216 ++++++++++++
+ 14 files changed, 3404 insertions(+)
+ create mode 100644 zig/build/sessions.zig
+ create mode 100644 zig/src/sessions/disk.zig
+ create mode 100644 zig/src/sessions/disk_test.zig
+ create mode 100644 zig/src/sessions/format.zig
+ create mode 100644 zig/src/sessions/freeset.zig
+ create mode 100644 zig/src/sessions/jobs.zig
+ create mode 100644 zig/src/sessions/lanes.zig
+ create mode 100644 zig/src/sessions/pagestore.zig
+ create mode 100644 zig/src/sessions/pool.zig
+ create mode 100644 zig/src/sessions/prefix.zig
+ create mode 100644 zig/src/sessions/sessions.zig
+ create mode 100644 zig/src/sessions/store.zig
+ create mode 100644 zig/src/sessions/store_test.zig
+
+diff --git a/build.zig b/build.zig
+index d9ec51a4..5d2b15b9 100644
+--- a/build.zig
++++ b/build.zig
+@@ -13,6 +13,7 @@ const exl3_build = @import("zig/build/exl3.zig");
+ const exlr8_build = @import("zig/build/exlr8.zig");
+ const golden_build = @import("zig/build/golden.zig");
+ const tp_build = @import("zig/build/tp.zig");
++const sessions_build = @import("zig/build/sessions.zig");
+ 
+ comptime {
+     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
+@@ -191,6 +192,7 @@ pub fn build(b: *std.Build) void {
+     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
+     grammar_build.steps(b, target, xgrammar);
+     tp_build.add(b, target, optimize, test_step);
++    sessions_build.add(b, test_step);
+ }
+ 
+ /// `zig build native -Dcpu=apple_m1`: tensorfold-native with the Metal engines for the Python package's bundle (a native M5 build traps on M1-M4).
+diff --git a/zig/build/sessions.zig b/zig/build/sessions.zig
+new file mode 100644
+index 00000000..a5d8ea6f
+--- /dev/null
++++ b/zig/build/sessions.zig
+@@ -0,0 +1,13 @@
++//! Session memory's build: the family-neutral `sessions` module (zig/src/sessions) and its host tests on any OS.
++
++const std = @import("std");
++
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/sessions/sessions.zig"), .target = target, .optimize = optimize, .link_libc = true });
++}
++
++pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, b.graph.host, .debug) }));
++    b.step("test-sessions", "Session memory's host tests: pool, prefix trie, RAM tier, NVMe tier on real files (no GPU)").dependOn(&run.step);
++    test_step.dependOn(&run.step);
++}
+diff --git a/zig/src/sessions/disk.zig b/zig/src/sessions/disk.zig
+new file mode 100644
+index 00000000..f5ab58f0
+--- /dev/null
++++ b/zig/src/sessions/disk.zig
+@@ -0,0 +1,587 @@
++//! The NVMe tier: a file an entry under <root>/<compat>/rank<r>/, written via .tmp + rename, streamed via the lanes.
++
++const std = @import("std");
++const linux = std.os.linux;
++const Io = std.Io;
++const lanes_mod = @import("lanes.zig");
++const Lanes = lanes_mod.Lanes;
++const Staging = lanes_mod.Staging;
++const Op = lanes_mod.Op;
++const up = lanes_mod.up;
++const format = @import("format.zig");
++const Layout = format.Layout;
++const Head = format.Head;
++const Seg = format.Seg;
++const PageStore = @import("pagestore.zig").PageStore;
++const pool_mod = @import("pool.zig");
++const Family = pool_mod.Family;
++const Digest = @import("prefix.zig").Digest;
++
++pub const none = std.math.maxInt(u32);
++
++pub const Options = struct {
++    root: []const u8,
++    compat: Digest,
++    rank: u32 = 0,
++    world: u32 = 1,
++    /// bytes of files the tier keeps (least recently used files without dependents go first)
++    budget: u64 = 64 << 30,
++    /// entries shorter than this are dropped, not parked
++    min_tokens: u64 = 1024,
++    /// O_DIRECT where the filesystem takes it (buffered with the page cache dropped otherwise)
++    direct: bool = true,
++    /// staging buffers and their size: the host transient of any park or restore
++    staging: u32 = 16,
++    chunk: u32 = 8 << 20,
++    lanes: u32 = 4,
++    /// delta files a chain may stack before a park writes the entry whole
++    max_chain: u32 = 8,
++};
++
++/// A piece of bounded state (rings, carries, taps): small, host bytes.
++pub const Blob = struct {
++    name: []const u8,
++    bytes: []const u8,
++};
++
++/// What a park writes: the entry, its tokens from first_page on, and this rank's pages per family, in logical order.
++pub const WriteSrc = struct {
++    key: Digest,
++    /// the file holding pages [0, first_page) (a delta), or null (a whole entry: first_page 0)
++    base: ?Digest = null,
++    tag: u32,
++    kind: u32 = 0,
++    page: u32,
++    pos: u64,
++    first_page: u32 = 0,
++    npages: u32,
++    /// tokens [first_page x page, pos)
++    ids: []const i32,
++    store: PageStore,
++    fence: u64 = 0,
++    families: []const Family,
++    /// per family: family-tensor pages of this rank's logical pages [first_page, npages), in logical order
++    pages: []const []const u32,
++    blobs: []const Blob = &.{},
++};
++
++/// One file of a restore: read logical pages [lo, hi) of it into the slot.
++pub const Extent = struct {
++    key: Digest,
++    first_page: u32,
++    lo: u32,
++    hi: u32,
++};
++
++/// Where a restore puts rows: per family, the family-tensor page of each of the slot's logical pages.
++pub const ReadSink = struct {
++    store: PageStore,
++    families: []const Family,
++    page: u32,
++    world: u32,
++    rank: u32,
++    /// per family: family-tensor pages for logical pages [0, npages)
++    pages: []const []const u32,
++};
++
++/// The bounded state a restore returns (owned).
++pub const Restored = struct {
++    blobs: []Blob,
++
++    pub fn deinit(r: *Restored, gpa: std.mem.Allocator) void {
++        for (r.blobs) |b| {
++            gpa.free(b.name);
++            gpa.free(b.bytes);
++        }
++        gpa.free(r.blobs);
++    }
++};
++
++/// The index record of one file.
++pub const Rec = struct {
++    key: Digest,
++    base: u32 = none,
++    tag: u32,
++    kind: u32,
++    pos: u64,
++    first_page: u32,
++    npages: u32,
++    size: u64,
++    /// files stacked on this one
++    refs: u32 = 0,
++    /// files under it, this one included
++    depth: u32 = 1,
++    older: u32 = none,
++    newer: u32 = none,
++    live: bool = true,
++};
++
++pub const Stats = struct {
++    writes: u64 = 0,
++    reads: u64 = 0,
++    bytes_written: u64 = 0,
++    bytes_read: u64 = 0,
++    bad: u64 = 0,
++    evicted: u64 = 0,
++};
++
++pub const Disk = struct {
++    gpa: std.mem.Allocator,
++    io: Io,
++    opts: Options,
++    dir: Io.Dir,
++    staging: Staging,
++    lanes: *Lanes,
++    recs: std.ArrayList(Rec) = .empty,
++    free_recs: std.ArrayList(u32) = .empty,
++    by_key: std.AutoHashMapUnmanaged(Digest, u32) = .empty,
++    /// least recently used first
++    oldest: u32 = none,
++    newest: u32 = none,
++    used: u64 = 0,
++    stats: Stats = .{},
++
++    pub fn open(gpa: std.mem.Allocator, io: Io, opts: Options) !*Disk {
++        const d = try gpa.create(Disk);
++        errdefer gpa.destroy(d);
++        var name_buf: [64]u8 = undefined;
++        const sub = try std.fmt.bufPrint(&name_buf, "{x}/rank{d}", .{ opts.compat[0..8], opts.rank });
++        var root = try Io.Dir.cwd().createDirPathOpen(io, opts.root, .{});
++        defer root.close(io);
++        const dir = try root.createDirPathOpen(io, sub, .{ .open_options = .{ .iterate = true } });
++        errdefer dir.close(io);
++        d.* = .{ .gpa = gpa, .io = io, .opts = opts, .dir = dir, .staging = try Staging.init(gpa, io, @max(2, opts.staging), up(opts.chunk)), .lanes = undefined };
++        errdefer d.staging.deinit();
++        d.lanes = try Lanes.start(gpa, io, &d.staging, @max(1, opts.lanes));
++        return d;
++    }
++
++    pub fn close(d: *Disk) void {
++        d.lanes.shutdown();
++        d.staging.deinit();
++        d.dir.close(d.io);
++        d.recs.deinit(d.gpa);
++        d.free_recs.deinit(d.gpa);
++        d.by_key.deinit(d.gpa);
++        const gpa = d.gpa;
++        gpa.destroy(d);
++    }
++
++    pub fn accepts(d: *const Disk, pos: u64) bool {
++        return pos >= d.opts.min_tokens;
++    }
++
++    pub fn get(d: *Disk, key: Digest) ?*Rec {
++        const i = d.by_key.get(key) orelse return null;
++        return &d.recs.items[i];
++    }
++
++    fn fileName(key: Digest, ext: []const u8, buf: *[48]u8) [:0]const u8 {
++        const n = (std.fmt.bufPrint(buf[0..47], "{x}.{s}", .{ &key, ext }) catch unreachable).len;
++        buf[n] = 0;
++        return buf[0..n :0];
++    }
++
++    fn openFile(d: *Disk, name: [:0]const u8, write: bool) !struct { fd: linux.fd_t, direct: bool } {
++        var flags: linux.O = .{ .ACCMODE = if (write) .WRONLY else .RDONLY, .CLOEXEC = true };
++        if (write) {
++            flags.CREAT = true;
++            flags.TRUNC = true;
++        }
++        if (d.opts.direct) {
++            var f2 = flags;
++            f2.DIRECT = true;
++            const rc = linux.openat(d.dir.handle, name, f2, 0o644);
++            if (linux.errno(rc) == .SUCCESS) return .{ .fd = @intCast(rc), .direct = true };
++        }
++        const rc = linux.openat(d.dir.handle, name, flags, 0o644);
++        if (linux.errno(rc) != .SUCCESS) return if (linux.errno(rc) == .NOENT) error.FileNotFound else error.OpenFailed;
++        return .{ .fd = @intCast(rc), .direct = false };
++    }
++
++    /// The layout a WriteSrc gets: segments, chunk sizes (whole pages a chunk for pool segments).
++    pub fn plan(d: *Disk, src: *const WriteSrc) !Layout {
++        var segs: std.ArrayList(Seg) = .empty;
++        defer segs.deinit(d.gpa);
++        const cap = d.opts.chunk;
++        try segs.append(d.gpa, .{ .name = format.segName("ids"), .kind = .ids, .family = 0, .nbytes = src.ids.len * 4, .chunk = cap });
++        for (src.families, 0..) |f, i| {
++            const pb: u32 = @intCast(f.pageBytes(src.page));
++            const k = @max(1, cap / pb);
++            if (@as(u64, k) * pb > d.staging.size) return error.PageTooLarge;
++            try segs.append(d.gpa, .{ .name = format.segName(f.name), .kind = .pool, .family = @intCast(i), .nbytes = @as(u64, src.pages[i].len) * pb, .chunk = k * pb });
++        }
++        for (src.blobs) |b| try segs.append(d.gpa, .{ .name = format.segName(b.name), .kind = .blob, .family = 0, .nbytes = b.bytes.len, .chunk = cap });
++        const head: Head = .{ .key = src.key, .base = src.base orelse @splat(0), .compat = d.opts.compat, .tag = src.tag, .kind = src.kind, .page = src.page, .world = d.opts.world, .rank = d.opts.rank, .first_page = src.first_page, .npages = src.npages, .nseg = 0, .ndigest = 0, .pos = src.pos };
++        return Layout.build(d.gpa, head, segs.items);
++    }
++
++    /// Writes an entry's file streamed (the pump copies pages to staging, lanes hash and write); returns its bytes.
++    pub fn writeFile(d: *Disk, src: *const WriteSrc) !u64 {
++        var lay = try d.plan(src);
++        defer lay.deinit(d.gpa);
++        var tb: [48]u8 = undefined;
++        var fb: [48]u8 = undefined;
++        const tmp = fileName(src.key, "tmp", &tb);
++        const f = try d.openFile(tmp, true);
++        var ok = false;
++        defer {
++            _ = linux.close(f.fd);
++            if (!ok) _ = linux.unlinkat(d.dir.handle, tmp, 0);
++        }
++        try src.store.waitFence(src.fence);
++        var op = try Op.init(d.gpa, d.io, &d.staging);
++        defer op.deinit();
++        errdefer op.wait() catch {};
++        for (lay.segs) |*s| {
++            for (0..s.nchunks) |ci| {
++                if (op.failed()) |e| return e;
++                const c = s.chunkAt(@intCast(ci));
++                const sb = try d.staging.get();
++                errdefer d.staging.put(sb);
++                const buf = d.staging.buf(sb)[0..c.data];
++                const at = @as(u64, ci) * s.chunk;
++                switch (s.kind) {
++                    .ids => @memcpy(buf, std.mem.sliceAsBytes(src.ids)[at..][0..c.data]),
++                    .blob => @memcpy(buf, blobOf(src, s).bytes[at..][0..c.data]),
++                    .pool => {
++                        const pb: u32 = @intCast(src.families[s.family].pageBytes(src.page));
++                        const p0: usize = @intCast(at / pb);
++                        try src.store.read(s.family, src.pages[s.family][p0..][0 .. c.data / pb], buf);
++                    },
++                    _ => unreachable,
++                }
++                d.lanes.submit(.{ .kind = .write, .fd = f.fd, .staging = sb, .data = c.data, .span = c.span, .off = c.off, .digest = &lay.digests[s.first_digest + ci], .op = &op });
++            }
++        }
++        try op.wait();
++        const hb = try d.staging.get();
++        defer d.staging.put(hb);
++        if (lay.head_span > d.staging.size) return error.HeaderTooLarge;
++        lay.encode(d.staging.buf(hb));
++        try lanes_mod.pwriteAll(f.fd, d.staging.buf(hb)[0..lay.head_span], 0);
++        if (linux.errno(linux.fdatasync(f.fd)) != .SUCCESS) return error.SyncFailed;
++        if (!f.direct) _ = linux.fadvise(f.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
++        if (linux.errno(linux.renameat(d.dir.handle, tmp, d.dir.handle, fileName(src.key, "tfs", &fb))) != .SUCCESS) return error.RenameFailed;
++        ok = true;
++        return lay.head.total;
++    }
++
++    fn blobOf(src: *const WriteSrc, s: *const Seg) Blob {
++        for (src.blobs) |b| if (std.mem.eql(u8, b.name, s.nameOf())) return b;
++        unreachable;
++    }
++
++    /// A file's header, checked.
++    pub fn readHead(d: *Disk, fd: linux.fd_t) !Layout {
++        const hb = try d.staging.get();
++        defer d.staging.put(hb);
++        const buf = d.staging.buf(hb);
++        try lanes_mod.preadAll(fd, buf[0..4096], 0);
++        const hn = std.mem.readInt(u32, buf[12..16], .little);
++        if (up(hn) > buf.len) return error.BadHeader;
++        if (hn > 4096) try lanes_mod.preadAll(fd, buf[4096..up(hn)], 4096);
++        return Layout.decode(d.gpa, buf[0..up(hn)]);
++    }
++
++    /// Reads pages [lo, hi) of one restore file into the sink, each chunk checked first; blobs too when want_blobs.
++    pub fn readFile(d: *Disk, ext: Extent, sink: *const ReadSink, want_blobs: bool) !?Restored {
++        var nb: [48]u8 = undefined;
++        const f = try d.openFile(fileName(ext.key, "tfs", &nb), false);
++        defer _ = linux.close(f.fd);
++        var lay = try d.readHead(f.fd);
++        defer lay.deinit(d.gpa);
++        if (!std.mem.eql(u8, &lay.head.key, &ext.key) or lay.head.first_page != ext.first_page or lay.head.page != sink.page) return error.BadHeader;
++        var st: linux.Statx = undefined;
++        if (linux.errno(linux.statx(f.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS or st.size < lay.head.total) return error.Truncated;
++        var out: std.ArrayList(Blob) = .empty;
++        errdefer {
++            for (out.items) |b| {
++                d.gpa.free(b.name);
++                d.gpa.free(b.bytes);
++            }
++            out.deinit(d.gpa);
++        }
++        var op = try Op.init(d.gpa, d.io, &d.staging);
++        defer op.deinit();
++        errdefer op.wait() catch {};
++        // (segment, chunk) jobs; the pump keeps at most staging - 1 in flight (one buffer for the header path)
++        var jobs: std.ArrayList(struct { seg: u32, chunk: u32 }) = .empty;
++        defer jobs.deinit(d.gpa);
++        for (lay.segs, 0..) |*s, si| switch (s.kind) {
++            .pool => {
++                if (s.family >= sink.families.len) return error.BadHeader;
++                const fam = sink.families[s.family];
++                const pb: u32 = @intCast(fam.pageBytes(sink.page));
++                if (s.chunk % pb != 0 or !std.mem.eql(u8, s.nameOf(), fam.name)) return error.BadHeader;
++                const need = ownedIn(fam, sink, ext.first_page, ext.hi) - ownedIn(fam, sink, ext.first_page, ext.lo);
++                const skip = ownedIn(fam, sink, ext.first_page, ext.lo);
++                if (s.nbytes < (@as(u64, skip) + need) * pb) return error.BadHeader;
++                const kpp = s.chunk / pb;
++                const c0 = skip / kpp;
++                const c1 = if (need == 0) c0 else (skip + need + kpp - 1) / kpp;
++                for (c0..c1) |c| try jobs.append(d.gpa, .{ .seg = @intCast(si), .chunk = @intCast(c) });
++            },
++            .blob => if (want_blobs) {
++                const buf = try d.gpa.alloc(u8, s.nbytes);
++                errdefer d.gpa.free(buf);
++                const name = try d.gpa.dupe(u8, s.nameOf());
++                errdefer d.gpa.free(name);
++                try out.append(d.gpa, .{ .name = name, .bytes = buf });
++                for (0..s.nchunks) |c| try jobs.append(d.gpa, .{ .seg = @intCast(si), .chunk = @intCast(c) });
++            },
++            else => {},
++        };
++        const window = d.staging.count - 1;
++        var sent: usize = 0;
++        var seen: usize = 0;
++        var bytes: u64 = 0;
++        while (seen < jobs.items.len) {
++            while (sent < jobs.items.len and sent - seen < window and op.failed() == null) : (sent += 1) {
++                const jb = jobs.items[sent];
++                const s = &lay.segs[jb.seg];
++                const c = s.chunkAt(jb.chunk);
++                d.lanes.submit(.{ .kind = .read, .fd = f.fd, .staging = try d.staging.get(), .data = c.data, .span = c.span, .off = c.off, .digest = &lay.digests[s.first_digest + jb.chunk], .op = &op, .tag = @intCast(sent) });
++                bytes += c.span;
++            }
++            const j = op.next() orelse break;
++            seen += 1;
++            defer d.staging.put(j.staging);
++            if (op.failed() != null) continue;
++            const jb = jobs.items[j.tag];
++            const s = &lay.segs[jb.seg];
++            const data = d.staging.buf(j.staging)[0..j.data];
++            if (s.kind == .blob) {
++                for (out.items) |b| if (std.mem.eql(u8, b.name, s.nameOf())) @memcpy(@constCast(b.bytes)[@as(u64, jb.chunk) * s.chunk ..][0..data.len], data);
++                continue;
++            }
++            try d.drain(s, jb.chunk, data, ext, sink);
++        }
++        try op.wait();
++        if (!f.direct) _ = linux.fadvise(f.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
++        d.stats.bytes_read += bytes;
++        if (!want_blobs) {
++            out.deinit(d.gpa);
++            return null;
++        }
++        return .{ .blobs = try out.toOwnedSlice(d.gpa) };
++    }
++
++    /// A checked pool chunk's pages that fall in [lo, hi) into the sink's pages.
++    fn drain(d: *Disk, s: *const Seg, chunk: u32, data: []const u8, ext: Extent, sink: *const ReadSink) !void {
++        _ = d;
++        const fam = sink.families[s.family];
++        const pb: u32 = @intCast(fam.pageBytes(sink.page));
++        const kpp = s.chunk / pb;
++        const skip = ownedIn(fam, sink, ext.first_page, ext.lo);
++        const end = ownedIn(fam, sink, ext.first_page, ext.hi);
++        const a = @max(chunk * kpp, skip);
++        const b = @min(chunk * kpp + @as(u32, @intCast(data.len / pb)), end);
++        if (a >= b) return;
++        var list: [512]u32 = undefined;
++        var n: u32 = 0;
++        var j = a;
++        while (j < b) : (j += 1) {
++            list[n] = sink.pages[s.family][logicalOf(fam, sink, ext.first_page, j)];
++            n += 1;
++            if (n == list.len or j + 1 == b) {
++                const first = j + 1 - n;
++                try sink.store.write(s.family, list[0..n], data[(first - chunk * kpp) * pb ..][0 .. n * pb]);
++                n = 0;
++            }
++        }
++    }
++
++    /// Records a written file in the index (round thread, at the plan's point); its base gains a dependent.
++    pub fn register(d: *Disk, src: *const WriteSrc, size: u64) !u32 {
++        const id = try d.add(src.key, src.base, src.tag, src.kind, src.pos, src.first_page, src.npages, size);
++        d.stats.writes += 1;
++        d.stats.bytes_written += size;
++        return id;
++    }
++
++    fn add(d: *Disk, key: Digest, base: ?Digest, tag: u32, kind: u32, pos: u64, first_page: u32, npages: u32, size: u64) !u32 {
++        var r: Rec = .{ .key = key, .tag = tag, .kind = kind, .pos = pos, .first_page = first_page, .npages = npages, .size = size };
++        if (base) |b| {
++            const bi = d.by_key.get(b) orelse return error.NoBase;
++            r.base = bi;
++            r.depth = d.recs.items[bi].depth + 1;
++        }
++        const id: u32 = if (d.free_recs.pop()) |i| i else blk: {
++            try d.recs.append(d.gpa, undefined);
++            break :blk @intCast(d.recs.items.len - 1);
++        };
++        try d.by_key.put(d.gpa, key, id);
++        if (r.base != none) d.recs.items[r.base].refs += 1;
++        d.recs.items[id] = r;
++        d.link(id);
++        d.used += size;
++        return id;
++    }
++
++    /// A valid file found on restart: its header, size and verified ids (tokens [first_page x page, pos), owned).
++    pub const Found = struct {
++        head: Head,
++        size: u64,
++        mtime: i64,
++        ids: []i32,
++
++        fn older(_: void, a: Found, b: Found) bool {
++            return a.mtime < b.mtime or (a.mtime == b.mtime and a.head.first_page < b.head.first_page);
++        }
++    };
++
++    /// Indexes the directory on restart: drops .tmp and bad files, checks ids, registers bases before their deltas.
++    pub fn scan(d: *Disk, out: *std.ArrayList(Found)) !void {
++        var it = d.dir.iterate();
++        var nb: [48]u8 = undefined;
++        while (try it.next(d.io)) |ent| {
++            if (ent.name.len >= nb.len) continue;
++            @memcpy(nb[0..ent.name.len], ent.name);
++            nb[ent.name.len] = 0;
++            const name = nb[0..ent.name.len :0];
++            if (std.mem.endsWith(u8, name, ".tmp")) {
++                _ = linux.unlinkat(d.dir.handle, name, 0);
++                continue;
++            }
++            if (!std.mem.endsWith(u8, name, ".tfs")) continue;
++            const f = d.found(name) catch {
++                d.stats.bad += 1;
++                _ = linux.unlinkat(d.dir.handle, name, 0);
++                continue;
++            };
++            try out.append(d.gpa, f);
++        }
++        std.mem.sort(Found, out.items, {}, Found.older);
++        var i: usize = 0;
++        while (i < out.items.len) {
++            const f = out.items[i];
++            const base: ?Digest = if (f.head.hasBase()) f.head.base else null;
++            if (base != null and d.by_key.get(base.?) == null) {
++                d.stats.bad += 1;
++                var kb: [48]u8 = undefined;
++                _ = linux.unlinkat(d.dir.handle, fileName(f.head.key, "tfs", &kb), 0);
++                d.gpa.free(f.ids);
++                _ = out.orderedRemove(i);
++                continue;
++            }
++            _ = try d.add(f.head.key, base, f.head.tag, f.head.kind, f.head.pos, f.head.first_page, f.head.npages, f.size);
++            i += 1;
++        }
++    }
++
++    fn found(d: *Disk, name: [:0]const u8) !Found {
++        const f = try d.openFile(name, false);
++        defer _ = linux.close(f.fd);
++        var lay = try d.readHead(f.fd);
++        defer lay.deinit(d.gpa);
++        const h = lay.head;
++        var kb: [48]u8 = undefined;
++        if (!std.mem.eql(u8, fileName(h.key, "tfs", &kb), name)) return error.BadHeader;
++        if (!std.mem.eql(u8, &h.compat, &d.opts.compat) or h.rank != d.opts.rank or h.world != d.opts.world) return error.Foreign;
++        var st: linux.Statx = undefined;
++        if (linux.errno(linux.statx(f.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true, .MTIME = true }, &st)) != .SUCCESS or st.size < h.total) return error.Truncated;
++        const seg = lay.find(.ids, "ids") orelse return error.BadHeader;
++        if (seg.nbytes % 4 != 0 or seg.nbytes / 4 != h.pos - @as(u64, h.first_page) * h.page) return error.BadHeader;
++        const ids = try d.gpa.alloc(i32, seg.nbytes / 4);
++        errdefer d.gpa.free(ids);
++        const sb = try d.staging.get();
++        defer d.staging.put(sb);
++        for (0..seg.nchunks) |ci| {
++            const c = seg.chunkAt(@intCast(ci));
++            const buf = d.staging.buf(sb);
++            try lanes_mod.preadAll(f.fd, buf[0..c.span], c.off);
++            var dg: [32]u8 = undefined;
++            std.crypto.hash.sha2.Sha256.hash(buf[0..c.data], &dg, .{});
++            if (!std.mem.eql(u8, &dg, &lay.digests[seg.first_digest + ci])) return error.ChecksumMismatch;
++            @memcpy(std.mem.sliceAsBytes(ids)[@as(usize, ci) * seg.chunk ..][0..c.data], buf[0..c.data]);
++        }
++        return .{ .head = h, .size = st.size, .mtime = st.mtime.sec * std.time.ns_per_s + st.mtime.nsec, .ids = ids };
++    }
++
++    fn link(d: *Disk, id: u32) void {
++        const r = &d.recs.items[id];
++        r.older = d.newest;
++        r.newer = none;
++        if (d.newest != none) d.recs.items[d.newest].newer = id else d.oldest = id;
++        d.newest = id;
++    }
++
++    fn unlink(d: *Disk, id: u32) void {
++        const r = &d.recs.items[id];
++        if (r.older != none) d.recs.items[r.older].newer = r.newer else d.oldest = r.newer;
++        if (r.newer != none) d.recs.items[r.newer].older = r.older else d.newest = r.older;
++    }
++
++    /// Marks a file (and its bases) used now: O(chain).
++    pub fn touch(d: *Disk, key: Digest) void {
++        var id = d.by_key.get(key) orelse return;
++        while (id != none) : (id = d.recs.items[id].base) {
++            d.unlink(id);
++            d.link(id);
++        }
++        // bases end up newest: walk order keeps the entry itself older than its bases, so trims reach dependents first
++    }
++
++    /// The files a restore of key reads, base first, with the logical pages each gives.
++    pub fn extents(d: *Disk, key: Digest, out: *std.ArrayList(Extent)) !void {
++        out.clearRetainingCapacity();
++        var id = d.by_key.get(key) orelse return error.FileNotFound;
++        var hi = d.recs.items[id].npages;
++        while (id != none) {
++            const r = &d.recs.items[id];
++            try out.append(d.gpa, .{ .key = r.key, .first_page = r.first_page, .lo = r.first_page, .hi = hi });
++            hi = r.first_page;
++            id = r.base;
++        }
++        std.mem.reverse(Extent, out.items);
++    }
++
++    /// Deletes a file without dependents (error when one stacks on it).
++    pub fn remove(d: *Disk, key: Digest) !void {
++        const id = d.by_key.get(key) orelse return;
++        const r = &d.recs.items[id];
++        if (r.refs > 0) return error.HasDependents;
++        if (r.base != none) d.recs.items[r.base].refs -= 1;
++        d.unlink(id);
++        _ = d.by_key.remove(key);
++        d.used -= r.size;
++        r.live = false;
++        var nb: [48]u8 = undefined;
++        _ = linux.unlinkat(d.dir.handle, fileName(key, "tfs", &nb), 0);
++        try d.free_recs.append(d.gpa, id);
++    }
++
++    /// Deletes least recently used files without dependents while over budget; their keys go to out.
++    pub fn trim(d: *Disk, out: *std.ArrayList(Digest)) !void {
++        var id = d.oldest;
++        while (d.used > d.opts.budget and id != none) {
++            const next = d.recs.items[id].newer;
++            if (d.recs.items[id].refs == 0) {
++                const key = d.recs.items[id].key;
++                try d.remove(key);
++                try out.append(d.gpa, key);
++                d.stats.evicted += 1;
++                id = d.oldest; // a removed file may free its base
++                continue;
++            }
++            id = next;
++        }
++    }
++};
++
++/// Owned (this rank's) logical pages of family f in [first, k): the file's index of logical page k.
++pub fn ownedIn(f: Family, sink: *const ReadSink, first: u32, k: u32) u32 {
++    if (!(f.split and sink.world > 1)) return k - first;
++    var by: [pool_mod.max_world]u32 = undefined;
++    pool_mod.span(first, k, sink.world, &by);
++    return by[sink.rank];
++}
++
++/// The logical page of a family's j-th stored page of a file that starts at first.
++pub fn logicalOf(f: Family, sink: *const ReadSink, first: u32, j: u32) u32 {
++    if (!(f.split and sink.world > 1)) return first + j;
++    const w = sink.world;
++    const r0 = first + (sink.rank + w - first % w) % w; // the first owned logical page at or after first
++    return r0 + j * w;
++}
+diff --git a/zig/src/sessions/disk_test.zig b/zig/src/sessions/disk_test.zig
+new file mode 100644
+index 00000000..6ac0525e
+--- /dev/null
++++ b/zig/src/sessions/disk_test.zig
+@@ -0,0 +1,125 @@
++//! The NVMe tier on real files: whole and delta files round-trip bit for bit, split ranks, damage.
++
++const std = @import("std");
++const testing = std.testing;
++const pool_mod = @import("pool.zig");
++const Pool = pool_mod.Pool;
++const Family = pool_mod.Family;
++const HostPool = @import("pagestore.zig").HostPool;
++const disk = @import("disk.zig");
++
++const fams = [_]Family{
++    .{ .name = "comp.2", .ratio = 2, .row_bytes = 584, .split = true },
++    .{ .name = "index_k.2", .ratio = 2, .row_bytes = 132 },
++    .{ .name = "comp.20", .ratio = 1, .row_bytes = 584, .split = true },
++};
++
++/// Fills a page of every family with bytes that name (family, logical page, byte).
++fn fill(h: *HostPool, p: *const Pool, logical: u32, pg: u32, salt: u8) void {
++    for (fams, 0..) |f, fi| {
++        if (f.split and !p.owns(pg)) continue;
++        const v = h.pageOf(@intCast(fi), p.familyPage(f, pg));
++        for (v, 0..) |*b, i| b.* = @truncate(i *% 131 +% logical *% 7 +% fi *% 29 +% salt);
++    }
++}
++
++fn familyPages(gpa: std.mem.Allocator, p: *const Pool, pages: []const u32, first: u32, owned_only: bool) ![][]u32 {
++    const out = try gpa.alloc([]u32, fams.len);
++    for (fams, 0..) |f, fi| {
++        var l: std.ArrayList(u32) = .empty;
++        for (pages[first..], first..) |pg, k| {
++            if (f.split and p.world > 1 and owned_only and k % p.world != p.rank) continue;
++            try l.append(gpa, p.familyPage(f, pg));
++        }
++        out[fi] = try l.toOwnedSlice(gpa);
++    }
++    return out;
++}
++
++fn freePages(gpa: std.mem.Allocator, x: [][]u32) void {
++    for (x) |l| gpa.free(l);
++    gpa.free(x);
++}
++
++fn roundTrip(world: u32, rank: u32) !void {
++    const gpa = testing.allocator;
++    const io = testing.io;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
++    defer gpa.free(root);
++    var p = try Pool.init(gpa, .{ .families = &fams, .page = 256 }, 64 * 256, world, rank);
++    defer p.deinit();
++    var h = try HostPool.init(gpa, &p);
++    defer h.deinit();
++    // small chunks so pool segments span many chunks; few staging buffers so the pump waits on the lanes
++    const d = try disk.Disk.open(gpa, io, .{ .root = root, .compat = @splat(5), .rank = rank, .world = world, .chunk = 3 * 74_752, .staging = 3, .lanes = 3, .min_tokens = 1 });
++    defer d.close();
++    const a = try p.newSlot(32 * 256);
++    const pos: u64 = 9 * 256 + 100;
++    try a.ensure(pos);
++    for (a.mapped(), 0..) |pg, k| fill(&h, &p, @intCast(k), pg, 1);
++    const ids = try gpa.alloc(i32, pos);
++    defer gpa.free(ids);
++    for (ids, 0..) |*t, i| t.* = @intCast(i * 3 + 1);
++    var blob: [5000]u8 = undefined;
++    for (&blob, 0..) |*x, i| x.* = @truncate(9 - i % 5);
++    const fp = try familyPages(gpa, &p, a.mapped(), 0, true);
++    defer freePages(gpa, fp);
++    const src: disk.WriteSrc = .{ .key = @splat(1), .tag = 4, .page = 256, .pos = pos, .npages = a.len, .ids = ids, .store = h.store(), .families = &fams, .pages = fp, .blobs = &.{.{ .name = "rings", .bytes = &blob }} };
++    const size = try d.writeFile(&src);
++    _ = try d.register(&src, size);
++    // a newer turn stacks a delta on it: pages [9, 14) only (page 9 was partial in the base)
++    const pos2: u64 = 13 * 256 + 7;
++    try a.ensure(pos2);
++    for (a.mapped()[9..], 9..) |pg, k| fill(&h, &p, @intCast(k), pg, 2);
++    const ids2 = try gpa.alloc(i32, pos2);
++    defer gpa.free(ids2);
++    for (ids2, 0..) |*t, i| t.* = @intCast(i * 3 + 1);
++    const fp2 = try familyPages(gpa, &p, a.mapped(), 9, true);
++    defer freePages(gpa, fp2);
++    const src2: disk.WriteSrc = .{ .key = @splat(2), .base = @splat(1), .tag = 4, .page = 256, .pos = pos2, .first_page = 9, .npages = a.len, .ids = ids2[9 * 256 ..], .store = h.store(), .families = &fams, .pages = fp2, .blobs = &.{.{ .name = "rings", .bytes = blob[0..77] }} };
++    const size2 = try d.writeFile(&src2);
++    _ = try d.register(&src2, size2);
++    try testing.expect(size2 < size);
++    try testing.expectError(error.HasDependents, d.remove(@splat(1)));
++    // restore the delta onto other pages through its chain
++    const b = try p.newSlot(32 * 256);
++    try b.ensure(pos2);
++    var ext: std.ArrayList(disk.Extent) = .empty;
++    defer ext.deinit(gpa);
++    try d.extents(@splat(2), &ext);
++    try testing.expectEqual(@as(usize, 2), ext.items.len);
++    try testing.expectEqual(@as(u32, 9), ext.items[0].hi);
++    const tp = try familyPages(gpa, &p, b.mapped(), 0, false);
++    defer freePages(gpa, tp);
++    const sink: disk.ReadSink = .{ .store = h.store(), .families = &fams, .page = 256, .world = world, .rank = rank, .pages = tp };
++    try testing.expect(try d.readFile(ext.items[0], &sink, false) == null);
++    var got = (try d.readFile(ext.items[1], &sink, true)).?;
++    defer got.deinit(gpa);
++    try testing.expectEqualSlices(u8, blob[0..77], got.blobs[0].bytes);
++    for (a.mapped(), b.mapped()) |pa, pb| for (fams, 0..) |f, fi| {
++        if (f.split and !p.owns(pa)) continue;
++        try testing.expectEqualSlices(u8, h.pageOf(@intCast(fi), p.familyPage(f, pa)), h.pageOf(@intCast(fi), p.familyPage(f, pb)));
++    };
++    // damage one chunk: the read refuses it before or as its rows land
++    var nb: [48]u8 = undefined;
++    const key2: [16]u8 = @splat(2);
++    const name = try std.fmt.bufPrint(&nb, "{x}.tfs", .{&key2});
++    const f = try d.dir.openFile(io, name, .{ .mode = .read_write });
++    var one = [_]u8{0};
++    _ = try f.readPositional(io, &.{&one}, 3 * 4096 + 100);
++    one[0] ^= 0xff;
++    try f.writePositionalAll(io, &one, 3 * 4096 + 100);
++    f.close(io);
++    try testing.expectError(error.ChecksumMismatch, d.readFile(ext.items[1], &sink, true));
++}
++
++test "whole and delta files round-trip bit for bit (replicated)" {
++    try roundTrip(1, 0);
++}
++
++test "split ranks write and restore their own pages (rank 0 and 1 of 2)" {
++    try roundTrip(2, 0);
++    try roundTrip(2, 1);
++}
+diff --git a/zig/src/sessions/format.zig b/zig/src/sessions/format.zig
+new file mode 100644
+index 00000000..2ac391d1
+--- /dev/null
++++ b/zig/src/sessions/format.zig
+@@ -0,0 +1,197 @@
++//! A session file (format 2): a header, then segments of 4 KiB-aligned chunks, each with its own SHA-256.
++
++const std = @import("std");
++const Sha256 = std.crypto.hash.sha2.Sha256;
++const up = @import("lanes.zig").up;
++
++pub const magic = "TFSESS02".*;
++pub const version: u32 = 2;
++
++pub const SegKind = enum(u32) { ids = 1, pool = 2, blob = 3, _ };
++
++pub const Head = extern struct {
++    magic: [8]u8 = magic,
++    version: u32 = version,
++    /// bytes of Head + segments + digests (before the pad)
++    head_bytes: u32 = 0,
++    /// SHA-256 of those bytes with this field zero
++    head_sha: [32]u8 = @splat(0),
++    key: [16]u8,
++    /// the entry whose files hold logical pages [0, first_page); zero: none
++    base: [16]u8 = @splat(0),
++    /// what makes these bytes mean the same thing to a build (family, knobs, layout, split)
++    compat: [16]u8,
++    tag: u32,
++    kind: u32,
++    page: u32,
++    world: u32,
++    rank: u32,
++    first_page: u32,
++    npages: u32,
++    nseg: u32,
++    ndigest: u32,
++    _pad: u32 = 0,
++    pos: u64,
++    total: u64 = 0,
++
++    pub fn hasBase(h: *const Head) bool {
++        return !std.mem.allEqual(u8, &h.base, 0);
++    }
++};
++
++pub const Seg = extern struct {
++    name: [40]u8,
++    kind: SegKind,
++    /// pool: the family's index in the layout
++    family: u32,
++    nbytes: u64,
++    offset: u64 = 0,
++    /// bytes a chunk (the last may be shorter) and file bytes a chunk (4 KiB multiple)
++    chunk: u32,
++    stride: u32 = 0,
++    first_digest: u32 = 0,
++    nchunks: u32 = 0,
++
++    pub fn nameOf(s: *const Seg) []const u8 {
++        return std.mem.sliceTo(&s.name, 0);
++    }
++
++    /// Chunk i's data bytes and file span.
++    pub fn chunkAt(s: *const Seg, i: u32) struct { off: u64, data: u32, span: u32 } {
++        const data: u32 = @intCast(@min(@as(u64, s.chunk), s.nbytes - @as(u64, i) * s.chunk));
++        return .{ .off = s.offset + @as(u64, i) * s.stride, .data = data, .span = @intCast(up(data)) };
++    }
++};
++
++pub const Digest32 = [32]u8;
++
++pub fn segName(name: []const u8) [40]u8 {
++    var n: [40]u8 = @splat(0);
++    @memcpy(n[0..@min(name.len, 39)], name[0..@min(name.len, 39)]);
++    return n;
++}
++
++/// A file's layout: offsets, chunks and the digest slots, before or after its chunks are written.
++pub const Layout = struct {
++    head: Head,
++    segs: []Seg,
++    digests: []Digest32,
++    /// file bytes of the padded header
++    head_span: u64,
++
++    /// Places segments (each with name, kind, family, nbytes, chunk) after the header.
++    pub fn build(gpa: std.mem.Allocator, head: Head, segs_in: []const Seg) !Layout {
++        const segs = try gpa.dupe(Seg, segs_in);
++        errdefer gpa.free(segs);
++        var nd: u32 = 0;
++        for (segs) |*s| {
++            if (s.chunk == 0) return error.BadSegment;
++            s.nchunks = @intCast((s.nbytes + s.chunk - 1) / s.chunk);
++            s.stride = @intCast(up(s.chunk));
++            s.first_digest = nd;
++            nd += s.nchunks;
++        }
++        var h = head;
++        h.nseg = @intCast(segs.len);
++        h.ndigest = nd;
++        h.head_bytes = @intCast(@sizeOf(Head) + segs.len * @sizeOf(Seg) + nd * @sizeOf(Digest32));
++        const span = up(h.head_bytes);
++        var off = span;
++        for (segs) |*s| {
++            s.offset = off;
++            if (s.nchunks > 0) off += @as(u64, s.nchunks - 1) * s.stride + up(s.nbytes - @as(u64, s.nchunks - 1) * s.chunk);
++        }
++        h.total = off;
++        const d = try gpa.alloc(Digest32, nd);
++        @memset(d, @splat(0));
++        return .{ .head = h, .segs = segs, .digests = d, .head_span = span };
++    }
++
++    pub fn deinit(l: *Layout, gpa: std.mem.Allocator) void {
++        gpa.free(l.segs);
++        gpa.free(l.digests);
++        l.* = undefined;
++    }
++
++    /// The header's bytes with its checksum into out (len >= head_span; the pad is zeroed).
++    pub fn encode(l: *Layout, out: []u8) void {
++        @memset(out[0..l.head_span], 0);
++        var h = l.head;
++        h.head_sha = @splat(0);
++        const hb = std.mem.asBytes(&h);
++        const sb = std.mem.sliceAsBytes(l.segs);
++        const db = std.mem.sliceAsBytes(l.digests);
++        @memcpy(out[0..hb.len], hb);
++        @memcpy(out[hb.len..][0..sb.len], sb);
++        @memcpy(out[hb.len + sb.len ..][0..db.len], db);
++        var sha: [32]u8 = undefined;
++        Sha256.hash(out[0..h.head_bytes], &sha, .{});
++        @memcpy(out[@offsetOf(Head, "head_sha")..][0..32], &sha);
++        l.head.head_sha = sha;
++    }
++
++    /// The header read back from bytes (at least head_bytes of them), every field and offset checked.
++    pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) !Layout {
++        if (bytes.len < @sizeOf(Head)) return error.BadHeader;
++        var h: Head = undefined;
++        @memcpy(std.mem.asBytes(&h), bytes[0..@sizeOf(Head)]);
++        if (!std.mem.eql(u8, &h.magic, &magic) or h.version != version) return error.BadHeader;
++        const want = @sizeOf(Head) + @as(u64, h.nseg) * @sizeOf(Seg) + @as(u64, h.ndigest) * @sizeOf(Digest32);
++        if (h.head_bytes != want or bytes.len < want) return error.BadHeader;
++        var check: [32]u8 = undefined;
++        var sha = Sha256.init(.{});
++        sha.update(bytes[0..@offsetOf(Head, "head_sha")]);
++        sha.update(&@as([32]u8, @splat(0)));
++        sha.update(bytes[@offsetOf(Head, "head_sha") + 32 .. want]);
++        sha.final(&check);
++        if (!std.mem.eql(u8, &check, &h.head_sha)) return error.ChecksumMismatch;
++        const segs = try gpa.alloc(Seg, h.nseg);
++        errdefer gpa.free(segs);
++        @memcpy(std.mem.sliceAsBytes(segs), bytes[@sizeOf(Head)..][0 .. segs.len * @sizeOf(Seg)]);
++        const d = try gpa.alloc(Digest32, h.ndigest);
++        errdefer gpa.free(d);
++        @memcpy(std.mem.sliceAsBytes(d), bytes[@sizeOf(Head) + segs.len * @sizeOf(Seg) ..][0 .. d.len * 32]);
++        var nd: u64 = 0;
++        for (segs) |s| {
++            if (s.chunk == 0 or s.stride != up(s.chunk) or s.first_digest != nd or s.offset % 4096 != 0) return error.BadHeader;
++            if (s.nchunks != (s.nbytes + s.chunk - 1) / s.chunk) return error.BadHeader;
++            if (s.nchunks > 0 and s.offset + @as(u64, s.nchunks - 1) * s.stride + up(s.nbytes - @as(u64, s.nchunks - 1) * s.chunk) > h.total) return error.BadHeader;
++            nd += s.nchunks;
++        }
++        if (nd != h.ndigest) return error.BadHeader;
++        return .{ .head = h, .segs = segs, .digests = d, .head_span = up(h.head_bytes) };
++    }
++
++    pub fn find(l: *const Layout, kind: SegKind, name: []const u8) ?*const Seg {
++        for (l.segs) |*s| if (s.kind == kind and std.mem.eql(u8, s.nameOf(), name)) return s;
++        return null;
++    }
++};
++
++test "a layout encodes, decodes, and refuses a damaged header" {
++    const gpa = std.testing.allocator;
++    const head: Head = .{ .key = @splat(1), .compat = @splat(2), .tag = 3, .kind = 0, .page = 256, .world = 2, .rank = 1, .first_page = 4, .npages = 9, .nseg = 0, .ndigest = 0, .pos = 2200 };
++    var l = try Layout.build(gpa, head, &.{
++        .{ .name = segName("ids"), .kind = .ids, .family = 0, .nbytes = 4 * (2200 - 1024), .chunk = 1 << 20 },
++        .{ .name = segName("comp.20"), .kind = .pool, .family = 0, .nbytes = 3 * 149_504, .chunk = 2 * 149_504 },
++        .{ .name = segName("taps"), .kind = .blob, .family = 0, .nbytes = 0, .chunk = 4096 },
++    });
++    defer l.deinit(gpa);
++    try std.testing.expectEqual(@as(u32, 1 + 2 + 0), l.head.ndigest);
++    try std.testing.expectEqual(@as(u64, 4096), l.segs[0].offset);
++    try std.testing.expectEqual(@as(u64, 4096 + up(4 * 1176)), l.segs[1].offset);
++    const c1 = l.segs[1].chunkAt(1);
++    try std.testing.expectEqual(@as(u32, 149_504), c1.data);
++    try std.testing.expectEqual(l.segs[1].offset + up(2 * 149_504), c1.off);
++    try std.testing.expectEqual(l.segs[2].offset, l.head.total);
++    l.digests[1][5] = 9;
++    var buf: [8192]u8 = undefined;
++    l.encode(&buf);
++    var back = try Layout.decode(gpa, &buf);
++    defer back.deinit(gpa);
++    try std.testing.expectEqual(l.head.total, back.head.total);
++    try std.testing.expectEqual(@as(u8, 9), back.digests[1][5]);
++    try std.testing.expectEqualStrings("comp.20", back.find(.pool, "comp.20").?.nameOf());
++    buf[200] ^= 0x40;
++    try std.testing.expectError(error.ChecksumMismatch, Layout.decode(gpa, &buf));
++}
+diff --git a/zig/src/sessions/freeset.zig b/zig/src/sessions/freeset.zig
+new file mode 100644
+index 00000000..b8cce323
+--- /dev/null
++++ b/zig/src/sessions/freeset.zig
+@@ -0,0 +1,114 @@
++//! A set of free page indices, lowest first in O(log64 n): a bit a page, then a bit a non-empty word a level up.
++
++const std = @import("std");
++
++const max_levels = 6; // 64^6 pages: more than any pool
++
++pub const FreeSet = struct {
++    /// levels[0] holds a bit a page, levels[k] a bit a non-empty word of levels[k - 1]
++    levels: [max_levels][]u64 = @splat(&.{}),
++    depth: u8 = 0,
++    n: u32 = 0,
++    free: u32 = 0,
++
++    /// All of 0 .. n - 1 free.
++    pub fn init(gpa: std.mem.Allocator, n: u32) !FreeSet {
++        var s: FreeSet = .{ .n = n };
++        errdefer s.deinit(gpa);
++        var bits: usize = @max(n, 1);
++        while (true) {
++            const words = (bits + 63) / 64;
++            s.levels[s.depth] = try gpa.alloc(u64, words);
++            @memset(s.levels[s.depth], 0);
++            s.depth += 1;
++            if (words == 1) break;
++            bits = words;
++        }
++        for (0..n) |i| s.setBit(@intCast(i));
++        s.free = n;
++        return s;
++    }
++
++    pub fn deinit(s: *FreeSet, gpa: std.mem.Allocator) void {
++        for (s.levels[0..s.depth]) |l| gpa.free(l);
++        s.* = .{};
++    }
++
++    pub fn count(s: *const FreeSet) u32 {
++        return s.free;
++    }
++
++    pub fn contains(s: *const FreeSet, i: u32) bool {
++        return s.levels[0][i / 64] & (@as(u64, 1) << @intCast(i % 64)) != 0;
++    }
++
++    /// The lowest free index, taken; null when none is free.
++    pub fn takeLowest(s: *FreeSet) ?u32 {
++        if (s.free == 0) return null;
++        var idx: usize = 0;
++        var lv: usize = s.depth;
++        while (lv > 0) {
++            lv -= 1;
++            const w = s.levels[lv][idx];
++            idx = idx * 64 + @ctz(w);
++        }
++        const i: u32 = @intCast(idx);
++        s.clearBit(i);
++        s.free -= 1;
++        return i;
++    }
++
++    /// Takes a given free index (error when it is not free).
++    pub fn take(s: *FreeSet, i: u32) error{NotFree}!void {
++        if (i >= s.n or !s.contains(i)) return error.NotFree;
++        s.clearBit(i);
++        s.free -= 1;
++    }
++
++    /// Gives an index back (error when it is already free: a double free).
++    pub fn give(s: *FreeSet, i: u32) error{DoubleFree}!void {
++        if (i >= s.n or s.contains(i)) return error.DoubleFree;
++        s.setBit(i);
++        s.free += 1;
++    }
++
++    fn setBit(s: *FreeSet, i: u32) void {
++        var idx: usize = i;
++        for (s.levels[0..s.depth]) |l| {
++            const was = l[idx / 64];
++            l[idx / 64] = was | (@as(u64, 1) << @intCast(idx % 64));
++            if (was != 0) return; // the word was non-empty: the levels above already say so
++            idx /= 64;
++        }
++    }
++
++    fn clearBit(s: *FreeSet, i: u32) void {
++        var idx: usize = i;
++        for (s.levels[0..s.depth]) |l| {
++            l[idx / 64] &= ~(@as(u64, 1) << @intCast(idx % 64));
++            if (l[idx / 64] != 0) return; // the word still has a free bit: the levels above stay set
++            idx /= 64;
++        }
++    }
++};
++
++test "lowest first, give back, double free refused, across levels" {
++    const gpa = std.testing.allocator;
++    var s = try FreeSet.init(gpa, 70_000); // three levels
++    defer s.deinit(gpa);
++    try std.testing.expectEqual(@as(u8, 3), s.depth);
++    for (0..5000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i)), s.takeLowest());
++    try s.give(4097);
++    try s.give(17);
++    try std.testing.expectError(error.DoubleFree, s.give(17));
++    try std.testing.expectEqual(@as(?u32, 17), s.takeLowest());
++    try std.testing.expectEqual(@as(?u32, 4097), s.takeLowest());
++    try std.testing.expectEqual(@as(?u32, 5000), s.takeLowest());
++    try s.take(69_999);
++    try std.testing.expectError(error.NotFree, s.take(69_999));
++    try std.testing.expectEqual(@as(u32, 70_000 - 5001 - 1), s.count());
++    while (s.takeLowest()) |_| {}
++    try std.testing.expectEqual(@as(u32, 0), s.count());
++    try s.give(69_999);
++    try std.testing.expectEqual(@as(?u32, 69_999), s.takeLowest());
++}
+diff --git a/zig/src/sessions/jobs.zig b/zig/src/sessions/jobs.zig
+new file mode 100644
+index 00000000..5b445f20
+--- /dev/null
++++ b/zig/src/sessions/jobs.zig
+@@ -0,0 +1,150 @@
++//! Parks and restores off the round: a tier thread runs each job's file I/O until the plan settles it (Store.settle).
++
++const std = @import("std");
++const Io = std.Io;
++const disk_mod = @import("disk.zig");
++const Disk = disk_mod.Disk;
++
++pub const Kind = enum { park, restore };
++pub const State = enum(u8) { queued, running, done, failed };
++
++pub const Job = struct {
++    kind: Kind,
++    /// the store's entry
++    entry: u32,
++    state: std.atomic.Value(State) = .init(.queued),
++    err: ?anyerror = null,
++    started_ns: i96 = 0,
++    elapsed_ns: u64 = 0,
++    /// park: the file to write (owned buffers below) and its size once written
++    src: disk_mod.WriteSrc = undefined,
++    size: u64 = 0,
++    /// restore: files base first, the sink, the bounded state read
++    extents: []disk_mod.Extent = &.{},
++    sink: disk_mod.ReadSink = undefined,
++    restored: ?disk_mod.Restored = null,
++    /// restore: the slot it fills
++    slot: u32 = 0,
++    /// pool pages the job holds until settled
++    held: []u32 = &.{},
++    /// owned buffers
++    ids: []i32 = &.{},
++    lists: [][]u32 = &.{},
++    blobs: []disk_mod.Blob = &.{},
++
++    pub fn done(j: *const Job) bool {
++        const s = j.state.load(.acquire);
++        return s == .done or s == .failed;
++    }
++
++    pub fn deinit(j: *Job, gpa: std.mem.Allocator) void {
++        gpa.free(j.held);
++        gpa.free(j.ids);
++        for (j.lists) |l| gpa.free(l);
++        gpa.free(j.lists);
++        for (j.blobs) |b| {
++            gpa.free(b.name);
++            gpa.free(b.bytes);
++        }
++        gpa.free(j.blobs);
++        gpa.free(j.extents);
++        if (j.restored) |*r| r.deinit(gpa);
++        gpa.destroy(j);
++    }
++
++    fn run(j: *Job, d: *Disk, io: Io) void {
++        j.state.store(.running, .release);
++        const t0 = Io.Clock.awake.now(io).toNanoseconds();
++        j.err = switch (j.kind) {
++            .park => if (d.writeFile(&j.src)) |n| blk: {
++                j.size = n;
++                break :blk null;
++            } else |e| e,
++            .restore => j.restore(d),
++        };
++        j.elapsed_ns = @intCast(Io.Clock.awake.now(io).toNanoseconds() - t0);
++        j.state.store(if (j.err == null) .done else .failed, .release);
++    }
++
++    fn restore(j: *Job, d: *Disk) ?anyerror {
++        for (j.extents, 0..) |e, i| {
++            const last = i + 1 == j.extents.len;
++            const r = d.readFile(e, &j.sink, last) catch |err| return err;
++            if (last) j.restored = r;
++        }
++        j.sink.store.publish() catch |err| return err;
++        return null;
++    }
++};
++
++/// The tier thread and its queue (null thread: jobs run inline).
++pub const Runner = struct {
++    gpa: std.mem.Allocator,
++    io: Io,
++    disk: *Disk,
++    thread: ?std.Thread = null,
++    queue: std.ArrayList(*Job) = .empty,
++    head: usize = 0,
++    mutex: Io.Mutex = .init,
++    cond: Io.Condition = .init,
++    stop: bool = false,
++
++    pub fn init(gpa: std.mem.Allocator, io: Io, d: *Disk) Runner {
++        return .{ .gpa = gpa, .io = io, .disk = d };
++    }
++
++    /// Starts the tier thread: jobs then run off the caller's thread.
++    pub fn startThread(r: *Runner) !void {
++        if (r.thread != null) return;
++        r.thread = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, loop, .{r});
++    }
++
++    pub fn deinit(r: *Runner) void {
++        if (r.thread) |t| {
++            r.mutex.lockUncancelable(r.io);
++            r.stop = true;
++            r.cond.broadcast(r.io);
++            r.mutex.unlock(r.io);
++            t.join();
++        }
++        r.queue.deinit(r.gpa);
++    }
++
++    pub fn submit(r: *Runner, j: *Job) !void {
++        if (r.thread == null) return j.run(r.disk, r.io);
++        r.mutex.lockUncancelable(r.io);
++        defer r.mutex.unlock(r.io);
++        if (r.head == r.queue.items.len) {
++            r.queue.clearRetainingCapacity();
++            r.head = 0;
++        }
++        try r.queue.append(r.gpa, j);
++        r.cond.signal(r.io);
++    }
++
++    /// Waits for a job (the plan settles it next).
++    pub fn wait(r: *Runner, j: *Job) void {
++        while (!j.done()) {
++            r.mutex.lockUncancelable(r.io);
++            defer r.mutex.unlock(r.io);
++            if (!j.done()) r.cond.waitTimeout(r.io, &r.mutex, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch {};
++        }
++    }
++
++    fn loop(r: *Runner) void {
++        while (true) {
++            const j = blk: {
++                r.mutex.lockUncancelable(r.io);
++                defer r.mutex.unlock(r.io);
++                while (r.head == r.queue.items.len and !r.stop) r.cond.waitUncancelable(r.io, &r.mutex);
++                if (r.head == r.queue.items.len) return;
++                r.head += 1;
++                break :blk r.queue.items[r.head - 1];
++            };
++            j.run(r.disk, r.io);
++            r.mutex.lockUncancelable(r.io);
++            r.cond.broadcast(r.io);
++            r.mutex.unlock(r.io);
++        }
++    }
++};
+diff --git a/zig/src/sessions/lanes.zig b/zig/src/sessions/lanes.zig
+new file mode 100644
+index 00000000..38fad8cd
+--- /dev/null
++++ b/zig/src/sessions/lanes.zig
+@@ -0,0 +1,336 @@
++//! The NVMe tier's lane threads, which hash and write (or read and check) 4 KiB chunks, and their staging buffers.
++
++const std = @import("std");
++const linux = std.os.linux;
++const Io = std.Io;
++const Sha256 = std.crypto.hash.sha2.Sha256;
++
++pub const block = 4096;
++
++pub fn up(n: u64) u64 {
++    return (n + block - 1) / block * block;
++}
++
++/// Bounded, aligned staging buffers (allocated once; `release` gives the memory back while idle).
++pub const Staging = struct {
++    io: Io,
++    size: usize,
++    count: u32,
++    bufs: [][]align(block) u8,
++    free_list: []u32,
++    free_n: u32,
++    mutex: Io.Mutex = .init,
++    cond: Io.Condition = .init,
++    gpa: std.mem.Allocator,
++
++    pub fn init(gpa: std.mem.Allocator, io: Io, count: u32, size: usize) !Staging {
++        if (count == 0 or size % block != 0) return error.BadStaging;
++        const bufs = try gpa.alloc([]align(block) u8, count);
++        errdefer gpa.free(bufs);
++        const fl = try gpa.alloc(u32, count);
++        errdefer gpa.free(fl);
++        for (bufs, 0..) |*b, i| {
++            b.* = &.{};
++            fl[i] = @intCast(i);
++        }
++        return .{ .io = io, .size = size, .count = count, .bufs = bufs, .free_list = fl, .free_n = count, .gpa = gpa };
++    }
++
++    pub fn deinit(s: *Staging) void {
++        s.release();
++        s.gpa.free(s.bufs);
++        s.gpa.free(s.free_list);
++        s.* = undefined;
++    }
++
++    /// A free buffer's index, waiting for one; its memory is mapped on first use.
++    pub fn get(s: *Staging) !u32 {
++        s.mutex.lockUncancelable(s.io);
++        defer s.mutex.unlock(s.io);
++        while (s.free_n == 0) s.cond.waitUncancelable(s.io, &s.mutex);
++        s.free_n -= 1;
++        const i = s.free_list[s.free_n];
++        if (s.bufs[i].len == 0) s.bufs[i] = try s.gpa.alignedAlloc(u8, .fromByteUnits(block), s.size);
++        return i;
++    }
++
++    pub fn put(s: *Staging, i: u32) void {
++        s.mutex.lockUncancelable(s.io);
++        defer s.mutex.unlock(s.io);
++        s.free_list[s.free_n] = i;
++        s.free_n += 1;
++        s.cond.signal(s.io);
++    }
++
++    pub fn buf(s: *Staging, i: u32) []align(block) u8 {
++        return s.bufs[i];
++    }
++
++    /// Unmaps every buffer (all must be free): the memory goes back between operations.
++    pub fn release(s: *Staging) void {
++        std.debug.assert(s.free_n == s.count);
++        for (s.bufs) |*b| if (b.len != 0) {
++            s.gpa.free(b.*);
++            b.* = &.{};
++        };
++    }
++
++    pub fn bytes(s: *const Staging) u64 {
++        return @as(u64, s.count) * s.size;
++    }
++};
++
++pub const Kind = enum { write, read };
++
++/// One chunk's I/O: buf[0 .. span] at file offset off (span: the chunk padded to 4 KiB; data: the chunk's own bytes).
++pub const Job = struct {
++    kind: Kind,
++    fd: linux.fd_t,
++    staging: u32,
++    data: u32,
++    span: u32,
++    off: u64,
++    /// write: the chunk's digest goes here; read: the digest it must have
++    digest: *[32]u8,
++    op: *Op,
++    /// the pump's tag for a finished read
++    tag: u32 = 0,
++};
++
++/// A park's or restore's chunks in flight: how many are pending, the first error, and finished reads for the pump.
++pub const Op = struct {
++    io: Io,
++    mutex: Io.Mutex = .init,
++    cond: Io.Condition = .init,
++    pending: u32 = 0,
++    err: ?anyerror = null,
++    /// finished reads (their jobs), drained by the pump
++    done: std.ArrayList(Job) = .empty,
++    gpa: std.mem.Allocator,
++    /// write jobs hand their staging back themselves
++    staging: *Staging,
++
++    pub fn init(gpa: std.mem.Allocator, io: Io, staging: *Staging) !Op {
++        var o: Op = .{ .io = io, .gpa = gpa, .staging = staging };
++        try o.done.ensureTotalCapacity(gpa, staging.count);
++        return o;
++    }
++
++    pub fn deinit(o: *Op) void {
++        o.done.deinit(o.gpa);
++    }
++
++    fn finish(o: *Op, j: Job, err: ?anyerror) void {
++        o.mutex.lockUncancelable(o.io);
++        defer o.mutex.unlock(o.io);
++        o.pending -= 1;
++        if (err) |e| {
++            if (o.err == null) o.err = e;
++        }
++        if (j.kind == .read) o.done.appendAssumeCapacity(j) else o.staging.put(j.staging);
++        o.cond.broadcast(o.io);
++    }
++
++    /// The next finished read, waiting for one; null when none is pending.
++    pub fn next(o: *Op) ?Job {
++        o.mutex.lockUncancelable(o.io);
++        defer o.mutex.unlock(o.io);
++        while (o.done.items.len == 0 and o.pending > 0) o.cond.waitUncancelable(o.io, &o.mutex);
++        return o.done.pop();
++    }
++
++    /// Waits for every pending job; returns the first error.
++    pub fn wait(o: *Op) !void {
++        o.mutex.lockUncancelable(o.io);
++        defer o.mutex.unlock(o.io);
++        while (o.pending > 0) o.cond.waitUncancelable(o.io, &o.mutex);
++        if (o.err) |e| return e;
++    }
++
++    pub fn failed(o: *Op) ?anyerror {
++        o.mutex.lockUncancelable(o.io);
++        defer o.mutex.unlock(o.io);
++        return o.err;
++    }
++};
++
++/// The lane threads and their queue.
++pub const Lanes = struct {
++    io: Io,
++    gpa: std.mem.Allocator,
++    staging: *Staging,
++    threads: []std.Thread,
++    /// queued jobs: a ring as long as the staging set (every queued job holds a buffer)
++    ring: []Job,
++    head: usize = 0,
++    len: usize = 0,
++    mutex: Io.Mutex = .init,
++    cond: Io.Condition = .init,
++    stop: bool = false,
++    /// seconds the lanes spent hashing and in I/O (summed over lanes)
++    hash_ns: std.atomic.Value(u64) = .init(0),
++    io_ns: std.atomic.Value(u64) = .init(0),
++
++    pub fn start(gpa: std.mem.Allocator, io: Io, staging: *Staging, n: u32) !*Lanes {
++        const l = try gpa.create(Lanes);
++        errdefer gpa.destroy(l);
++        const ring = try gpa.alloc(Job, staging.count);
++        errdefer gpa.free(ring);
++        l.* = .{ .io = io, .gpa = gpa, .staging = staging, .threads = try gpa.alloc(std.Thread, n), .ring = ring };
++        errdefer gpa.free(l.threads);
++        var made: usize = 0;
++        errdefer {
++            l.halt();
++            for (l.threads[0..made]) |t| t.join();
++        }
++        for (l.threads) |*t| {
++            t.* = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, run, .{l});
++            made += 1;
++        }
++        return l;
++    }
++
++    fn halt(l: *Lanes) void {
++        l.mutex.lockUncancelable(l.io);
++        l.stop = true;
++        l.cond.broadcast(l.io);
++        l.mutex.unlock(l.io);
++    }
++
++    pub fn shutdown(l: *Lanes) void {
++        l.halt();
++        for (l.threads) |t| t.join();
++        l.gpa.free(l.ring);
++        l.gpa.free(l.threads);
++        l.gpa.destroy(l);
++    }
++
++    /// Queues a job (each holds a staging buffer, so the ring never overflows).
++    pub fn submit(l: *Lanes, j: Job) void {
++        {
++            j.op.mutex.lockUncancelable(l.io);
++            defer j.op.mutex.unlock(l.io);
++            j.op.pending += 1;
++        }
++        l.mutex.lockUncancelable(l.io);
++        defer l.mutex.unlock(l.io);
++        std.debug.assert(l.len < l.ring.len);
++        l.ring[(l.head + l.len) % l.ring.len] = j;
++        l.len += 1;
++        l.cond.signal(l.io);
++    }
++
++    fn run(l: *Lanes) void {
++        while (true) {
++            const j = blk: {
++                l.mutex.lockUncancelable(l.io);
++                defer l.mutex.unlock(l.io);
++                while (l.len == 0 and !l.stop) l.cond.waitUncancelable(l.io, &l.mutex);
++                if (l.len == 0) return;
++                const j = l.ring[l.head];
++                l.head = (l.head + 1) % l.ring.len;
++                l.len -= 1;
++                break :blk j;
++            };
++            j.op.finish(j, l.work(j));
++        }
++    }
++
++    fn work(l: *Lanes, j: Job) ?anyerror {
++        const b = l.staging.buf(j.staging);
++        var t0 = std.Io.Clock.awake.now(l.io).toNanoseconds();
++        switch (j.kind) {
++            .write => {
++                Sha256.hash(b[0..j.data], j.digest, .{});
++                const t1 = std.Io.Clock.awake.now(l.io).toNanoseconds();
++                _ = l.hash_ns.fetchAdd(@intCast(t1 - t0), .monotonic);
++                t0 = t1;
++                @memset(b[j.data..j.span], 0);
++                pwriteAll(j.fd, b[0..j.span], j.off) catch |e| return e;
++                _ = l.io_ns.fetchAdd(@intCast(std.Io.Clock.awake.now(l.io).toNanoseconds() - t0), .monotonic);
++            },
++            .read => {
++                preadAll(j.fd, b[0..j.span], j.off) catch |e| return e;
++                const t1 = std.Io.Clock.awake.now(l.io).toNanoseconds();
++                _ = l.io_ns.fetchAdd(@intCast(t1 - t0), .monotonic);
++                var d: [32]u8 = undefined;
++                Sha256.hash(b[0..j.data], &d, .{});
++                _ = l.hash_ns.fetchAdd(@intCast(std.Io.Clock.awake.now(l.io).toNanoseconds() - t1), .monotonic);
++                if (!std.mem.eql(u8, &d, j.digest)) return error.ChecksumMismatch;
++            },
++        }
++        return null;
++    }
++};
++
++pub fn pwriteAll(fd: linux.fd_t, data: []const u8, off: u64) !void {
++    var done: usize = 0;
++    while (done < data.len) {
++        const rc = linux.pwrite(fd, data[done..].ptr, data.len - done, @intCast(off + done));
++        switch (linux.errno(rc)) {
++            .SUCCESS => {},
++            .INTR => continue,
++            .NOSPC => return error.NoSpaceLeft,
++            else => return error.WriteFailed,
++        }
++        if (rc == 0) return error.WriteFailed;
++        done += rc;
++    }
++}
++
++pub fn preadAll(fd: linux.fd_t, out: []u8, off: u64) !void {
++    var done: usize = 0;
++    while (done < out.len) {
++        const rc = linux.pread(fd, out[done..].ptr, out.len - done, @intCast(off + done));
++        switch (linux.errno(rc)) {
++            .SUCCESS => {},
++            .INTR => continue,
++            else => return error.ReadFailed,
++        }
++        if (rc == 0) return error.ShortRead;
++        done += rc;
++    }
++}
++
++test "lanes write, read back and check chunks through bounded staging" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var st = try Staging.init(gpa, io, 3, 2 * block);
++    defer st.deinit();
++    const l = try Lanes.start(gpa, io, &st, 2);
++    defer l.shutdown();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const f = try tmp.dir.createFile(io, "lanes.bin", .{ .read = true });
++    defer f.close(io);
++    const fd = f.handle;
++    var digests: [7][32]u8 = undefined;
++    var op = try Op.init(gpa, io, &st);
++    defer op.deinit();
++    for (0..7) |i| {
++        const s = try st.get();
++        const n: u32 = if (i == 6) 1000 else 2 * block - 7;
++        for (st.buf(s)[0..n], 0..) |*b, k| b.* = @truncate(k * 31 + i);
++        l.submit(.{ .kind = .write, .fd = fd, .staging = s, .data = n, .span = @intCast(up(n)), .off = i * 2 * block, .digest = &digests[i], .op = &op });
++    }
++    try op.wait();
++    var rop = try Op.init(gpa, io, &st);
++    defer rop.deinit();
++    var seen: u32 = 0;
++    var sent: u32 = 0;
++    while (seen < 7) {
++        while (sent < 7 and sent - seen < 3) : (sent += 1) {
++            const n: u32 = if (sent == 6) 1000 else 2 * block - 7;
++            l.submit(.{ .kind = .read, .fd = fd, .staging = try st.get(), .data = n, .span = @intCast(up(n)), .off = sent * 2 * block, .digest = &digests[sent], .op = &rop, .tag = sent });
++        }
++        const j = rop.next().?;
++        for (st.buf(j.staging)[0..j.data], 0..) |b, k| try std.testing.expectEqual(@as(u8, @truncate(k * 31 + j.tag)), b);
++        st.put(j.staging);
++        seen += 1;
++    }
++    try rop.wait();
++    digests[2][0] ^= 1; // a damaged chunk is refused
++    l.submit(.{ .kind = .read, .fd = fd, .staging = try st.get(), .data = 2 * block - 7, .span = 2 * block, .off = 2 * 2 * block, .digest = &digests[2], .op = &rop });
++    st.put(rop.next().?.staging);
++    try std.testing.expectError(error.ChecksumMismatch, rop.wait());
++}
+diff --git a/zig/src/sessions/pagestore.zig b/zig/src/sessions/pagestore.zig
+new file mode 100644
+index 00000000..0e479269
+--- /dev/null
++++ b/zig/src/sessions/pagestore.zig
+@@ -0,0 +1,129 @@
++//! The bytes behind the pool's pages: a family's tensor of pages, read and written a page run at a time.
++
++const std = @import("std");
++const pool_mod = @import("pool.zig");
++const Pool = pool_mod.Pool;
++const Family = pool_mod.Family;
++
++pub const PageStore = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// family fam's pages, back to back into dst (pages.len x a page's bytes)
++        read: *const fn (ptr: *anyopaque, fam: u32, pages: []const u32, dst: []u8) anyerror!void,
++        /// src (pages.len x a page's bytes) into family fam's pages
++        write: *const fn (ptr: *anyopaque, fam: u32, pages: []const u32, src: []const u8) anyerror!void,
++        /// one page's rows of family fam into another page (copy on write of a RAM resume's partial page)
++        copyPage: *const fn (ptr: *anyopaque, fam: u32, src: u32, dst: u32) anyerror!void,
++        /// round thread: a point after every row the compute stream has written so far
++        fence: *const fn (ptr: *anyopaque) anyerror!u64,
++        /// before reads: wait until the fence's rows are visible
++        waitFence: *const fn (ptr: *anyopaque, token: u64) anyerror!void,
++        /// after writes: make them visible to the compute stream
++        publish: *const fn (ptr: *anyopaque) anyerror!void,
++    };
++
++    pub fn read(s: PageStore, fam: u32, pages: []const u32, dst: []u8) !void {
++        return s.vtable.read(s.ptr, fam, pages, dst);
++    }
++    pub fn write(s: PageStore, fam: u32, pages: []const u32, src: []const u8) !void {
++        return s.vtable.write(s.ptr, fam, pages, src);
++    }
++    pub fn copyPage(s: PageStore, fam: u32, src: u32, dst: u32) !void {
++        return s.vtable.copyPage(s.ptr, fam, src, dst);
++    }
++    pub fn fence(s: PageStore) !u64 {
++        return s.vtable.fence(s.ptr);
++    }
++    pub fn waitFence(s: PageStore, token: u64) !void {
++        return s.vtable.waitFence(s.ptr, token);
++    }
++    pub fn publish(s: PageStore) !void {
++        return s.vtable.publish(s.ptr);
++    }
++};
++
++/// Every family's pages in host memory: [familyTensorPages x page bytes] a family, zeroed (the null page stays zero).
++pub const HostPool = struct {
++    gpa: std.mem.Allocator,
++    page: u32,
++    families: []const Family,
++    tensors: [][]u8,
++
++    pub fn init(gpa: std.mem.Allocator, p: *const Pool) !HostPool {
++        const t = try gpa.alloc([]u8, p.layout.families.len);
++        errdefer gpa.free(t);
++        var made: usize = 0;
++        errdefer for (t[0..made]) |x| gpa.free(x);
++        for (p.layout.families, 0..) |f, i| {
++            t[i] = try gpa.alloc(u8, @as(usize, p.familyTensorPages(f)) * f.pageBytes(p.page));
++            @memset(t[i], 0);
++            made += 1;
++        }
++        return .{ .gpa = gpa, .page = p.page, .families = p.layout.families, .tensors = t };
++    }
++
++    pub fn deinit(h: *HostPool) void {
++        for (h.tensors) |x| h.gpa.free(x);
++        h.gpa.free(h.tensors);
++        h.* = undefined;
++    }
++
++    pub fn store(h: *HostPool) PageStore {
++        return .{ .ptr = h, .vtable = &vtable };
++    }
++
++    /// One page of family fam (a view).
++    pub fn pageOf(h: *HostPool, fam: u32, pg: u32) []u8 {
++        const n: usize = @intCast(h.families[fam].pageBytes(h.page));
++        return h.tensors[fam][pg * n ..][0..n];
++    }
++
++    const vtable: PageStore.VTable = .{ .read = read, .write = write, .copyPage = copyPage, .fence = fence, .waitFence = waitFence, .publish = publish };
++
++    fn read(ptr: *anyopaque, fam: u32, pages: []const u32, dst: []u8) anyerror!void {
++        const h: *HostPool = @ptrCast(@alignCast(ptr));
++        const n: usize = @intCast(h.families[fam].pageBytes(h.page));
++        if (dst.len != pages.len * n) return error.BadLength;
++        for (pages, 0..) |pg, i| @memcpy(dst[i * n ..][0..n], h.pageOf(fam, pg));
++    }
++
++    fn write(ptr: *anyopaque, fam: u32, pages: []const u32, src: []const u8) anyerror!void {
++        const h: *HostPool = @ptrCast(@alignCast(ptr));
++        const n: usize = @intCast(h.families[fam].pageBytes(h.page));
++        if (src.len != pages.len * n) return error.BadLength;
++        for (pages, 0..) |pg, i| @memcpy(h.pageOf(fam, pg), src[i * n ..][0..n]);
++    }
++
++    fn copyPage(ptr: *anyopaque, fam: u32, src: u32, dst: u32) anyerror!void {
++        const h: *HostPool = @ptrCast(@alignCast(ptr));
++        @memcpy(h.pageOf(fam, dst), h.pageOf(fam, src));
++    }
++
++    fn fence(_: *anyopaque) anyerror!u64 {
++        return 0;
++    }
++    fn waitFence(_: *anyopaque, _: u64) anyerror!void {}
++    fn publish(_: *anyopaque) anyerror!void {}
++};
++
++test "host pool pages round-trip through the interface" {
++    const gpa = std.testing.allocator;
++    const fams = [_]Family{ .{ .name = "comp", .ratio = 1, .row_bytes = 8 }, .{ .name = "ik", .ratio = 2, .row_bytes = 4 } };
++    var p = try Pool.init(gpa, .{ .families = &fams, .page = 16 }, 64, 1, 0);
++    defer p.deinit();
++    var h = try HostPool.init(gpa, &p);
++    defer h.deinit();
++    const s = h.store();
++    var src: [2 * 128]u8 = undefined;
++    for (&src, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
++    try s.write(0, &.{ 3, 1 }, &src);
++    var dst: [2 * 128]u8 = undefined;
++    try s.read(0, &.{ 3, 1 }, &dst);
++    try std.testing.expectEqualSlices(u8, &src, &dst);
++    try s.copyPage(0, 3, 0);
++    try std.testing.expectEqualSlices(u8, src[0..128], h.pageOf(0, 0));
++    try std.testing.expect(std.mem.allEqual(u8, h.pageOf(0, p.null_page), 0));
++    try std.testing.expectError(error.BadLength, s.read(1, &.{0}, &dst));
++}
+diff --git a/zig/src/sessions/pool.zig b/zig/src/sessions/pool.zig
+new file mode 100644
+index 00000000..d3e67516
+--- /dev/null
++++ b/zig/src/sessions/pool.zig
+@@ -0,0 +1,475 @@
++//! The paged KV pool's host book: lowest-free pages per residue mod W, holder counts, slot page tables, quotas.
++
++const std = @import("std");
++const FreeSet = @import("freeset.zig").FreeSet;
++
++pub const Error = error{ PoolExhausted, PastCapacity, SlotNotEmpty, DoubleFree, BadPool, ResidueMismatch } || std.mem.Allocator.Error;
++
++/// A cache family: rows of `row_bytes` every `ratio` tokens; `split` families shard by logical page over the ranks.
++pub const Family = struct {
++    name: []const u8,
++    ratio: u32,
++    row_bytes: u32,
++    split: bool = false,
++
++    pub fn pageRows(f: Family, page: u32) u32 {
++        return page / f.ratio;
++    }
++
++    /// Bytes of one page of this family (a whole page's rows).
++    pub fn pageBytes(f: Family, page: u32) u64 {
++        return @as(u64, f.pageRows(page)) * f.row_bytes;
++    }
++};
++
++/// The pool's families and page size: what a token costs and how pages are laid out.
++pub const Layout = struct {
++    families: []const Family,
++    /// tokens a page (a power of two; 256 for every family we serve)
++    page: u32 = 256,
++
++    /// A rank's bytes a token: the split families count 1 / W.
++    pub fn bytesPerToken(l: Layout, world: u32) f64 {
++        var b: f64 = 0;
++        for (l.families) |f| b += @as(f64, @floatFromInt(f.row_bytes)) / @as(f64, @floatFromInt(f.ratio)) / @as(f64, @floatFromInt(if (f.split and world > 1) world else 1));
++        return b;
++    }
++
++    /// A rank's average bytes a page (split families 1 / W): what the residency budget counts.
++    pub fn pageBytes(l: Layout, world: u32) u64 {
++        var b: u64 = 0;
++        for (l.families) |f| b += f.pageBytes(l.page) / (if (f.split and world > 1) world else 1);
++        return b;
++    }
++};
++
++pub fn pagesFor(tokens: u64, page: u32) u32 {
++    return @intCast((tokens + page - 1) / page);
++}
++
++/// Logical pages [k0, k1) counted by residue mod `w` (O(w)).
++pub fn span(k0: u32, k1: u32, w: u32, out: []u32) void {
++    for (out[0..w], 0..) |*o, r| {
++        const rr: u32 = @intCast(r);
++        const first = k0 + (rr + w - k0 % w) % w;
++        o.* = if (first >= k1) 0 else (k1 - 1 - first) / w + 1;
++    }
++}
++
++pub const max_world = 8;
++
++/// A file whose logical pages [0, pages) match a slot's or entry's rows: a later park writes only past it.
++pub const Origin = struct {
++    key: [16]u8,
++    pages: u32,
++};
++
++/// One slot's page table: logical page i -> physical page; the device tables follow through the dirty range.
++pub const Slot = struct {
++    pool: *Pool,
++    id: u32,
++    capacity: u64,
++    max_pages: u32,
++    /// physical page of each mapped logical page; len is the mapped count
++    pages: []u32,
++    len: u32 = 0,
++    /// pages the admission reserved for this slot's request (null: no admission control)
++    quota: ?u32 = null,
++    /// pages taken past the quota, from pages nobody had reserved
++    over: u32 = 0,
++    /// table entries changed since the device side last synced them: [lo, hi)
++    dirty_lo: u32 = std.math.maxInt(u32),
++    dirty_hi: u32 = 0,
++    /// the file the leading pages came from (truncation shortens it, release clears it)
++    origin: ?Origin = null,
++
++    pub fn mapped(s: *const Slot) []const u32 {
++        return s.pages[0..s.len];
++    }
++
++    pub fn tokens(s: *const Slot) u64 {
++        return @as(u64, s.len) * s.pool.page;
++    }
++
++    fn mark(s: *Slot, lo: u32, hi: u32) void {
++        s.dirty_lo = @min(s.dirty_lo, lo);
++        s.dirty_hi = @max(s.dirty_hi, hi);
++    }
++
++    /// The table range to upload since the last call (empty when nothing changed): entries past len are the null page.
++    pub fn takeDirty(s: *Slot) ?struct { lo: u32, hi: u32 } {
++        if (s.dirty_lo >= s.dirty_hi) return null;
++        defer {
++            s.dirty_lo = std.math.maxInt(u32);
++            s.dirty_hi = 0;
++        }
++        return .{ .lo = s.dirty_lo, .hi = s.dirty_hi };
++    }
++
++    /// The device table's value at logical page i (the page, or the null page past len).
++    pub fn tableAt(s: *const Slot, i: u32) u32 {
++        return if (i < s.len) s.pages[i] else s.pool.null_page;
++    }
++
++    /// The split families' device table at logical page i: the local page this rank stores, else the discard page.
++    pub fn localTableAt(s: *const Slot, i: u32) u32 {
++        return s.pool.localPage(s.tableAt(i));
++    }
++
++    fn reservedSpan(s: *const Slot, out: []u32) void {
++        const q = s.quota orelse 0;
++        span(s.len, @max(s.len, q), s.pool.world, out);
++    }
++
++    /// Maps every page holding positions < end (a no-op when they are: the common case).
++    pub fn ensure(s: *Slot, end: u64) Error!void {
++        const p = s.pool;
++        const need = pagesFor(end, p.page);
++        if (need <= s.len) return;
++        if (need > s.max_pages) return error.PastCapacity;
++        const w = p.world;
++        var before: [max_world]u32 = undefined;
++        s.reservedSpan(&before);
++        if (s.quota) |q| if (need > q) {
++            // past the reservation: only pages nobody else reserved, residue by residue
++            var extra: [max_world]u32 = undefined;
++            span(@max(q, s.len), need, w, &extra);
++            for (0..w) |r| if (extra[r] > p.free[r].count() -| (p.reserved[r] - before[r])) return error.PoolExhausted;
++            s.over += need - @max(q, s.len);
++        };
++        var want: [max_world]u32 = undefined;
++        span(s.len, need, w, &want);
++        for (0..w) |r| if (want[r] > p.free[r].count()) return error.PoolExhausted;
++        const lo = s.len;
++        for (lo..need) |k| {
++            const pg = p.takeAt(@intCast(k)) catch unreachable; // counted above
++            p.hold(pg, 0, 1); // the taker's hold becomes the slot's
++            s.pages[k] = pg;
++        }
++        s.len = need;
++        p.unreserve(&before);
++        var after: [max_world]u32 = undefined;
++        s.reservedSpan(&after);
++        p.addReserved(&after);
++        s.mark(lo, need);
++    }
++
++    /// Maps shared pages as the first pages of an empty slot (a RAM resume: read only, the slot writes past them).
++    pub fn adopt(s: *Slot, shared: []const u32) Error!void {
++        if (s.len != 0) return error.SlotNotEmpty;
++        if (shared.len > s.max_pages) return error.PastCapacity;
++        const p = s.pool;
++        var before: [max_world]u32 = undefined;
++        s.reservedSpan(&before);
++        for (shared, 0..) |pg, k| if (pg >= p.npages or pg % p.world != k % p.world) return error.ResidueMismatch;
++        for (shared, 0..) |pg, k| {
++            p.hold(pg, 1, 1);
++            s.pages[k] = pg;
++        }
++        s.len = @intCast(shared.len);
++        p.unreserve(&before);
++        var after: [max_world]u32 = undefined;
++        s.reservedSpan(&after);
++        p.addReserved(&after);
++        s.mark(0, s.len);
++    }
++
++    /// Appends one page taken for logical page len (the copy-on-write page of a RAM resume).
++    pub fn push(s: *Slot, pg: u32) Error!void {
++        if (s.len >= s.max_pages) return error.PastCapacity;
++        const p = s.pool;
++        if (p.world > 1 and pg % p.world != s.len % p.world) return error.ResidueMismatch;
++        var before: [max_world]u32 = undefined;
++        s.reservedSpan(&before);
++        p.hold(pg, 0, 1); // the taker's hold becomes the slot's
++        s.pages[s.len] = pg;
++        s.len += 1;
++        p.unreserve(&before);
++        var after: [max_world]u32 = undefined;
++        s.reservedSpan(&after);
++        p.addReserved(&after);
++        s.mark(s.len - 1, s.len);
++    }
++
++    /// Lets go of the pages past position keep (rows nothing reads again); returns how many.
++    pub fn truncate(s: *Slot, keep: u64) Error!u32 {
++        const p = s.pool;
++        // positions >= keep get written again: a page holding one no longer equals the origin file's
++        if (s.origin) |*o| o.pages = @min(o.pages, @as(u32, @intCast(keep / p.page)));
++        const k = pagesFor(keep, p.page);
++        if (k >= s.len) return 0;
++        var before: [max_world]u32 = undefined;
++        s.reservedSpan(&before);
++        const n = s.len - k;
++        for (s.pages[k..s.len]) |pg| try p.release(pg, 1);
++        const old = s.len;
++        s.len = k;
++        p.unreserve(&before);
++        var after: [max_world]u32 = undefined;
++        s.reservedSpan(&after);
++        p.addReserved(&after);
++        s.mark(k, old);
++        return n;
++    }
++
++    /// Sets the admission's reservation (null: none).
++    pub fn reserve(s: *Slot, quota: ?u32) void {
++        var before: [max_world]u32 = undefined;
++        s.reservedSpan(&before);
++        s.quota = quota;
++        s.pool.unreserve(&before);
++        var after: [max_world]u32 = undefined;
++        s.reservedSpan(&after);
++        s.pool.addReserved(&after);
++    }
++
++    /// Frees the slot's pages and its reservation.
++    pub fn releaseAll(s: *Slot) Error!u32 {
++        s.reserve(null);
++        s.over = 0;
++        s.origin = null;
++        return s.truncate(0);
++    }
++};
++
++/// The pool's book: free sets by residue, holders a page, the slots and their reservations.
++pub const Pool = struct {
++    gpa: std.mem.Allocator,
++    layout: Layout,
++    npages: u32,
++    page: u32,
++    /// log2 of page tokens
++    shift: u5,
++    /// ranks the split families are sharded over (1: every rank stores every row)
++    world: u32,
++    rank: u32,
++    /// the page unmapped table entries point at (all zeros: a stray read reads zeros)
++    null_page: u32,
++    /// a split family's local page count (npages / W), its local null page and its discard page (other ranks' rows)
++    local_pages: u32,
++    local_null: u32,
++    discard: u32,
++    free: [max_world]FreeSet = @splat(.{}),
++    /// pages each residue's slots reserved and have not mapped yet
++    reserved: [max_world]u32 = @splat(0),
++    /// holders a page (slots + entries + in-flight jobs) and how many are slots
++    refs: []u16,
++    slot_refs: []u16,
++    /// pages held by something and by no slot (session entries alone): what parking can free
++    entry_only: u32 = 0,
++    slots: std.ArrayList(*Slot) = .empty,
++
++    pub fn init(gpa: std.mem.Allocator, layout: Layout, tokens: u64, world: u32, rank: u32) Error!Pool {
++        if (layout.page == 0 or layout.page & (layout.page - 1) != 0) return error.BadPool;
++        if (tokens % layout.page != 0 or tokens == 0) return error.BadPool;
++        if (world == 0 or world > max_world or rank >= world) return error.BadPool;
++        const npages: u32 = @intCast(tokens / layout.page);
++        if (npages % world != 0) return error.BadPool;
++        for (layout.families) |f| if (f.ratio == 0 or layout.page % f.ratio != 0) return error.BadPool;
++        var p: Pool = .{
++            .gpa = gpa,
++            .layout = layout,
++            .npages = npages,
++            .page = layout.page,
++            .shift = @intCast(std.math.log2_int(u32, layout.page)),
++            .world = world,
++            .rank = rank,
++            .null_page = npages,
++            .local_pages = npages / world,
++            .local_null = npages / world,
++            .discard = npages / world + 1,
++            .refs = &.{},
++            .slot_refs = &.{},
++        };
++        errdefer p.deinit();
++        for (0..world) |r| p.free[r] = try FreeSet.init(gpa, npages / world);
++        p.refs = try gpa.alloc(u16, npages);
++        @memset(p.refs, 0);
++        p.slot_refs = try gpa.alloc(u16, npages);
++        @memset(p.slot_refs, 0);
++        return p;
++    }
++
++    pub fn deinit(p: *Pool) void {
++        for (p.slots.items) |s| {
++            p.gpa.free(s.pages);
++            p.gpa.destroy(s);
++        }
++        p.slots.deinit(p.gpa);
++        for (0..p.world) |r| p.free[r].deinit(p.gpa);
++        p.gpa.free(p.refs);
++        p.gpa.free(p.slot_refs);
++        p.* = undefined;
++    }
++
++    pub fn newSlot(p: *Pool, capacity: u64) Error!*Slot {
++        const s = try p.gpa.create(Slot);
++        errdefer p.gpa.destroy(s);
++        const mp = pagesFor(capacity, p.page);
++        s.* = .{ .pool = p, .id = @intCast(p.slots.items.len), .capacity = capacity, .max_pages = mp, .pages = try p.gpa.alloc(u32, mp) };
++        errdefer p.gpa.free(s.pages);
++        try p.slots.append(p.gpa, s);
++        return s;
++    }
++
++    /// A free physical page for logical page k (its residue when split), held once by the caller.
++    pub fn takeAt(p: *Pool, k: u32) Error!u32 {
++        const r = k % p.world;
++        const local = p.free[r].takeLowest() orelse return error.PoolExhausted;
++        const pg = local * p.world + r;
++        p.hold(pg, 1, 0); // the caller's hold (an entry-like holder until a slot maps it)
++        return pg;
++    }
++
++    /// Holders change on page pg: dref total, dslot of them slots; keeps entry_only and gives the page back at zero.
++    fn hold(p: *Pool, pg: u32, dref: i32, dslot: i32) void {
++        const r0 = p.refs[pg];
++        const s0 = p.slot_refs[pg];
++        const r1: u16 = @intCast(@as(i32, r0) + dref);
++        const s1: u16 = @intCast(@as(i32, s0) + dslot);
++        p.refs[pg] = r1;
++        p.slot_refs[pg] = s1;
++        const was = r0 > 0 and s0 == 0;
++        const now = r1 > 0 and s1 == 0;
++        if (was and !now) p.entry_only -= 1;
++        if (!was and now) p.entry_only += 1;
++    }
++
++    /// One holder lets go (slot: from a slot's table); the page returns to its free set when nobody holds it.
++    fn release(p: *Pool, pg: u32, slot: u1) Error!void {
++        if (p.refs[pg] == 0) return error.DoubleFree;
++        p.hold(pg, -1, -@as(i32, slot));
++        if (p.refs[pg] == 0) p.free[pg % p.world].give(pg / p.world) catch return error.DoubleFree;
++    }
++
++    /// One more holder (a session entry or an in-flight job) of each page.
++    pub fn share(p: *Pool, pages: []const u32) void {
++        for (pages) |pg| p.hold(pg, 1, 0);
++    }
++
++    /// Those holders let go.
++    pub fn drop(p: *Pool, pages: []const u32) Error!void {
++        for (pages) |pg| try p.release(pg, 0);
++    }
++
++    pub fn holders(p: *const Pool, pg: u32) u16 {
++        return p.refs[pg];
++    }
++
++    fn unreserve(p: *Pool, by: []const u32) void {
++        for (0..p.world) |r| p.reserved[r] -= by[r];
++    }
++
++    fn addReserved(p: *Pool, by: []const u32) void {
++        for (0..p.world) |r| p.reserved[r] += by[r];
++    }
++
++    /// Free pages no admission reserved (split: W x the scarcer residue, so any logical run fits).
++    pub fn available(p: *const Pool) u32 {
++        var low: u32 = std.math.maxInt(u32);
++        for (0..p.world) |r| low = @min(low, p.free[r].count() -| p.reserved[r]);
++        return low * p.world;
++    }
++
++    pub fn freePages(p: *const Pool) u32 {
++        var n: u32 = 0;
++        for (0..p.world) |r| n += p.free[r].count();
++        return n;
++    }
++
++    /// Pages an admission needs for a request (prompt + reply + slack, at most the slot's capacity).
++    pub fn needPages(p: *const Pool, prompt: u64, max_tokens: u64, capacity: u64, slack: u64) u32 {
++        return pagesFor(@min(prompt + max_tokens + slack, capacity), p.page);
++    }
++
++    /// This rank stores the split families' rows of page pg.
++    pub fn owns(p: *const Pool, pg: u32) bool {
++        return pg != p.null_page and pg % p.world == p.rank;
++    }
++
++    /// A split family's local page of pg: its own when owned, the local null for the null page, else the discard page.
++    pub fn localPage(p: *const Pool, pg: u32) u32 {
++        if (pg == p.null_page) return p.local_null;
++        return if (pg % p.world == p.rank) pg / p.world else p.discard;
++    }
++
++    /// The page a family's tensor indexes for physical page pg (split families: localPage).
++    pub fn familyPage(p: *const Pool, f: Family, pg: u32) u32 {
++        return if (f.split and p.world > 1) p.localPage(pg) else pg;
++    }
++
++    /// Pages a family's device tensor holds: npages + null, or (split) local pages + local null + discard page.
++    pub fn familyTensorPages(p: *const Pool, f: Family) u32 {
++        return if (f.split and p.world > 1) p.local_pages + 2 else p.npages + 1;
++    }
++
++    /// Bytes this rank stores of family f for logical pages [first, first + n) of a slot or entry.
++    pub fn familyBytes(p: *const Pool, f: Family, first: u32, n: u32) u64 {
++        if (!(f.split and p.world > 1)) return @as(u64, n) * f.pageBytes(p.page);
++        var by: [max_world]u32 = undefined;
++        span(first, first + n, p.world, &by);
++        return @as(u64, by[p.rank]) * f.pageBytes(p.page);
++    }
++
++    /// Bytes of every family's device tensor on this rank.
++    pub fn tensorBytes(p: *const Pool) u64 {
++        var b: u64 = 0;
++        for (p.layout.families) |f| b += @as(u64, p.familyTensorPages(f)) * f.pageBytes(p.page);
++        return b;
++    }
++
++    /// Pages held by session entries alone and their bytes on this rank (the residency budget's measure): O(1).
++    pub fn entryOnlyBytes(p: *const Pool) u64 {
++        return @as(u64, p.entry_only) * p.layout.pageBytes(p.world);
++    }
++};
++
++test "residues, holders, quotas and the device tables" {
++    const gpa = std.testing.allocator;
++    const fams = [_]Family{ .{ .name = "comp", .ratio = 2, .row_bytes = 584, .split = true }, .{ .name = "index_k", .ratio = 2, .row_bytes = 132 } };
++    var p = try Pool.init(gpa, .{ .families = &fams }, 16 * 256, 2, 1);
++    defer p.deinit();
++    try std.testing.expectEqual(@as(u32, 8 + 2), p.familyTensorPages(fams[0]));
++    try std.testing.expectEqual(@as(u32, 16 + 1), p.familyTensorPages(fams[1]));
++    try std.testing.expectApproxEqAbs(@as(f64, 146 + 66), p.layout.bytesPerToken(2), 1e-9);
++    const a = try p.newSlot(8 * 256);
++    const b = try p.newSlot(8 * 256);
++    try a.ensure(3 * 256 + 1); // 4 pages: residues 0,1,0,1
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, a.mapped());
++    try b.ensure(256);
++    try std.testing.expectEqualSlices(u32, &.{4}, b.mapped());
++    try std.testing.expectEqual(p.discard, a.localTableAt(0)); // page 0 is rank 0's
++    try std.testing.expectEqual(@as(u32, 0), a.localTableAt(1)); // page 1 -> rank 1's local page 0
++    try std.testing.expectEqual(p.local_null, a.localTableAt(7));
++    const d = a.takeDirty().?;
++    try std.testing.expectEqual(@as(u32, 0), d.lo);
++    try std.testing.expectEqual(@as(u32, 4), d.hi);
++    try std.testing.expect(a.takeDirty() == null);
++    // an entry shares a's pages; a lets go; the pages stay held by the entry alone
++    p.share(a.mapped()[0..3]);
++    try std.testing.expectEqual(@as(u32, 0), p.entry_only);
++    _ = try a.releaseAll();
++    try std.testing.expectEqual(@as(u32, 3), p.entry_only);
++    try std.testing.expectEqual(@as(u32, 16 - 1 - 3), p.freePages());
++    try p.drop(&.{ 0, 1, 2 });
++    try std.testing.expectEqual(@as(u32, 0), p.entry_only);
++    try std.testing.expectError(error.DoubleFree, p.drop(&.{0}));
++    // quotas: b reserves 6 pages; available counts W x the scarcer residue
++    b.reserve(6);
++    var by: [2]u32 = undefined;
++    span(1, 6, 2, &by);
++    try std.testing.expectEqual(@as(u32, 2), by[0]);
++    try std.testing.expectEqual(@as(u32, 3), by[1]);
++    try std.testing.expectEqual(@as(u32, 2 * @min(7 - 2, 8 - 3)), p.available());
++    try b.ensure(6 * 256);
++    try std.testing.expectEqual(@as(u32, 0), p.reserved[0] + p.reserved[1]);
++    for (b.mapped(), 0..) |pg, k| try std.testing.expectEqual(k % 2, pg % 2);
++    // RAM resume: adopt full pages of the right residues, refuse the wrong ones
++    const c = try p.newSlot(8 * 256);
++    try std.testing.expectError(error.ResidueMismatch, c.adopt(&.{b.pages[1]}));
++    p.share(b.mapped()[0..2]);
++    try c.adopt(b.mapped()[0..2]);
++    try c.push(try p.takeAt(2));
++    try std.testing.expectEqual(@as(u16, 3), p.holders(b.pages[0]));
++    try std.testing.expectEqual(@as(u32, 0), c.pages[2] % 2);
++}
+diff --git a/zig/src/sessions/prefix.zig b/zig/src/sessions/prefix.zig
+new file mode 100644
+index 00000000..28c639fb
+--- /dev/null
++++ b/zig/src/sessions/prefix.zig
+@@ -0,0 +1,457 @@
++//! Session entries by prefix: a trie over chained page digests, one node per distinct run of full pages a tag.
++
++const std = @import("std");
++
++pub const Digest = [16]u8;
++pub const none = std.math.maxInt(u32);
++const Blake = std.crypto.hash.blake2.Blake2b128;
++
++/// Chained digests of the full pages of ids under a tag: out[j] determines tag and ids[0 .. page (j + 1)].
++pub fn chain(tag: u32, ids: []const i32, page: u32, out: []Digest) void {
++    var prev = root(tag);
++    for (out, 0..) |*o, j| {
++        o.* = step(prev, ids[j * page ..][0..page]);
++        prev = o.*;
++    }
++}
++
++/// The digest of a tag's empty prefix.
++pub fn root(tag: u32) Digest {
++    var h = Blake.init(.{});
++    h.update("tf-sess-root");
++    h.update(std.mem.asBytes(&tag));
++    return h.finalResult();
++}
++
++/// The next page's digest.
++pub fn step(prev: Digest, page_ids: []const i32) Digest {
++    var h = Blake.init(.{});
++    h.update(&prev);
++    h.update(std.mem.sliceAsBytes(page_ids));
++    return h.finalResult();
++}
++
++/// An entry's identity: its node's digest (tag and full pages), its length and tail.
++pub fn entryKey(node: Digest, pos: u64, tail: []const i32) Digest {
++    var h = Blake.init(.{});
++    h.update("tf-sess-entry");
++    h.update(&node);
++    h.update(std.mem.asBytes(&pos));
++    h.update(std.mem.sliceAsBytes(tail));
++    return h.finalResult();
++}
++
++pub const Tier = enum { ram, any };
++
++pub fn Index(comptime Extra: type) type {
++    return struct {
++        const Self = @This();
++
++        pub const Node = struct {
++            digest: Digest,
++            parent: u32,
++            depth: u32,
++            first_child: u32 = none,
++            next_sib: u32 = none,
++            prev_sib: u32 = none,
++            first_entry: u32 = none,
++            /// entries in the subtree (this node's included): all, and those in RAM
++            sub_all: u32 = 0,
++            sub_ram: u32 = 0,
++            /// RAM entries at this node itself
++            own_ram: u32 = 0,
++            /// the tokens of the page leading into this node, while sub_ram > 0
++            tokens: ?[]i32 = null,
++        };
++
++        pub const Entry = struct {
++            key: Digest,
++            tag: u32,
++            pos: u64,
++            node: u32,
++            tail: []i32,
++            ram: bool,
++            next_at: u32 = none,
++            prev_at: u32 = none,
++            live: bool = true,
++            extra: Extra,
++        };
++
++        /// An entry inserted, or the one already there with the same key.
++        pub const Placed = struct { id: u32, new: bool };
++
++        gpa: std.mem.Allocator,
++        page: u32,
++        nodes: std.ArrayList(Node) = .empty,
++        free_nodes: std.ArrayList(u32) = .empty,
++        by_digest: std.AutoHashMapUnmanaged(Digest, u32) = .empty,
++        entries: std.ArrayList(Entry) = .empty,
++        free_entries: std.ArrayList(u32) = .empty,
++        by_key: std.AutoHashMapUnmanaged(Digest, u32) = .empty,
++        /// page-sized token blocks, reused
++        blocks: std.ArrayList([]i32) = .empty,
++
++        pub fn init(gpa: std.mem.Allocator, page: u32) Self {
++            return .{ .gpa = gpa, .page = page };
++        }
++
++        pub fn deinit(x: *Self) void {
++            for (x.nodes.items) |n| if (n.tokens) |t| x.gpa.free(t);
++            for (x.blocks.items) |b| x.gpa.free(b);
++            for (x.entries.items) |e| if (e.live) x.gpa.free(e.tail);
++            x.nodes.deinit(x.gpa);
++            x.free_nodes.deinit(x.gpa);
++            x.by_digest.deinit(x.gpa);
++            x.entries.deinit(x.gpa);
++            x.free_entries.deinit(x.gpa);
++            x.by_key.deinit(x.gpa);
++            x.blocks.deinit(x.gpa);
++            x.* = undefined;
++        }
++
++        pub fn get(x: *Self, e: u32) *Entry {
++            return &x.entries.items[e];
++        }
++
++        pub fn node(x: *Self, n: u32) *Node {
++            return &x.nodes.items[n];
++        }
++
++        pub fn lookup(x: *const Self, key: Digest) ?u32 {
++            return x.by_key.get(key);
++        }
++
++        fn newNode(x: *Self, digest: Digest, parent: u32, depth: u32) !u32 {
++            const id: u32 = if (x.free_nodes.pop()) |i| i else blk: {
++                try x.nodes.append(x.gpa, undefined);
++                break :blk @intCast(x.nodes.items.len - 1);
++            };
++            x.nodes.items[id] = .{ .digest = digest, .parent = parent, .depth = depth };
++            try x.by_digest.put(x.gpa, digest, id);
++            if (parent != none) {
++                const p = &x.nodes.items[parent];
++                x.nodes.items[id].next_sib = p.first_child;
++                if (p.first_child != none) x.nodes.items[p.first_child].prev_sib = id;
++                p.first_child = id;
++            }
++            return id;
++        }
++
++        fn takeBlock(x: *Self) ![]i32 {
++            if (x.blocks.pop()) |b| return b;
++            return x.gpa.alloc(i32, x.page);
++        }
++
++        /// Adds an entry for ids (chain: its full pages' digests), or returns the one with the same key.
++        pub fn insert(x: *Self, tag: u32, ids: []const i32, digests: []const Digest, ram: bool, extra: Extra) !Placed {
++            const full: u32 = @intCast(ids.len / x.page);
++            std.debug.assert(digests.len >= full);
++            const r = root(tag);
++            var n = x.by_digest.get(r) orelse try x.newNode(r, none, 0);
++            for (0..full) |j| {
++                const d = digests[j];
++                n = x.by_digest.get(d) orelse try x.newNode(d, n, @intCast(j + 1));
++            }
++            const r2 = try x.place(tag, n, ids.len, ids[full * x.page ..], extra);
++            if (r2.new and ram) try x.setRam(r2.id, true, ids);
++            return r2;
++        }
++
++        /// Adds a disk entry continuing from node anchor (none: the tag's root); suffix: tokens [depth x page, pos).
++        pub fn insertFrom(x: *Self, tag: u32, anchor: u32, suffix: []const i32, extra: Extra) !Placed {
++            var n = if (anchor != none) anchor else blk: {
++                const r = root(tag);
++                break :blk x.by_digest.get(r) orelse try x.newNode(r, none, 0);
++            };
++            const d0 = x.nodes.items[n].depth;
++            const full: u32 = @intCast(suffix.len / x.page);
++            for (0..full) |j| {
++                const d = step(x.nodes.items[n].digest, suffix[j * x.page ..][0..x.page]);
++                n = x.by_digest.get(d) orelse try x.newNode(d, n, d0 + @as(u32, @intCast(j)) + 1);
++            }
++            return x.place(tag, n, @as(u64, d0) * x.page + suffix.len, suffix[full * x.page ..], extra);
++        }
++
++        /// The node at depth on an entry's path (its first `depth` full pages).
++        pub fn nodeAt(x: *Self, id: u32, depth: u32) ?u32 {
++            var n = x.entries.items[id].node;
++            while (n != none and x.nodes.items[n].depth > depth) n = x.nodes.items[n].parent;
++            return if (n != none and x.nodes.items[n].depth == depth) n else null;
++        }
++
++        fn place(x: *Self, tag: u32, n: u32, pos: u64, tail_ids: []const i32, extra: Extra) !Placed {
++            const key = entryKey(x.nodes.items[n].digest, pos, tail_ids);
++            if (x.by_key.get(key)) |e| return .{ .id = e, .new = false };
++            const tail = try x.gpa.dupe(i32, tail_ids);
++            errdefer x.gpa.free(tail);
++            const id: u32 = if (x.free_entries.pop()) |i| i else blk: {
++                try x.entries.append(x.gpa, undefined);
++                break :blk @intCast(x.entries.items.len - 1);
++            };
++            try x.by_key.put(x.gpa, key, id);
++            const nd = &x.nodes.items[n];
++            x.entries.items[id] = .{ .key = key, .tag = tag, .pos = pos, .node = n, .tail = tail, .ram = false, .next_at = nd.first_entry, .extra = extra };
++            if (nd.first_entry != none) x.entries.items[nd.first_entry].prev_at = id;
++            nd.first_entry = id;
++            x.addPath(n, 1, 0);
++            return .{ .id = id, .new = true };
++        }
++
++        fn addPath(x: *Self, from: u32, d_all: i32, d_ram: i32) void {
++            var n = from;
++            while (n != none) {
++                const nd = &x.nodes.items[n];
++                nd.sub_all = @intCast(@as(i64, nd.sub_all) + d_all);
++                nd.sub_ram = @intCast(@as(i64, nd.sub_ram) + d_ram);
++                n = nd.parent;
++            }
++        }
++
++        /// Moves an entry in or out of RAM; going in needs its ids (to keep its path's tokens).
++        pub fn setRam(x: *Self, id: u32, ram: bool, ids: ?[]const i32) !void {
++            const e = &x.entries.items[id];
++            if (e.ram == ram) return;
++            if (ram) {
++                const all = ids orelse return error.IdsNeeded;
++                var n = e.node;
++                while (n != none and x.nodes.items[n].depth > 0) : (n = x.nodes.items[n].parent) {
++                    const nd = &x.nodes.items[n];
++                    if (nd.tokens != null) continue;
++                    const b = try x.takeBlock();
++                    @memcpy(b, all[(nd.depth - 1) * x.page ..][0..x.page]);
++                    nd.tokens = b;
++                }
++            }
++            e.ram = ram;
++            x.nodes.items[e.node].own_ram = if (ram) x.nodes.items[e.node].own_ram + 1 else x.nodes.items[e.node].own_ram - 1;
++            x.addPath(e.node, 0, if (ram) 1 else -1);
++            if (!ram) x.dropTokens(e.node);
++        }
++
++        fn dropTokens(x: *Self, from: u32) void {
++            var n = from;
++            while (n != none) : (n = x.nodes.items[n].parent) {
++                const nd = &x.nodes.items[n];
++                if (nd.sub_ram > 0) return;
++                if (nd.tokens) |t| {
++                    x.blocks.append(x.gpa, t) catch x.gpa.free(t);
++                    nd.tokens = null;
++                }
++            }
++        }
++
++        /// Removes an entry and the nodes no entry needs any more.
++        pub fn remove(x: *Self, id: u32) void {
++            x.setRam(id, false, null) catch unreachable;
++            const e = &x.entries.items[id];
++            const n = e.node;
++            if (e.prev_at != none) x.entries.items[e.prev_at].next_at = e.next_at else x.nodes.items[n].first_entry = e.next_at;
++            if (e.next_at != none) x.entries.items[e.next_at].prev_at = e.prev_at;
++            _ = x.by_key.remove(e.key);
++            x.gpa.free(e.tail);
++            e.live = false;
++            x.free_entries.append(x.gpa, id) catch {};
++            x.addPath(n, -1, 0);
++            var m = n;
++            while (m != none and x.nodes.items[m].sub_all == 0) {
++                const nd = x.nodes.items[m];
++                if (nd.parent != none) {
++                    if (nd.prev_sib != none) x.nodes.items[nd.prev_sib].next_sib = nd.next_sib else x.nodes.items[nd.parent].first_child = nd.next_sib;
++                    if (nd.next_sib != none) x.nodes.items[nd.next_sib].prev_sib = nd.prev_sib;
++                }
++                _ = x.by_digest.remove(nd.digest);
++                x.free_nodes.append(x.gpa, m) catch {};
++                m = nd.parent;
++            }
++        }
++
++        /// The entry's tail matches the prompt there and the entry is shorter (its full pages matched by digest).
++        fn tailOf(e: *const Entry, prompt: []const i32) bool {
++            const at: usize = @intCast(e.pos - e.tail.len);
++            return e.pos < prompt.len and std.mem.eql(i32, e.tail, prompt[at..][0..e.tail.len]);
++        }
++
++        /// The longest entry of tag whose ids strictly prefix prompt (RAM first on a tie); digests: the prompt's chain.
++        pub fn find(x: *Self, tag: u32, prompt: []const i32, digests: []const Digest, tier: Tier) ?u32 {
++            const full: u32 = @intCast(prompt.len / x.page);
++            const r = x.by_digest.get(root(tag)) orelse return null;
++            // the deepest node on the prompt's path: each prefix of an entry's path has a node: binary search
++            var lo: u32 = 0;
++            var hi: u32 = full;
++            while (lo < hi) {
++                const mid = lo + (hi - lo + 1) / 2;
++                if (x.by_digest.contains(digests[mid - 1])) lo = mid else hi = mid - 1;
++            }
++            var n: u32 = if (lo == 0) r else x.by_digest.get(digests[lo - 1]).?;
++            while (n != none) : (n = x.nodes.items[n].parent) {
++                const nd = &x.nodes.items[n];
++                if (nd.sub_all == 0 or (tier == .ram and nd.own_ram == 0)) continue;
++                var best: u32 = none;
++                var e = nd.first_entry;
++                while (e != none) : (e = x.entries.items[e].next_at) {
++                    const en = &x.entries.items[e];
++                    if (tier == .ram and !en.ram) continue;
++                    if (!tailOf(en, prompt)) continue;
++                    if (best == none or en.pos > x.entries.items[best].pos or (en.pos == x.entries.items[best].pos and en.ram)) best = e;
++                }
++                if (best != none) return best;
++            }
++            return null;
++        }
++
++        /// A newer entry of id's chain holds every position it does (tier .ram: in RAM), so id need not be written.
++        pub fn covered(x: *Self, id: u32, tier: Tier) bool {
++            const e = &x.entries.items[id];
++            const nd = &x.nodes.items[e.node];
++            var f = nd.first_entry;
++            while (f != none) : (f = x.entries.items[f].next_at) {
++                const o = &x.entries.items[f];
++                if (f == id or (tier == .ram and !o.ram)) continue;
++                if (o.pos > e.pos and std.mem.startsWith(i32, o.tail, e.tail)) return true;
++            }
++            var c = nd.first_child;
++            while (c != none) : (c = x.nodes.items[c].next_sib) {
++                const ch = &x.nodes.items[c];
++                const n = if (tier == .ram) ch.sub_ram else ch.sub_all;
++                if (n == 0) continue;
++                if (e.tail.len == 0) return true;
++                if (ch.tokens) |t| if (std.mem.startsWith(i32, t, e.tail)) return true;
++            }
++            return false;
++        }
++
++        /// How many RAM entries extend a RAM entry (longer, same tag, its ids their prefix): branch points have more.
++        pub fn extensions(x: *Self, id: u32) u32 {
++            const e = &x.entries.items[id];
++            const nd = &x.nodes.items[e.node];
++            var n: u32 = 0;
++            var f = nd.first_entry;
++            while (f != none) : (f = x.entries.items[f].next_at) {
++                const o = &x.entries.items[f];
++                if (f != id and o.ram and o.pos > e.pos and std.mem.startsWith(i32, o.tail, e.tail)) n += 1;
++            }
++            var c = nd.first_child;
++            while (c != none) : (c = x.nodes.items[c].next_sib) {
++                const ch = &x.nodes.items[c];
++                if (ch.sub_ram == 0) continue;
++                if (std.mem.startsWith(i32, ch.tokens.?, e.tail)) n += ch.sub_ram;
++            }
++            return n;
++        }
++
++        /// A RAM entry no other RAM entry extends: a chat's newest state.
++        pub fn isLeaf(x: *Self, id: u32) bool {
++            return x.entries.items[id].ram and !x.covered(id, .ram);
++        }
++
++        /// A RAM leaf's older turns (the RAM entries it extends) into out; returns the chat's recency (newest `used`).
++        pub fn members(x: *Self, leaf: u32, out: *std.ArrayList(u32), used: *const fn (*const Extra) u64) !u64 {
++            const l = &x.entries.items[leaf];
++            var recency = used(&l.extra);
++            var below: u32 = none; // the path's node under n: its tokens are the page an entry at n must prefix
++            var n = l.node;
++            while (n != none) : ({
++                below = n;
++                n = x.nodes.items[n].parent;
++            }) {
++                const nd = &x.nodes.items[n];
++                if (nd.own_ram == 0) continue;
++                const page_ids: []const i32 = if (below == none) l.tail else x.nodes.items[below].tokens.?;
++                var f = nd.first_entry;
++                while (f != none) : (f = x.entries.items[f].next_at) {
++                    const o = &x.entries.items[f];
++                    if (f == leaf or !o.ram or o.pos >= l.pos) continue;
++                    if (!std.mem.startsWith(i32, page_ids, o.tail)) continue;
++                    try out.append(x.gpa, f);
++                    recency = @max(recency, used(&o.extra));
++                }
++            }
++            return recency;
++        }
++
++        /// A RAM entry's ids, rebuilt from its path's pages and tail, into out (len = pos).
++        pub fn idsOf(x: *Self, id: u32, out: []i32) !void {
++            const e = &x.entries.items[id];
++            if (out.len != e.pos) return error.BadLength;
++            const at = e.pos - e.tail.len;
++            @memcpy(out[at..], e.tail);
++            var n = e.node;
++            while (n != none and x.nodes.items[n].depth > 0) : (n = x.nodes.items[n].parent) {
++                const nd = &x.nodes.items[n];
++                const t = nd.tokens orelse return error.NotInRam;
++                @memcpy(out[(nd.depth - 1) * x.page ..][0..x.page], t);
++            }
++        }
++    };
++}
++
++const T = Index(u64);
++
++fn usedOf(e: *const u64) u64 {
++    return e.*;
++}
++
++fn seq(gpa: std.mem.Allocator, n: usize, salt: i32) ![]i32 {
++    const v = try gpa.alloc(i32, n);
++    for (v, 0..) |*t, i| t.* = @as(i32, @intCast(i % 997)) * 3 + salt;
++    return v;
++}
++
++fn add(x: *T, tag: u32, ids: []const i32, ram: bool, used: u64) !u32 {
++    var d: [64]Digest = undefined;
++    chain(tag, ids, x.page, d[0 .. ids.len / x.page]);
++    return (try x.insert(tag, ids, d[0 .. ids.len / x.page], ram, used)).id;
++}
++
++test "longest strict prefix, ties, tags and coverage" {
++    const gpa = std.testing.allocator;
++    var x = T.init(gpa, 16);
++    defer x.deinit();
++    const chat = try seq(gpa, 200, 0);
++    defer gpa.free(chat);
++    const t1 = try add(&x, 7, chat[0..40], true, 1); // a prompt's replay point
++    const t2 = try add(&x, 7, chat[0..72], true, 2); // a turn's end
++    const t3 = try add(&x, 7, chat[0..128], false, 3); // on disk only, page aligned
++    _ = try add(&x, 8, chat[0..100], true, 4); // another tag
++    var d: [16]Digest = undefined;
++    chain(7, chat[0..40], 16, d[0..2]);
++    const again = try x.insert(7, chat[0..40], d[0..2], true, 9);
++    try std.testing.expect(again.id == t1 and !again.new);
++    chain(7, chat[0..150], 16, d[0..9]);
++    try std.testing.expectEqual(@as(?u32, t3), x.find(7, chat[0..150], d[0..9], .any));
++    try std.testing.expectEqual(@as(?u32, t2), x.find(7, chat[0..150], d[0..9], .ram));
++    try std.testing.expectEqual(@as(?u32, t2), x.find(7, chat[0..128], d[0..8], .any)); // strict: 128 is not a prefix of 128
++    chain(7, chat[0..72], 16, d[0..4]);
++    try std.testing.expectEqual(@as(?u32, t1), x.find(7, chat[0..72], d[0..4], .any));
++    var other = try gpa.dupe(i32, chat[0..150]);
++    defer gpa.free(other);
++    other[50] = -1; // diverges inside t2's tail page: t1 still prefixes it
++    chain(7, other, 16, d[0..9]);
++    try std.testing.expectEqual(@as(?u32, t1), x.find(7, other, d[0..9], .any));
++    // t3 extends t2 on disk only: its page's tokens are gone, so a tail there is undecided (the store marks covered_by)
++    try std.testing.expect(x.covered(t1, .ram) and !x.covered(t2, .any) and !x.covered(t2, .ram) and !x.covered(t3, .any));
++    const t4 = try add(&x, 7, chat[0..64], false, 5); // page aligned: any deeper entry covers it
++    try std.testing.expect(x.covered(t4, .any) and x.covered(t4, .ram));
++    x.remove(t4);
++    try std.testing.expect(x.isLeaf(t2) and !x.isLeaf(t1));
++    try std.testing.expectEqual(@as(u32, 1), x.extensions(t1));
++    try std.testing.expectEqual(@as(u32, 0), x.extensions(t2));
++    var m: std.ArrayList(u32) = .empty;
++    defer m.deinit(gpa);
++    try std.testing.expectEqual(@as(u64, 2), try x.members(t2, &m, usedOf));
++    try std.testing.expectEqualSlices(u32, &.{t1}, m.items);
++    const ids = try gpa.alloc(i32, 72);
++    defer gpa.free(ids);
++    try x.idsOf(t2, ids);
++    try std.testing.expectEqualSlices(i32, chat[0..72], ids);
++    // going to disk drops the path's tokens once no RAM entry needs them; removal prunes the nodes
++    try x.setRam(t2, false, null);
++    try x.setRam(t1, false, null);
++    try std.testing.expectError(error.NotInRam, x.idsOf(t2, ids));
++    x.remove(t3);
++    x.remove(t2);
++    x.remove(t1);
++    chain(7, chat[0..150], 16, d[0..9]);
++    try std.testing.expectEqual(@as(?u32, null), x.find(7, chat[0..150], d[0..9], .any));
++    try std.testing.expectEqual(@as(u32, 1 + 6), x.by_digest.count()); // tag 8's root + its 6 full pages
++}
+diff --git a/zig/src/sessions/sessions.zig b/zig/src/sessions/sessions.zig
+new file mode 100644
+index 00000000..7bdc46b3
+--- /dev/null
++++ b/zig/src/sessions/sessions.zig
+@@ -0,0 +1,33 @@
++//! Session memory, family-neutral: the KV pool book, page bytes, prefix entries, the RAM tier and the NVMe tier.
++
++pub const freeset = @import("freeset.zig");
++pub const pool = @import("pool.zig");
++pub const Pool = pool.Pool;
++pub const Slot = pool.Slot;
++pub const Family = pool.Family;
++pub const Layout = pool.Layout;
++pub const pagestore = @import("pagestore.zig");
++pub const PageStore = pagestore.PageStore;
++pub const HostPool = pagestore.HostPool;
++pub const prefix = @import("prefix.zig");
++pub const lanes = @import("lanes.zig");
++pub const format = @import("format.zig");
++pub const disk = @import("disk.zig");
++pub const Disk = disk.Disk;
++pub const jobs = @import("jobs.zig");
++pub const store = @import("store.zig");
++pub const Store = store.Store;
++
++test {
++    _ = freeset;
++    _ = pool;
++    _ = pagestore;
++    _ = prefix;
++    _ = lanes;
++    _ = format;
++    _ = disk;
++    _ = jobs;
++    _ = store;
++    _ = @import("disk_test.zig");
++    _ = @import("store_test.zig");
++}
+diff --git a/zig/src/sessions/store.zig b/zig/src/sessions/store.zig
+new file mode 100644
+index 00000000..851ce509
+--- /dev/null
++++ b/zig/src/sessions/store.zig
+@@ -0,0 +1,570 @@
++//! The session store: RAM entries holding pool pages and bounded state, a residency budget, and the NVMe tier.
++
++const std = @import("std");
++const Io = std.Io;
++const pool_mod = @import("pool.zig");
++const Pool = pool_mod.Pool;
++const Slot = pool_mod.Slot;
++const PageStore = @import("pagestore.zig").PageStore;
++const prefix = @import("prefix.zig");
++const Digest = prefix.Digest;
++const disk_mod = @import("disk.zig");
++const Disk = disk_mod.Disk;
++const jobs = @import("jobs.zig");
++const Job = jobs.Job;
++
++pub const none = prefix.none;
++
++/// A slot's bounded state (rings, carries, lookback, taps) as the family snapshots it: opaque to the store.
++pub const Bounded = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        nbytes: *const fn (ptr: *anyopaque) u64,
++        /// host copies of its pieces for a park (owned by the caller: name and bytes allocated with gpa)
++        blobs: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator) anyerror![]disk_mod.Blob,
++        release: *const fn (ptr: *anyopaque) void,
++    };
++};
++
++pub const Policy = struct {
++    /// bounded state the RAM tier keeps (least recently used entries go past it)
++    ram_bytes: u64 = 512 << 20,
++    /// idle chats resident in the pool (0: no limit) and pool bytes held by entries alone (0: no limit)
++    chats: u32 = 0,
++    resident_bytes: u64 = 0,
++    /// park an evicted chat's older turns too (default: drop them, the leaf's file covers them)
++    park_prefixes: bool = false,
++    /// drop, never write, an entry a newer entry of its chain covers
++    skip_covered: bool = true,
++    /// write a newer turn as a delta on the file its leading pages came from
++    delta: bool = true,
++    /// parks and restores on the tier thread (settled by the plan)
++    async_io: bool = false,
++};
++
++pub const Extra = struct {
++    /// RAM: the pool pages it holds, logical [0, npages)
++    pages: []u32 = &.{},
++    bounded: ?Bounded = null,
++    /// a file with this key is registered on the NVMe tier
++    file: bool = false,
++    used: u64 = 0,
++    origin: ?pool_mod.Origin = null,
++    /// a newer entry of its chain was parked from RAM: writing this one again is redundant
++    covered_by: bool = false,
++    kind: u32 = 0,
++    /// an unsettled park of it
++    job: ?*Job = null,
++    older: u32 = none,
++    newer: u32 = none,
++};
++
++const Index = prefix.Index(Extra);
++
++pub const Hit = struct { id: u32, ram: bool, pos: u64 };
++
++pub const Stats = struct {
++    saves: u64 = 0,
++    dups: u64 = 0,
++    hits_ram: u64 = 0,
++    hits_disk: u64 = 0,
++    parks: u64 = 0,
++    delta_parks: u64 = 0,
++    drops: u64 = 0,
++    covered_drops: u64 = 0,
++    chat_evictions: u64 = 0,
++    park_ns: u64 = 0,
++    restore_ns: u64 = 0,
++};
++
++pub const Store = struct {
++    gpa: std.mem.Allocator,
++    io: Io,
++    pool: *Pool,
++    pages: PageStore,
++    index: Index,
++    disk: ?*Disk,
++    /// heap-held: the tier thread keeps its address
++    runner: ?*jobs.Runner = null,
++    policy: Policy,
++    clock: u64 = 0,
++    bounded_total: u64 = 0,
++    /// RAM entries, least recently used first
++    oldest: u32 = none,
++    newest: u32 = none,
++    ram_count: u32 = 0,
++    pending: std.ArrayList(*Job) = .empty,
++    scratch: std.ArrayList(Digest) = .empty,
++    stats: Stats = .{},
++
++    pub fn init(gpa: std.mem.Allocator, io: Io, pool: *Pool, pages: PageStore, d: ?*Disk, policy: Policy) !Store {
++        var s: Store = .{ .gpa = gpa, .io = io, .pool = pool, .pages = pages, .index = Index.init(gpa, pool.page), .disk = d, .policy = policy };
++        if (d) |dd| {
++            const r = try gpa.create(jobs.Runner);
++            r.* = jobs.Runner.init(gpa, io, dd);
++            s.runner = r;
++            if (policy.async_io) r.startThread() catch |e| {
++                gpa.destroy(r);
++                return e;
++            };
++        }
++        return s;
++    }
++
++    pub fn deinit(s: *Store) void {
++        if (s.runner) |r| {
++            for (s.pending.items) |j| r.wait(j);
++            r.deinit();
++            s.gpa.destroy(r);
++        }
++        for (s.pending.items) |j| j.deinit(s.gpa);
++        s.pending.deinit(s.gpa);
++        for (s.index.entries.items) |*e| if (e.live) {
++            if (e.extra.bounded) |b| b.vtable.release(b.ptr);
++            s.pool.drop(e.extra.pages) catch {};
++            s.gpa.free(e.extra.pages);
++        };
++        s.index.deinit();
++        s.scratch.deinit(s.gpa);
++        s.* = undefined;
++    }
++
++    fn digests(s: *Store, tag: u32, ids: []const i32) ![]const Digest {
++        const n = ids.len / s.pool.page;
++        try s.scratch.resize(s.gpa, n);
++        prefix.chain(tag, ids, s.pool.page, s.scratch.items);
++        return s.scratch.items;
++    }
++
++    pub fn entry(s: *Store, id: u32) *Index.Entry {
++        return s.index.get(id);
++    }
++
++    /// The longest stored entry (RAM or NVMe) whose ids strictly prefix prompt, with the same tag.
++    pub fn find(s: *Store, tag: u32, prompt: []const i32) !?Hit {
++        const d = try s.digests(tag, prompt);
++        const id = s.index.find(tag, prompt, d, .any) orelse return null;
++        const e = s.index.get(id);
++        return .{ .id = id, .ram = e.ram, .pos = e.pos };
++    }
++
++    fn link(s: *Store, id: u32) void {
++        const x = &s.index.get(id).extra;
++        x.older = s.newest;
++        x.newer = none;
++        if (s.newest != none) s.index.get(s.newest).extra.newer = id else s.oldest = id;
++        s.newest = id;
++    }
++
++    fn unlink(s: *Store, id: u32) void {
++        const x = &s.index.get(id).extra;
++        if (x.older != none) s.index.get(x.older).extra.newer = x.newer else s.oldest = x.newer;
++        if (x.newer != none) s.index.get(x.newer).extra.older = x.older else s.newest = x.older;
++    }
++
++    fn touch(s: *Store, id: u32) void {
++        s.clock += 1;
++        const e = s.index.get(id);
++        e.extra.used = s.clock;
++        if (e.ram) {
++            s.unlink(id);
++            s.link(id);
++        }
++    }
++
++    /// An entry for a slot's state at len(ids), sharing its pages; null for a duplicate (bounded is released then).
++    pub fn save(s: *Store, slot: *Slot, bounded: Bounded, ids: []const i32, tag: u32, kind: u32) !?u32 {
++        if (ids.len == 0) return error.EmptyEntry;
++        const need = pool_mod.pagesFor(ids.len, s.pool.page);
++        if (slot.len < need) return error.SlotTooShort;
++        const d = try s.digests(tag, ids);
++        const ins = try s.index.insert(tag, ids, d, false, .{ .kind = kind });
++        errdefer if (ins.new) s.index.remove(ins.id);
++        const e = s.index.get(ins.id);
++        if (e.ram) {
++            bounded.vtable.release(bounded.ptr);
++            s.touch(ins.id);
++            s.stats.dups += 1;
++            return null;
++        }
++        const pages = try s.gpa.dupe(u32, slot.mapped()[0..need]);
++        errdefer s.gpa.free(pages);
++        try s.index.setRam(ins.id, true, ids);
++        s.pool.share(pages);
++        const x = &s.index.get(ins.id).extra;
++        x.pages = pages;
++        x.bounded = bounded;
++        x.kind = kind;
++        if (slot.origin) |o| x.origin = .{ .key = o.key, .pages = @min(o.pages, @as(u32, @intCast(ids.len / s.pool.page))) };
++        s.bounded_total += bounded.vtable.nbytes(bounded.ptr);
++        s.ram_count += 1;
++        s.link(ins.id);
++        s.touch(ins.id);
++        s.stats.saves += 1;
++        try s.trimRam();
++        _ = try s.enforce();
++        return ins.id;
++    }
++
++    /// A RAM entry into an empty slot: full pages shared, the partial last page copied; returns its bounded state.
++    pub fn restoreRam(s: *Store, id: u32, slot: *Slot) !Bounded {
++        const e = s.index.get(id);
++        if (!e.ram) return error.NotInRam;
++        const full: u32 = @intCast(e.pos / s.pool.page);
++        try slot.adopt(e.extra.pages[0..full]);
++        errdefer _ = slot.releaseAll() catch {};
++        if (e.pos % s.pool.page != 0) {
++            const src = e.extra.pages[full];
++            const dst = try s.pool.takeAt(full);
++            for (s.pool.layout.families, 0..) |f, fi| {
++                if (f.split and !s.pool.owns(src)) continue;
++                try s.pages.copyPage(@intCast(fi), s.pool.familyPage(f, src), s.pool.familyPage(f, dst));
++            }
++            try slot.push(dst);
++        }
++        if (e.extra.origin) |o| slot.origin = .{ .key = o.key, .pages = @min(o.pages, full) };
++        s.touch(id);
++        s.stats.hits_ram += 1;
++        return e.extra.bounded.?;
++    }
++
++    /// Starts an NVMe resume into an empty slot (pages mapped now, filled by the job); settle it before the slot runs.
++    pub fn beginRestore(s: *Store, id: u32, slot: *Slot) !*Job {
++        const d = s.disk orelse return error.NoDisk;
++        const e = s.index.get(id);
++        if (!e.extra.file) return error.NotOnDisk;
++        if (slot.len != 0) return error.SlotNotEmpty;
++        try slot.ensure(e.pos);
++        const j = try s.gpa.create(Job);
++        j.* = .{ .kind = .restore, .entry = id, .slot = slot.id };
++        errdefer j.deinit(s.gpa);
++        var ext: std.ArrayList(disk_mod.Extent) = .empty;
++        errdefer ext.deinit(s.gpa);
++        try d.extents(e.key, &ext);
++        j.extents = try ext.toOwnedSlice(s.gpa);
++        const np = pool_mod.pagesFor(e.pos, s.pool.page);
++        j.lists = try s.familyLists(slot.mapped()[0..np], 0, false);
++        j.sink = .{ .store = s.pages, .families = s.pool.layout.families, .page = s.pool.page, .world = s.pool.world, .rank = s.pool.rank, .pages = j.lists };
++        try s.pending.append(s.gpa, j);
++        try s.runner.?.submit(j);
++        return j;
++    }
++
++    /// Per family: family-tensor pages of logical [first, len(pages)) (owned_only: this rank's of split families).
++    fn familyLists(s: *Store, pages: []const u32, first: u32, owned_only: bool) ![][]u32 {
++        const fams = s.pool.layout.families;
++        const out = try s.gpa.alloc([]u32, fams.len);
++        var made: usize = 0;
++        errdefer {
++            for (out[0..made]) |l| s.gpa.free(l);
++            s.gpa.free(out);
++        }
++        for (fams, 0..) |f, fi| {
++            const w = s.pool.world;
++            const sharded = f.split and w > 1 and owned_only;
++            var n: usize = pages.len - first;
++            if (sharded) {
++                var by: [pool_mod.max_world]u32 = undefined;
++                pool_mod.span(first, @intCast(pages.len), w, &by);
++                n = by[s.pool.rank];
++            }
++            const l = try s.gpa.alloc(u32, n);
++            var i: usize = 0;
++            var k: usize = first;
++            if (sharded) k = first + (s.pool.rank + w - first % w) % w;
++            while (k < pages.len) : (k += if (sharded) w else 1) {
++                l[i] = s.pool.familyPage(f, pages[k]);
++                i += 1;
++            }
++            out[fi] = l;
++            made += 1;
++        }
++        return out;
++    }
++
++    /// Starts a park of a RAM entry (null: nothing to write, the entry is already settled out of RAM).
++    pub fn beginPark(s: *Store, id: u32) !?*Job {
++        const d = s.disk orelse return error.NoDisk;
++        const e = s.index.get(id);
++        if (!e.ram or e.extra.job != null) return error.NotParkable;
++        if (e.extra.file and d.get(e.key) != null) {
++            try s.leaveRam(id);
++            return null;
++        }
++        const page = s.pool.page;
++        const npages = pool_mod.pagesFor(e.pos, page);
++        var base: ?Digest = null;
++        var first: u32 = 0;
++        if (s.policy.delta) if (e.extra.origin) |o| if (o.pages > 0) {
++            var r = d.get(o.key);
++            while (r) |rec| : (r = if (rec.base == disk_mod.none) null else &d.recs.items[rec.base]) {
++                if (rec.first_page < o.pages) break;
++            }
++            if (r) |rec| if (rec.depth < d.opts.max_chain) {
++                base = rec.key;
++                first = o.pages;
++            };
++        };
++        const j = try s.gpa.create(Job);
++        j.* = .{ .kind = .park, .entry = id };
++        errdefer j.deinit(s.gpa);
++        j.ids = try s.gpa.alloc(i32, e.pos);
++        try s.index.idsOf(id, j.ids);
++        j.lists = try s.familyLists(e.extra.pages, first, true);
++        j.blobs = try e.extra.bounded.?.vtable.blobs(e.extra.bounded.?.ptr, s.gpa);
++        j.src = .{ .key = e.key, .base = base, .tag = e.tag, .kind = e.extra.kind, .page = page, .pos = e.pos, .first_page = first, .npages = npages, .ids = j.ids[first * page ..], .store = s.pages, .fence = try s.pages.fence(), .families = s.pool.layout.families, .pages = j.lists, .blobs = j.blobs };
++        if (base) |b| d.get(b).?.refs += 1; // held while the job runs: a trim cannot take the base
++        e.extra.job = j;
++        try s.pending.append(s.gpa, j);
++        try s.runner.?.submit(j);
++        return j;
++    }
++
++    /// Settles a finished job at the plan's point: a park registers its file, a restore returns the bounded state.
++    pub fn settle(s: *Store, j: *Job) !?disk_mod.Restored {
++        s.runner.?.wait(j);
++        defer {
++            for (s.pending.items, 0..) |p, i| if (p == j) {
++                _ = s.pending.orderedRemove(i);
++                break;
++            };
++            j.deinit(s.gpa);
++        }
++        const d = s.disk.?;
++        switch (j.kind) {
++            .park => {
++                if (j.src.base) |b| d.get(b).?.refs -= 1;
++                const e = s.index.get(j.entry);
++                e.extra.job = null;
++                if (j.err) |err| return err; // the entry stays in RAM; the .tmp is gone
++                _ = try d.register(&j.src, j.size);
++                e.extra.file = true;
++                s.stats.parks += 1;
++                if (j.src.base != null) s.stats.delta_parks += 1;
++                s.stats.park_ns += j.elapsed_ns;
++                if (s.policy.skip_covered) {
++                    var m: std.ArrayList(u32) = .empty;
++                    defer m.deinit(s.gpa);
++                    _ = try s.index.members(j.entry, &m, usedOf);
++                    for (m.items) |o| s.index.get(o).extra.covered_by = true;
++                }
++                try s.leaveRam(j.entry);
++                try s.trimDisk();
++                return null;
++            },
++            .restore => {
++                if (j.err) |err| {
++                    // the slot as before the restore: empty, its reservation kept
++                    _ = try s.pool.slots.items[j.slot].truncate(0);
++                    return err;
++                }
++                const e = s.index.get(j.entry);
++                d.touch(e.key);
++                s.touch(j.entry);
++                s.pool.slots.items[j.slot].origin = .{ .key = e.key, .pages = @intCast(e.pos / s.pool.page) };
++                s.stats.hits_disk += 1;
++                s.stats.restore_ns += j.elapsed_ns;
++                const r = j.restored;
++                j.restored = null;
++                return r;
++            },
++        }
++    }
++
++    /// Settles every pending job in submission order (one rank, or the plan's "settle all").
++    pub fn settleAll(s: *Store) !void {
++        while (s.pending.items.len > 0) {
++            if (try s.settle(s.pending.items[0])) |r| {
++                var rr = r;
++                rr.deinit(s.gpa);
++            }
++        }
++    }
++
++    fn usedOf(x: *const Extra) u64 {
++        return x.used;
++    }
++
++    /// A RAM entry lets go of its pages and bounded state; it stays indexed if a file holds it.
++    fn leaveRam(s: *Store, id: u32) !void {
++        const e = s.index.get(id);
++        if (!e.ram) return;
++        try s.pool.drop(e.extra.pages);
++        s.gpa.free(e.extra.pages);
++        e.extra.pages = &.{};
++        if (e.extra.bounded) |b| {
++            s.bounded_total -= b.vtable.nbytes(b.ptr);
++            b.vtable.release(b.ptr);
++        }
++        e.extra.bounded = null;
++        s.unlink(id);
++        s.ram_count -= 1;
++        try s.index.setRam(id, false, null);
++        if (!e.extra.file) s.index.remove(id);
++    }
++
++    /// An entry whose file could not be read back: the file deleted, the entry gone unless RAM holds it (every rank).
++    pub fn forget(s: *Store, id: u32) !void {
++        const e = s.index.get(id);
++        if (e.extra.job != null) return error.Busy;
++        if (e.extra.file) if (s.disk) |d| {
++            d.stats.bad += 1;
++            // a delta's base stays while a newer file stacks on it (an opt-in delta mode)
++            d.remove(e.key) catch |err| return if (err == error.HasDependents) {} else err;
++            e.extra.file = false;
++        };
++        if (!e.ram) s.index.remove(id);
++    }
++
++    /// Drops an entry from RAM without writing it.
++    pub fn drop(s: *Store, id: u32) !void {
++        try s.leaveRam(id);
++        s.stats.drops += 1;
++    }
++
++    /// Lets go of a RAM entry: dropped when covered, parked if the tier takes it, else dropped; returns a started park.
++    pub fn evict(s: *Store, id: u32) !?*Job {
++        const e = s.index.get(id);
++        if (e.extra.job != null) return null;
++        if (s.policy.skip_covered and (e.extra.covered_by or s.index.covered(id, .any))) {
++            try s.drop(id);
++            s.stats.covered_drops += 1;
++            return null;
++        }
++        if (s.disk) |d| if (d.accepts(e.pos)) {
++            const j = try s.beginPark(id) orelse return null;
++            if (!s.policy.async_io) _ = try s.settle(j);
++            return if (s.policy.async_io) j else null;
++        };
++        try s.drop(id);
++        return null;
++    }
++
++    /// Evicts least recently used RAM entries past the bounded-state budget.
++    fn trimRam(s: *Store) !void {
++        var id = s.oldest;
++        while (s.bounded_total > s.policy.ram_bytes and s.ram_count > 1 and id != none) {
++            const next = s.index.get(id).extra.newer;
++            if (s.index.get(id).extra.job == null) _ = try s.evict(id);
++            id = next;
++        }
++    }
++
++    /// Files the NVMe budget deleted leave the index (a RAM entry with that key stays, unwritten again).
++    fn trimDisk(s: *Store) !void {
++        const d = s.disk orelse return;
++        var gone: std.ArrayList(Digest) = .empty;
++        defer gone.deinit(s.gpa);
++        try d.trim(&gone);
++        for (gone.items) |k| if (s.index.lookup(k)) |id| {
++            s.index.get(id).extra.file = false;
++            if (!s.index.get(id).ram) s.index.remove(id);
++        };
++    }
++
++    const Chat = struct { leaf: u32, recency: u64 };
++
++    fn chatLess(_: void, a: Chat, b: Chat) bool {
++        return a.recency < b.recency or (a.recency == b.recency and a.leaf < b.leaf);
++    }
++
++    /// A chat is live while a slot maps its leaf's first page.
++    fn idleLeaf(s: *Store, id: u32) bool {
++        const e = s.index.get(id);
++        return e.extra.job == null and s.index.isLeaf(id) and (e.extra.pages.len == 0 or s.pool.slot_refs[e.extra.pages[0]] == 0);
++    }
++
++    /// Evicts LRU idle chats past the residency budget (leaf parked, unshared older turns dropped); returns how many.
++    pub fn enforce(s: *Store) !u32 {
++        const pol = s.policy;
++        if (pol.chats == 0 and pol.resident_bytes == 0) return 0;
++        var chats: std.ArrayList(Chat) = .empty;
++        defer chats.deinit(s.gpa);
++        var members: std.ArrayList(u32) = .empty;
++        defer members.deinit(s.gpa);
++        var id = s.oldest;
++        while (id != none) : (id = s.index.get(id).extra.newer) {
++            if (!s.idleLeaf(id)) continue;
++            members.clearRetainingCapacity();
++            try chats.append(s.gpa, .{ .leaf = id, .recency = try s.index.members(id, &members, usedOf) });
++        }
++        std.mem.sort(Chat, chats.items, {}, chatLess);
++        var idle: u32 = @intCast(chats.items.len);
++        var gone: u32 = 0;
++        for (chats.items) |c| {
++            const over_n = pol.chats > 0 and idle > pol.chats;
++            const over_b = pol.resident_bytes > 0 and s.pool.entryOnlyBytes() > pol.resident_bytes;
++            if (!over_n and !over_b) break;
++            if (!s.index.get(c.leaf).ram or !s.idleLeaf(c.leaf)) continue;
++            members.clearRetainingCapacity();
++            _ = try s.index.members(c.leaf, &members, usedOf);
++            _ = try s.evict(c.leaf);
++            // deepest first: a member more RAM entries extend than this chat's leaf is a branch point, as is all above
++            const own: u32 = if (s.index.get(c.leaf).ram) 1 else 0;
++            for (members.items) |m| {
++                if (s.index.get(m).extra.job != null) continue;
++                if (s.index.extensions(m) > own) break;
++                if (pol.park_prefixes) _ = try s.evict(m) else try s.drop(m);
++            }
++            idle -= 1;
++            gone += 1;
++            s.stats.chat_evictions += 1;
++        }
++        return gone;
++    }
++
++    /// RAM entries to let go of (coldest first, never keep) so need pages are free: [] if they are, null if impossible.
++    pub fn planSpill(s: *Store, need: u32, keep: []const u32, out: *std.ArrayList(u32)) !bool {
++        out.clearRetainingCapacity();
++        var avail = s.pool.available();
++        if (avail >= need) return true;
++        var left: std.AutoHashMapUnmanaged(u32, u16) = .empty;
++        defer left.deinit(s.gpa);
++        var id = s.oldest;
++        while (id != none and avail < need) : (id = s.index.get(id).extra.newer) {
++            if (std.mem.indexOfScalar(u32, keep, id) != null or s.index.get(id).extra.job != null) continue;
++            try out.append(s.gpa, id);
++            for (s.index.get(id).extra.pages) |pg| {
++                const g = try left.getOrPut(s.gpa, pg);
++                if (!g.found_existing) g.value_ptr.* = s.pool.refs[pg];
++                g.value_ptr.* -= 1;
++                if (g.value_ptr.* == 0) avail += 1; // split: a page of the scarcer residue may count for less; the check below decides
++            }
++        }
++        return avail >= need;
++    }
++
++    /// Rebuilds NVMe entries on restart (ranks then intersect them), deltas on their bases' paths; returns how many.
++    pub fn reconcile(s: *Store) !u32 {
++        const d = s.disk orelse return 0;
++        var found: std.ArrayList(Disk.Found) = .empty;
++        defer {
++            for (found.items) |f| s.gpa.free(f.ids);
++            found.deinit(s.gpa);
++        }
++        try d.scan(&found);
++        for (found.items) |f| {
++            var anchor: u32 = none;
++            if (f.head.hasBase()) {
++                const b = s.index.lookup(f.head.base) orelse return error.NoBase;
++                anchor = s.index.nodeAt(b, f.head.first_page) orelse return error.BadChain;
++            }
++            const r = try s.index.insertFrom(f.head.tag, anchor, f.ids, .{ .file = true, .kind = f.head.kind });
++            s.clock += 1;
++            s.index.get(r.id).extra.used = s.clock;
++        }
++        return @intCast(found.items.len);
++    }
++
++    /// Idle resident chats and the pool bytes held by entries alone.
++    pub fn resident(s: *Store) struct { chats: u32, bytes: u64 } {
++        var n: u32 = 0;
++        var id = s.oldest;
++        while (id != none) : (id = s.index.get(id).extra.newer) if (s.idleLeaf(id)) {
++            n += 1;
++        };
++        return .{ .chats = n, .bytes = s.pool.entryOnlyBytes() };
++    }
++};
+diff --git a/zig/src/sessions/store_test.zig b/zig/src/sessions/store_test.zig
+new file mode 100644
+index 00000000..86b58a4f
+--- /dev/null
++++ b/zig/src/sessions/store_test.zig
+@@ -0,0 +1,216 @@
++//! The session store on a host pool and a real NVMe tier: chats, evictions, resumes bit for bit, deltas, two ranks.
++
++const std = @import("std");
++const testing = std.testing;
++const pool_mod = @import("pool.zig");
++const Pool = pool_mod.Pool;
++const Slot = pool_mod.Slot;
++const Family = pool_mod.Family;
++const HostPool = @import("pagestore.zig").HostPool;
++const disk_mod = @import("disk.zig");
++const store_mod = @import("store.zig");
++const Store = store_mod.Store;
++const Bounded = store_mod.Bounded;
++
++const page = 64;
++const fams = [_]Family{
++    .{ .name = "comp.2", .ratio = 2, .row_bytes = 584, .split = true },
++    .{ .name = "index_k.2", .ratio = 2, .row_bytes = 132 },
++    .{ .name = "comp.20", .ratio = 1, .row_bytes = 584, .split = true },
++};
++
++/// Bounded state in host memory: one blob naming its chat and length.
++const HostBounded = struct {
++    gpa: std.mem.Allocator,
++    bytes: []u8,
++
++    fn make(gpa: std.mem.Allocator, chat: u32, pos: u64) !Bounded {
++        const h = try gpa.create(HostBounded);
++        h.* = .{ .gpa = gpa, .bytes = try gpa.alloc(u8, 3000) };
++        for (h.bytes, 0..) |*b, i| b.* = @truncate(i +% chat *% 17 +% pos);
++        return .{ .ptr = h, .vtable = &vt };
++    }
++    const vt: Bounded.VTable = .{ .nbytes = nbytes, .blobs = blobs, .release = release };
++    fn nbytes(p: *anyopaque) u64 {
++        const h: *HostBounded = @ptrCast(@alignCast(p));
++        return h.bytes.len;
++    }
++    fn blobs(p: *anyopaque, gpa: std.mem.Allocator) anyerror![]disk_mod.Blob {
++        const h: *HostBounded = @ptrCast(@alignCast(p));
++        const out = try gpa.alloc(disk_mod.Blob, 1);
++        out[0] = .{ .name = try gpa.dupe(u8, "rings"), .bytes = try gpa.dupe(u8, h.bytes) };
++        return out;
++    }
++    fn release(p: *anyopaque) void {
++        const h: *HostBounded = @ptrCast(@alignCast(p));
++        h.gpa.free(h.bytes);
++        h.gpa.destroy(h);
++    }
++};
++
++/// One rank: its pool, host pages and store, plus what each chat's slot wrote (the reference rows by logical page).
++const Rank = struct {
++    pool: Pool,
++    host: HostPool,
++    disk: *disk_mod.Disk,
++    store: Store,
++
++    fn init(r: *Rank, gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, policy: store_mod.Policy) !void {
++        r.pool = try Pool.init(gpa, .{ .families = &fams, .page = page }, 96 * page, world, rank);
++        r.host = try HostPool.init(gpa, &r.pool);
++        r.disk = try disk_mod.Disk.open(gpa, testing.io, .{ .root = root, .compat = @splat(7), .rank = rank, .world = world, .chunk = 64 << 10, .staging = 4, .lanes = 2, .min_tokens = 1 });
++        r.store = try Store.init(gpa, testing.io, &r.pool, r.host.store(), r.disk, policy);
++    }
++
++    fn deinit(r: *Rank) void {
++        r.store.deinit();
++        r.disk.close();
++        r.host.deinit();
++        r.pool.deinit();
++    }
++
++    /// The rows a chat's slot writes at a logical page: a function of (chat, logical page, family) alone.
++    fn write(r: *Rank, s: *const Slot, chat: u32, from_page: u32) void {
++        for (s.mapped()[from_page..], from_page..) |pg, k| for (fams, 0..) |f, fi| {
++            if (f.split and !r.pool.owns(pg)) continue;
++            const v = r.host.pageOf(@intCast(fi), r.pool.familyPage(f, pg));
++            for (v, 0..) |*b, i| b.* = @truncate(i *% 13 +% k *% 101 +% chat *% 7 +% fi);
++        };
++    }
++
++    /// Every stored row of the slot's pages below pos equals what write() put there.
++    fn check(r: *Rank, s: *const Slot, chat: u32, pos: u64) !void {
++        const n = pool_mod.pagesFor(pos, page);
++        for (s.mapped()[0..n], 0..) |pg, k| for (fams, 0..) |f, fi| {
++            if (f.split and !r.pool.owns(pg)) continue;
++            const v = r.host.pageOf(@intCast(fi), r.pool.familyPage(f, pg));
++            const rows: usize = if (k + 1 == n and pos % page != 0) (pos % page) / f.ratio * f.row_bytes else v.len;
++            for (v[0..rows], 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(i *% 13 +% k *% 101 +% chat *% 7 +% fi)), b);
++        };
++    }
++};
++
++fn chatIds(gpa: std.mem.Allocator, chat: u32, n: usize) ![]i32 {
++    const v = try gpa.alloc(i32, n);
++    for (v, 0..) |*t, i| t.* = @intCast(chat * 100_000 + i);
++    return v;
++}
++
++/// Prefill or resume a chat to len(ids) in slot s, save it, free the slot, enforce residency; returns the resume point.
++fn turn(gpa: std.mem.Allocator, r: *Rank, s: *Slot, chat: u32, ids: []const i32) ![]const u8 {
++    var tier: []const u8 = "fresh";
++    var from: u32 = 0;
++    if (try r.store.find(1, ids)) |hit| {
++        if (hit.ram) {
++            const b = try r.store.restoreRam(hit.id, s);
++            try testing.expectEqual(@as(u64, 3000), b.vtable.nbytes(b.ptr));
++            tier = "ram";
++        } else {
++            const j = try r.store.beginRestore(hit.id, s);
++            var got = (try r.store.settle(j)).?;
++            defer got.deinit(gpa);
++            try testing.expectEqual(@as(u8, @truncate(chat *% 17 +% hit.pos)), got.blobs[0].bytes[0]);
++            tier = "disk";
++        }
++        try r.check(s, chat, hit.pos);
++        from = @intCast(hit.pos / page);
++    }
++    try s.ensure(ids.len);
++    r.write(s, chat, from);
++    _ = try r.store.save(s, try HostBounded.make(gpa, chat, ids.len), ids, 1, 0);
++    _ = try s.releaseAll();
++    _ = try r.store.enforce();
++    try r.store.settleAll(); // the plan's settle point (async parks finish here)
++    return tier;
++}
++
++/// The scenario on one rank; returns a trace of its decisions (stats and page ids) to compare ranks.
++fn scenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, async_io: bool, trace: *std.ArrayList(u64)) !void {
++    var r: Rank = undefined;
++    try r.init(gpa, root, world, rank, .{ .chats = 1, .async_io = async_io });
++    defer r.deinit();
++    const s = try r.pool.newSlot(64 * page);
++    const a = try chatIds(gpa, 1, 20 * page);
++    defer gpa.free(a);
++    const b = try chatIds(gpa, 2, 20 * page);
++    defer gpa.free(b);
++    const st = &r.store.stats;
++    try testing.expectEqualStrings("fresh", try turn(gpa, &r, s, 1, a[0 .. 5 * page + 10]));
++    try testing.expectEqualStrings("ram", try turn(gpa, &r, s, 1, a[0 .. 8 * page + 3]));
++    try testing.expectEqual(@as(u64, 0), st.parks);
++    // a second idle chat: chat 1 (least recent) parked whole, its older turn dropped (not written)
++    try testing.expectEqualStrings("fresh", try turn(gpa, &r, s, 2, b[0 .. 6 * page]));
++    try testing.expectEqual(@as(u64, 1), st.parks);
++    try testing.expectEqual(@as(u64, 1), st.drops);
++    try testing.expectEqual(@as(u32, 1), r.store.resident().chats);
++    const whole = r.disk.used;
++    // chat 1 resumes from NVMe bit for bit; chat 2 goes
++    try testing.expectEqualStrings("disk", try turn(gpa, &r, s, 1, a[0 .. 12 * page + 40]));
++    try testing.expectEqual(@as(u64, 2), st.parks);
++    const before = r.disk.used;
++    // chat 2 resumes; chat 1 goes again, written as a delta on its first file (pages 8..12 of 13)
++    try testing.expectEqualStrings("disk", try turn(gpa, &r, s, 2, b[0 .. 9 * page]));
++    try testing.expectEqual(@as(u64, 3), st.parks);
++    try testing.expectEqual(@as(u64, 1), st.delta_parks);
++    // the delta holds 5 of the entry's 13 pages: less than chat 1's first whole file of 9 pages
++    try testing.expect(r.disk.used - before < whole);
++    // chat 1's newest turn restores through its two files, bit for bit
++    try testing.expectEqualStrings("disk", try turn(gpa, &r, s, 1, a[0 .. 15 * page]));
++    try testing.expectEqual(@as(u64, 3), st.hits_disk);
++    try trace.appendSlice(gpa, &.{ st.parks, st.delta_parks, st.drops, st.covered_drops, st.hits_ram, st.hits_disk, r.pool.freePages(), r.pool.entry_only });
++    var id = r.store.oldest;
++    while (id != store_mod.none) : (id = r.store.entry(id).extra.newer) for (r.store.entry(id).extra.pages) |pg| try trace.append(gpa, pg);
++}
++
++/// After the scenario: a new process on the same tier finds every file and resumes chat 1 through its delta chain.
++fn restart(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32) !void {
++    var r: Rank = undefined;
++    try r.init(gpa, root, world, rank, .{ .chats = 1 });
++    defer r.deinit();
++    try testing.expectEqual(@as(u32, 4), try r.store.reconcile());
++    const s = try r.pool.newSlot(64 * page);
++    const a = try chatIds(gpa, 1, 20 * page);
++    defer gpa.free(a);
++    try testing.expectEqualStrings("disk", try turn(gpa, &r, s, 1, a[0 .. 16 * page]));
++    try testing.expectEqual(@as(u64, 1), r.store.stats.hits_disk);
++}
++
++fn tmpRoot(gpa: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []const u8) ![:0]u8 {
++    try tmp.dir.createDirPath(testing.io, sub);
++    return tmp.dir.realPathFileAlloc(testing.io, sub, gpa);
++}
++
++test "chats over turns: residency to NVMe, bit-identical resumes, deltas, older turns dropped (sync and async)" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var t0: std.ArrayList(u64) = .empty;
++    defer t0.deinit(gpa);
++    var t1: std.ArrayList(u64) = .empty;
++    defer t1.deinit(gpa);
++    const r0 = try tmpRoot(gpa, &tmp, "sync");
++    defer gpa.free(r0);
++    try scenario(gpa, r0, 1, 0, false, &t0);
++    try restart(gpa, r0, 1, 0);
++    const r1 = try tmpRoot(gpa, &tmp, "async");
++    defer gpa.free(r1);
++    try scenario(gpa, r1, 1, 0, true, &t1);
++    try testing.expectEqualSlices(u64, t0.items, t1.items); // the tier thread changes when bytes move, not what is decided
++}
++
++test "two split ranks make the same decisions on the same calls and each restores its own rows" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var t0: std.ArrayList(u64) = .empty;
++    defer t0.deinit(gpa);
++    var t1: std.ArrayList(u64) = .empty;
++    defer t1.deinit(gpa);
++    const root = try tmpRoot(gpa, &tmp, "tier");
++    defer gpa.free(root);
++    try scenario(gpa, root, 2, 0, false, &t0);
++    try scenario(gpa, root, 2, 1, true, &t1);
++    try restart(gpa, root, 2, 0);
++    try restart(gpa, root, 2, 1);
++    try testing.expectEqualSlices(u64, t0.items, t1.items);
++}
+-- 
+2.53.0
+

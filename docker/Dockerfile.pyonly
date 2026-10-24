@@ -1,0 +1,28 @@
+# Python-only update of the recipe image: an existing muse-tf image (exllamav3 at EXL3_COMMIT + the patches it was
+# built with, extension compiled) plus later patches-exl3/ that change only .py files. Applies the new patches as
+# commits on /opt/exllamav3 (same identity and dates as exported, so HEAD equals the patched sha) and copies the
+# changed files over the installed package. No CUDA rebuild; seconds to build on each node.
+#   scripts/build-image-pyonly.sh     (tags muse-tf:<first 10 of the new patched sha>; never retags latest)
+ARG FROM_IMAGE
+FROM ${FROM_IMAGE}
+ARG FROM_SHA
+ARG EXL3_PATCHED_SHA=unknown
+ARG RECIPE_COMMIT=unknown
+COPY patches-exl3 /opt/patches-exl3-next
+RUN cd /opt/exllamav3 \
+ && test "$(git rev-parse HEAD)" = "${FROM_SHA}" \
+ && n=$(ls /opt/patches-exl3/*.patch | wc -l) \
+ && ls /opt/patches-exl3-next/*.patch | tail -n +$((n + 1)) > /tmp/new-patches \
+ && test -s /tmp/new-patches \
+ && git -c user.name="ajensenwaud" -c user.email="ajensenwaud@users.noreply.github.com" \
+        am -q --committer-date-is-author-date $(cat /tmp/new-patches) \
+ && ! git diff --name-only "${FROM_SHA}" HEAD | grep -qv '\.py$' \
+ && site=$(cd / && python3 -c "import exllamav3, os; print(os.path.dirname(os.path.dirname(exllamav3.__file__)))") \
+ && git diff --name-only --diff-filter=AM "${FROM_SHA}" HEAD | while read -r f; do \
+        mkdir -p "$site/$(dirname "$f")" && cp "$f" "$site/$f" && echo "patched $f"; done \
+ && rm -rf /opt/patches-exl3 && mv /opt/patches-exl3-next /opt/patches-exl3 \
+ && git rev-parse HEAD > /opt/exllamav3.patched-sha \
+ && cd / && python3 -c "import exllamav3.conversion.convert_model; from exllamav3.architecture.architectures import get_architectures as g; \
+assert 'MuseSparkForConditionalGeneration' in g(); print('exllamav3', open('/opt/exllamav3.patched-sha').read().strip())"
+LABEL org.opencontainers.image.title="muse-tf" org.opencontainers.image.revision="${RECIPE_COMMIT}" \
+      io.exllamav3.patched="${EXL3_PATCHED_SHA}"

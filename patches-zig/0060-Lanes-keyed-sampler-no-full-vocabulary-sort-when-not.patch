@@ -1,0 +1,364 @@
+From 617175f6a32b2b6a69a2c022e36e0495cacaf1f8 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:12:46 +1100
+Subject: [PATCH 60/60] Lanes keyed sampler: no full-vocabulary sort when
+ nothing is cut by rank (top_k off or >= width, top_p off): one pass over the
+ row (Muse's draw hands it the f32 row, no f64 copies), the same Gumbel race
+ in id order with the sorted order's tie rule, candidates whose noise provably
+ cannot reach the best score skipped before the logs; the same token as before
+ (chooseSorted kept as the reference and the top_k/top_p path; tests against
+ it and against Muse's old draw)
+
+---
+ zig/src/core/lanes/lanes.zig              |  1 +
+ zig/src/core/lanes/sampling.zig           | 92 +++++++++++++++++++++-
+ zig/src/core/lanes/sampling_test.zig      | 96 +++++++++++++++++++++++
+ zig/src/families/muse_spark/draw_test.zig | 63 +++++++++++++++
+ zig/src/families/muse_spark/native.zig    |  6 +-
+ zig/src/families/muse_spark/root.zig      |  1 +
+ 6 files changed, 253 insertions(+), 6 deletions(-)
+ create mode 100644 zig/src/core/lanes/sampling_test.zig
+ create mode 100644 zig/src/families/muse_spark/draw_test.zig
+
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 7198a2ed..03df0ae8 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -41,6 +41,7 @@ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("engine_test.zig");
+     _ = @import("gpu_full_test.zig");
++    _ = @import("sampling_test.zig");
+     _ = @import("drafted_test.zig");
+     _ = @import("pricing_test.zig");
+ }
+diff --git a/zig/src/core/lanes/sampling.zig b/zig/src/core/lanes/sampling.zig
+index e9d46975..f34428b0 100644
+--- a/zig/src/core/lanes/sampling.zig
++++ b/zig/src/core/lanes/sampling.zig
+@@ -49,10 +49,18 @@ pub fn keyBits(seed: u64, position: u64, id: u64) u64 {
+ 
+ /// Uniform (0, 1] double from the key's top 53 bits (Python `uniform`).
+ pub fn uniform(seed: u64, position: u64, id: u64) f64 {
+-    const x = keyBits(seed, position, id);
++    return uniformOf(keyBits(seed, position, id));
++}
++
++fn uniformOf(x: u64) f64 {
+     return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
+ }
+ 
++/// keyBits before the id: keyBits(seed, position, id) == mix(keyBase(seed, position) ^ id).
++fn keyBase(seed: u64, position: u64) u64 {
++    return mix(mix(seed +% 0x9E3779B97F4A7C15) ^ (position *% 0xD1B54A32D192ED03));
++}
++
+ /// numpy's float64 pairwise sum (`np.add.reduce` on a contiguous row).
+ pub fn pairwiseSum(a: []const f64) f64 {
+     if (a.len < 8) {
+@@ -83,6 +91,11 @@ fn byValueThenId(_: void, a: Candidate, b: Candidate) bool {
+ 
+ /// The id drawn among candidates `ids` with float64 logits `values` (Python `choose`, and `choose_rows` row by row).
+ pub fn choose(gpa: Allocator, values: []const f64, ids: []const u64, position: u64, s: Sampling) !u64 {
++    return chooseAll(values, ids, position, s) orelse chooseSorted(gpa, values, ids, position, s);
++}
++
++/// `choose` over the whole sorted order: the reference, and the path for top_k and top_p cuts.
++pub fn chooseSorted(gpa: Allocator, values: []const f64, ids: []const u64, position: u64, s: Sampling) !u64 {
+     const width = ids.len;
+     const order = try gpa.alloc(Candidate, width);
+     defer gpa.free(order);
+@@ -130,6 +143,83 @@ pub fn choose(gpa: Allocator, values: []const f64, ids: []const u64, position: u
+     return order[best].id;
+ }
+ 
++/// `choose` with no cut by rank (top_k off or >= width, top_p off): the same race in id order, no sort; null otherwise.
++fn chooseAll(values: []const f64, ids: []const u64, position: u64, s: Sampling) ?u64 {
++    if (ids.len == 0 or values.len != ids.len or (s.top_k != 0 and s.top_k < ids.len)) return null;
++    return race(f64, values, ids, position, s);
++}
++
++/// `choose` over a whole row whose ids are its indices (values widened to f64 as `choose`'s callers widen them).
++pub fn chooseRow(gpa: Allocator, row: []const f32, position: u64, s: Sampling) !u64 {
++    if (row.len > 0 and (s.top_k == 0 or s.top_k >= row.len)) if (race(f32, row, null, position, s)) |id| return id;
++    const values = try gpa.alloc(f64, row.len);
++    defer gpa.free(values);
++    const ids = try gpa.alloc(u64, row.len);
++    defer gpa.free(ids);
++    for (values, ids, row, 0..) |*v, *id, x, i| {
++        v.* = x;
++        id.* = i;
++    }
++    return chooseSorted(gpa, values, ids, position, s);
++}
++
++/// The sorted loop's winner, the first maximum score in (value desc, id asc) order, in one pass; null: sort instead.
++fn race(comptime T: type, values: []const T, ids: ?[]const u64, position: u64, s: Sampling) ?u64 {
++    if (!(s.temperature > 0) or (s.top_p > 0.0 and s.top_p < 1.0) or s.min_p > 1.0) return null;
++    const t = @max(s.temperature, 1e-6);
++    const min_p = s.min_p > 0.0;
++    var floor = -std.math.inf(f64);
++    if (min_p) {
++        var top = -std.math.inf(f64);
++        for (values) |v| top = @max(top, @as(f64, v));
++        floor = top / t + s.minLog();
++    }
++    const base = keyBase(s.seed, position);
++    const bounds = skipBounds();
++    var top = -std.math.inf(f64);
++    var best: usize = 0;
++    var best_v = -std.math.inf(f64);
++    var best_score = std.math.nan(f64); // none yet
++    for (values, 0..) |v32, i| {
++        const v: f64 = v32;
++        if (std.math.isNan(v)) return null; // NaN has no place in the sorted order
++        top = @max(top, v);
++        const x = v / t;
++        if (min_p and !(x >= floor)) continue;
++        const id: u64 = if (ids) |m| m[i] else i;
++        const u = uniformOf(mix(base ^ id));
++        if (!std.math.isNan(best_score) and skips(bounds, best_score - x, u, x, best_score)) continue;
++        const score = x + -log(-log(u));
++        if (std.math.isNan(score)) continue; // a NaN score never wins (the row's max scores a number)
++        if (!std.math.isNan(best_score)) {
++            if (score < best_score) continue;
++            const best_id: u64 = if (ids) |m| m[best] else best;
++            if (score == best_score and !byValueThenId({}, .{ .value = v, .id = id }, .{ .value = best_v, .id = best_id })) continue;
++        }
++        best = i;
++        best_v = v;
++        best_score = score;
++    }
++    if (!std.math.isFinite(top) or std.math.isNan(best_score)) return null;
++    return if (ids) |m| m[best] else best;
++}
++
++/// Score gaps d and uniforms U: below U, -log(-log(u)) < d - 0.5, so a candidate that far under the best cannot win.
++pub const gaps = [_]f64{ 40, 32, 16, 8, 4, 2, 1 };
++
++pub fn skipBounds() [gaps.len]f64 {
++    var u: [gaps.len]f64 = undefined;
++    for (&u, gaps) |*b, d| b.* = exp(-exp(-(d - 0.5)));
++    return u;
++}
++
++/// Whether a candidate `d` under the best score provably scores below it (its Gumbel noise cannot close the gap).
++fn skips(bounds: [gaps.len]f64, d: f64, u: f64, x: f64, best_score: f64) bool {
++    if (!(@abs(x) <= 1e6 and @abs(best_score) <= 1e6)) return false; // rounding stays far inside the 0.5 margin
++    for (gaps, bounds) |g, b| if (d >= g) return u < b;
++    return false;
++}
++
+ test "seeds keep 63 bits and uniforms fall in (0, 1]" {
+     try std.testing.expect(seedFor(&.{ 1, 2, 3 }, 0) < (@as(u64, 1) << 63));
+     const u = uniform(7, 11, 13);
+diff --git a/zig/src/core/lanes/sampling_test.zig b/zig/src/core/lanes/sampling_test.zig
+new file mode 100644
+index 00000000..d166a828
+--- /dev/null
++++ b/zig/src/core/lanes/sampling_test.zig
+@@ -0,0 +1,96 @@
++//! choose (no sort when nothing is cut by rank) against chooseSorted, the sorted reference, token for token.
++const std = @import("std");
++const sampling = @import("sampling.zig");
++
++extern "c" fn log(x: f64) f64;
++
++const Shape = enum { normal, ties, wide, flat, inf };
++
++fn fill(r: std.Random, values: []f64, ids: []u64, shape: Shape, permute: bool) void {
++    for (values, ids, 0..) |*v, *id, i| {
++        const x = r.floatNorm(f64);
++        v.* = switch (shape) {
++            .normal => @as(f32, @floatCast(x * 3.0)),
++            .ties => @round(x * 4.0) / 4.0,
++            .wide => @as(f32, @floatCast(x * 25.0)),
++            .flat => 0.5,
++            .inf => if (i % 3 == 0) -std.math.inf(f64) else @as(f32, @floatCast(x)),
++        };
++        id.* = i;
++    }
++    if (shape == .ties and values.len > 2) values[1] = -0.0;
++    if (permute) r.shuffle(u64, ids);
++}
++
++test "choose without the sort draws the sorted reference's token" {
++    const a = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(20261024);
++    const r = prng.random();
++    const temps = [_]f64{ 0.6, 1.0, 1.5, 1e-7 };
++    const min_ps = [_]f64{ 0.0, 0.05, 1.0, 1.5 };
++    const top_ps = [_]f64{ 1.0, 0.0, 1.5, 0.95 };
++    var draws: usize = 0;
++    var differ: usize = 0;
++    for ([_]usize{ 1, 2, 7, 64, 1000, 5000 }) |width| {
++        const values = try a.alloc(f64, width);
++        defer a.free(values);
++        const ids = try a.alloc(u64, width);
++        defer a.free(ids);
++        for (std.enums.values(Shape)) |shape| for ([_]bool{ false, true }) |permute| {
++            fill(r, values, ids, shape, permute);
++            for (temps) |t| for (min_ps) |mp| for (top_ps) |tp| for ([_]u32{ 0, @intCast(width) }) |k| {
++                for (0..4) |pos| {
++                    const s = sampling.Sampling{ .seed = r.int(u64) >> 1, .temperature = t, .top_k = k, .top_p = tp, .min_p = mp };
++                    const want = try sampling.chooseSorted(a, values, ids, pos, s);
++                    const got = try sampling.choose(a, values, ids, pos, s);
++                    draws += 1;
++                    if (got != want) differ += 1;
++                }
++            };
++        };
++    }
++    try std.testing.expectEqual(@as(usize, 0), differ);
++    try std.testing.expect(draws > 10000);
++}
++
++test "chooseRow over f32 rows draws the sorted reference's token" {
++    const a = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(7);
++    const r = prng.random();
++    for ([_]usize{ 1, 3, 100, 3000 }) |width| {
++        const row = try a.alloc(f32, width);
++        defer a.free(row);
++        const values = try a.alloc(f64, width);
++        defer a.free(values);
++        const ids = try a.alloc(u64, width);
++        defer a.free(ids);
++        for (std.enums.values(Shape)) |shape| {
++            fill(r, values, ids, shape, false);
++            for (row, values) |*x, v| x.* = @floatCast(v);
++            if (shape == .inf and width > 2) row[width - 1] = std.math.nan(f32);
++            for (row, values) |x, *v| v.* = x;
++            for ([_]f64{ 0.6, 1.0, 1.5 }) |t| for ([_]f64{ 0.0, 0.05 }) |mp| for ([_]u32{ 0, @intCast(width), 1 }) |k| for (0..3) |pos| {
++                const s = sampling.Sampling{ .seed = r.int(u64) >> 1, .temperature = t, .top_k = k, .top_p = 1.0, .min_p = mp };
++                try std.testing.expectEqual(try sampling.chooseSorted(a, values, ids, pos, s), try sampling.chooseRow(a, row, pos, s));
++            };
++        }
++    }
++}
++
++test "a NaN value falls back to the sorted reference" {
++    const a = std.testing.allocator;
++    const values = [_]f64{ 1.0, std.math.nan(f64), 3.0, 2.0 };
++    const ids = [_]u64{ 4, 5, 6, 7 };
++    for (0..64) |pos| {
++        const s = sampling.Sampling{ .seed = 99, .temperature = 1.0, .top_k = 0, .top_p = 1.0 };
++        try std.testing.expectEqual(try sampling.chooseSorted(a, &values, &ids, pos, s), try sampling.choose(a, &values, &ids, pos, s));
++    }
++}
++
++test "every skipped uniform's Gumbel noise stays under its gap" {
++    // the largest uniform a bound skips is the double below it; its noise must sit more than 0.4 under the gap
++    for (sampling.gaps, sampling.skipBounds()) |gap, b| {
++        try std.testing.expect(b > 0.0 and b <= 1.0);
++        try std.testing.expect(-log(-log(std.math.nextAfter(f64, b, 0.0))) < gap - 0.4);
++    }
++}
+diff --git a/zig/src/families/muse_spark/draw_test.zig b/zig/src/families/muse_spark/draw_test.zig
+new file mode 100644
+index 00000000..9a40d98c
+--- /dev/null
++++ b/zig/src/families/muse_spark/draw_test.zig
+@@ -0,0 +1,63 @@
++//! native.draw (the unsorted full-vocabulary race) against the draw it replaced, token for token.
++const std = @import("std");
++const lanes = @import("lanes");
++const native = @import("native.zig");
++
++/// native.draw before the change: the same top-k preselection, then the sorted reference.
++fn oldDraw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling, position: u64) !u32 {
++    var best: usize = 0;
++    for (row, 0..) |x, i| if (x > row[best]) {
++        best = i;
++    };
++    if (!std.math.isFinite(row[best])) return error.NonfiniteLogits;
++    const sampling = settings orelse return @intCast(best);
++    if (sampling.temperature <= 0) return @intCast(best);
++    const k = if (sampling.top_k == 0) row.len else @min(row.len, sampling.top_k);
++    const values = try gpa.alloc(f64, k);
++    defer gpa.free(values);
++    const ids = try gpa.alloc(u64, k);
++    defer gpa.free(ids);
++    var filled: usize = 0;
++    for (row, 0..) |x32, id| {
++        const x: f64 = x32;
++        if (k == row.len) {
++            values[id] = x;
++            ids[id] = id;
++            continue;
++        }
++        if (filled == k and x <= values[k - 1]) continue;
++        var at = @min(filled, k - 1);
++        while (at > 0 and x > values[at - 1]) : (at -= 1) {
++            values[at] = values[at - 1];
++            ids[at] = ids[at - 1];
++        }
++        values[at] = x;
++        ids[at] = id;
++        filled = @min(filled + 1, k);
++    }
++    return @intCast(try lanes.sampling.chooseSorted(gpa, values, ids, position, sampling));
++}
++
++test "draw over Muse's vocabulary gives the old draw's token at every top_k, top_p and temperature" {
++    const a = std.testing.allocator;
++    const vocab = 202048;
++    const row = try a.alloc(f32, vocab);
++    defer a.free(row);
++    var prng = std.Random.DefaultPrng.init(816);
++    const r = prng.random();
++    var draws: usize = 0;
++    for (0..2) |trial| {
++        // a peaked row (one token far ahead) and a flat one (bf16-like ties)
++        for (row) |*x| x.* = @floatCast(if (trial == 0) r.floatNorm(f64) * 2.5 else @round(r.floatNorm(f64) * 8.0) / 8.0);
++        row[r.uintLessThan(usize, vocab)] = if (trial == 0) 18.0 else 3.0;
++        for ([_]u32{ 0, 1, 64, 1024, vocab }) |k| for ([_]f64{ 1.0, 0.95, 0.5 }) |p| for ([_]f64{ 0.6, 1.0, 1.5 }) |t| {
++            for (0..2) |pos| {
++                const s = lanes.Sampling{ .seed = r.int(u64) >> 1, .temperature = t, .top_k = k, .top_p = p };
++                const position = 1000 + pos * 7919;
++                try std.testing.expectEqual(try oldDraw(a, row, s, position), try native.draw(a, row, s, position));
++                draws += 1;
++            }
++        };
++    }
++    try std.testing.expectEqual(@as(usize, 180), draws);
++}
+diff --git a/zig/src/families/muse_spark/native.zig b/zig/src/families/muse_spark/native.zig
+index 21cca70a..4a91f71f 100644
+--- a/zig/src/families/muse_spark/native.zig
++++ b/zig/src/families/muse_spark/native.zig
+@@ -401,6 +401,7 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
+     const sampling = settings orelse return @intCast(best);
+     if (sampling.temperature <= 0) return @intCast(best);
+     const k = if (sampling.top_k == 0) row.len else @min(row.len, sampling.top_k);
++    if (k == row.len) return @intCast(try lanes.sampling.chooseRow(gpa, row, position, sampling));
+     const values = try gpa.alloc(f64, k);
+     defer gpa.free(values);
+     const ids = try gpa.alloc(u64, k);
+@@ -408,11 +409,6 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
+     var filled: usize = 0;
+     for (row, 0..) |x32, id| {
+         const x: f64 = x32;
+-        if (k == row.len) {
+-            values[id] = x;
+-            ids[id] = id;
+-            continue;
+-        }
+         if (filled == k and x <= values[k - 1]) continue;
+         var at = @min(filled, k - 1);
+         while (at > 0 and x > values[at - 1]) : (at -= 1) {
+diff --git a/zig/src/families/muse_spark/root.zig b/zig/src/families/muse_spark/root.zig
+index 682e85f0..934918f9 100644
+--- a/zig/src/families/muse_spark/root.zig
++++ b/zig/src/families/muse_spark/root.zig
+@@ -17,6 +17,7 @@ test {
+     _ = forward;
+     _ = engine;
+     _ = native;
++    _ = @import("draw_test.zig");
+     _ = dflash2;
+     _ = prompt;
+     _ = dflash2_config;
+-- 
+2.53.0
+

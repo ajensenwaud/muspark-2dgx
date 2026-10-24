@@ -1,0 +1,1233 @@
+From d1fc13f96f5b2613d4b639e9ebf9b6b9c2099ee7 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:26:33 +1100
+Subject: [PATCH 44/60] Muse Spark: the DFlash2 drafter (RadixArk
+ Muse-Spark-Open-DFlash2), EXL3 pack, split under TP=2
+
+dflash2_config.zig: the drafter's config (5 sliding-window GQA layers, block 8, taps after target layers
+1/16/30/44/59, selector rank 256 / top 16, grouped dynamic causal convolutions) and its per-rank cuts (q/o by
+heads, k/v by KV heads, MLP by width, fc by outputs). dflash2.zig: the drafter fed from inside the target's run
+(residual taps, then the context K/V update after the last layer), a draft pass per stream count that captures as a
+CUDA graph (up to 16 streams x 8 rows). The MiMo-V2 DFlash kernels are reused for embedding, taps, per-head norm
+and RoPE, cache stores, block attention and row takes; muse_spark/dflash2.cu adds the selector's dense projection,
+the conv prepare/finish, SiLU-mul, the per-rank top 16 of the scaled, softcapped head and the candidate walk.
+---
+ zig/build/cuda.zig                            |   1 +
+ zig/kernels/cuda/muse_spark/dflash2.cu        | 217 ++++++
+ zig/src/cuda/kernels.zig                      |   1 +
+ zig/src/families/muse_spark/dflash2.zig       | 618 ++++++++++++++++++
+ .../families/muse_spark/dflash2_config.zig    | 255 ++++++++
+ zig/src/families/muse_spark/forward.zig       |   5 +
+ zig/src/families/muse_spark/load.zig          |   2 +-
+ zig/src/families/muse_spark/root.zig          |   4 +
+ 8 files changed, 1102 insertions(+), 1 deletion(-)
+ create mode 100644 zig/kernels/cuda/muse_spark/dflash2.cu
+ create mode 100644 zig/src/families/muse_spark/dflash2.zig
+ create mode 100644 zig/src/families/muse_spark/dflash2_config.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 526a3041..2633d6a8 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -56,6 +56,7 @@ const kernels = [_]Kernel{
+     .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // full attention on an 8-bit cache
+     .{ .name = "muse_glue", .src = "muse_spark/glue", .flags = glue }, // Muse Spark: norms, gates, router, expert sums, head
+     .{ .name = "muse_attention", .src = "muse_spark/attention", .flags = &.{"-O3"} }, // Muse Spark: head_dim 64 decode attention
++    .{ .name = "muse_dflash2", .src = "muse_spark/dflash2", .flags = glue }, // Muse Spark: DFlash2 drafter convs, top-k, selector walk
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/kernels/cuda/muse_spark/dflash2.cu b/zig/kernels/cuda/muse_spark/dflash2.cu
+new file mode 100644
+index 00000000..887f9a7a
+--- /dev/null
++++ b/zig/kernels/cuda/muse_spark/dflash2.cu
+@@ -0,0 +1,217 @@
++// Muse Spark's DFlash2 drafter (RadixArk/Muse-Spark-Open-DFlash2): the ops MiMo's DFlash kernels (mimo_v2/dflash.cu)
++// do not have. Semantics: the reference trainer's model.py (z-lab/dflash DFlash2DraftModel), docs/ZIG-MUSE.md.
++//   dfl_dense:       a small 16-bit matrix (rows [N, K], HF layout) times fp16 rows (the selector's hidden projection)
++//   dfl_conv_prep:   GroupedDynamicCausalConv.prepare over each stream's block rows (base + dynamic weight per tap)
++//   dfl_conv_finish: .finish on the sublayer output (the ranks' partials summed in rank order), added to the residual
++//   dfl_silu_mul:    fp16(silu(g) * u)
++//   dfl_topk:        a rank's top 16 of its head slice (scaled and softcapped logits), values and global ids
++//   dfl_walk:        the candidate selector's greedy walk over the ranks' merged top 16, one stream a block
++// A drafter only proposes (the target verifies every token): fp32 arithmetic, not torch's bits. Glue flags.
++
++#include <cstdint>
++#include <cuda_fp16.h>
++#include <math_constants.h>
++
++namespace {
++
++__device__ __forceinline__ float warp_sum(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    return v;
++}
++
++__device__ __forceinline__ float w16(const uint16_t* p, int64_t i, int bf16) {
++    const uint16_t b = p[i];
++    return bf16 ? __uint_as_float(((uint32_t)b) << 16) : __half2float(__ushort_as_half(b));
++}
++
++constexpr int TOPK = 16;
++
++// a beats b: the larger value, ties to the lower id
++__device__ __forceinline__ bool beats(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
++
++}  // namespace
++
++// out[r, j] = sum_k x[r, k] * W[j, k]: x fp16 [n, K], W [N, K] fp16 or bf16 (w_bf16), out fp32 or fp16 (out_f32).
++// Grid (ceil(N / 8), ceil(n / 8)), 256 threads: warp w the output j = blockIdx.x * 8 + w, for 8 rows.
++extern "C" __global__ void dfl_dense(const __half* __restrict__ x, const uint16_t* __restrict__ W, int w_bf16,
++                                     void* __restrict__ out, int out_f32, int n, int K, int N) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int j = blockIdx.x * 8 + warp, r0 = blockIdx.y * 8;
++    if (j >= N) return;
++    float acc[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
++    for (int k = lane; k < K; k += 32) {
++        const float w = w16(W, (int64_t)j * K + k, w_bf16);
++#pragma unroll
++        for (int i = 0; i < 8; ++i)
++            if (r0 + i < n) acc[i] += w * __half2float(x[(int64_t)(r0 + i) * K + k]);
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const float s = warp_sum(acc[i]);
++        if (lane == 0 && r0 + i < n) {
++            if (out_f32) ((float*)out)[(int64_t)(r0 + i) * N + j] = s;
++            else ((__half*)out)[(int64_t)(r0 + i) * N + j] = __float2half_rn(s);
++        }
++    }
++}
++
++// GroupedDynamicCausalConv.prepare: rows r = s * B + b (stream s, block row b), channels c of D, G = D / gs groups.
++// out[r, c] = fp16(sum_{t < KT, b >= t} (base[t, c] + dyn[r, 0, t, c / gs]) * h[r - t, c]). dyn fp16 [n, 2, KT, G]
++// (the kernel projection of h), base fp32 [KT, D] (base_kernel[0]). A block a row.
++extern "C" __global__ void dfl_conv_prep(const __half* __restrict__ h, const __half* __restrict__ dyn,
++                                         const float* __restrict__ base, __half* __restrict__ out, int B, int D, int KT,
++                                         int gs) {
++    const int r = blockIdx.x, b = r % B, G = D / gs;
++    const __half* dr = dyn + (int64_t)r * 2 * KT * G;
++    for (int c = threadIdx.x; c < D; c += blockDim.x) {
++        float acc = 0.f;
++        for (int t = 0; t < KT && t <= b; ++t) {
++            const float w = base[t * D + c] + __half2float(dr[t * G + c / gs]);
++            acc += w * __half2float(h[(int64_t)(r - t) * D + c]);
++        }
++        out[(int64_t)r * D + c] = __float2half_rn(acc);
++    }
++}
++
++// GroupedDynamicCausalConv.finish with the residual add: y = y0 (+ y1) fp32 [n, D] (the sublayer's partials, rank
++// order); res[r, c] += sum_{t < KT, b >= t} (base[t, c] + dyn[r, 1, t, c / gs]) * y[r - t, c]. base = base_kernel[1].
++extern "C" __global__ void dfl_conv_finish(float* __restrict__ res, const float* __restrict__ y0,
++                                           const float* __restrict__ y1, const __half* __restrict__ dyn,
++                                           const float* __restrict__ base, int B, int D, int KT, int gs) {
++    const int r = blockIdx.x, b = r % B, G = D / gs;
++    const __half* dr = dyn + (int64_t)r * 2 * KT * G + KT * G;
++    for (int c = threadIdx.x; c < D; c += blockDim.x) {
++        float acc = 0.f;
++        for (int t = 0; t < KT && t <= b; ++t) {
++            const int64_t at = (int64_t)(r - t) * D + c;
++            const float y = y1 ? y0[at] + y1[at] : y0[at];
++            acc += (base[t * D + c] + __half2float(dr[t * G + c / gs])) * y;
++        }
++        res[(int64_t)r * D + c] += acc;
++    }
++}
++
++// out = fp16(silu(g) * u), n elements (GatedMLP's interm in fp16).
++extern "C" __global__ void dfl_silu_mul(const __half* __restrict__ g, const __half* __restrict__ u,
++                                        __half* __restrict__ out, int64_t n) {
++    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
++        const float x = __half2float(g[i]);
++        out[i] = __float2half_rn(x / (1.f + expf(-x)) * __half2float(u[i]));
++    }
++}
++
++// A rank's top 16 of each row of its head slice: head fp32 [n, w] (scaled and softcapped), columns [0, valid) real
++// tokens with global ids lo + column. out fp32 [n, 32]: the 16 values (descending), then their ids as int bits.
++// A block a row, 256 threads: each keeps its own sorted 16, then 16 block-wide picks of the best head.
++extern "C" __global__ void __launch_bounds__(256) dfl_topk(const float* __restrict__ head, int w, int valid, int lo,
++                                                           float* __restrict__ out) {
++    __shared__ float hv[256];
++    __shared__ int hi[256];
++    __shared__ int ht[256];
++    const int r = blockIdx.x, t = threadIdx.x;
++    float v[TOPK];
++    int id[TOPK];
++#pragma unroll
++    for (int k = 0; k < TOPK; ++k) {
++        v[k] = -CUDART_INF_F;
++        id[k] = 0x7fffffff;
++    }
++    const float* row = head + (int64_t)r * w;
++    for (int c = t; c < valid; c += 256) {
++        const float x = row[c];
++        const int g = lo + c;
++        if (!beats(x, g, v[TOPK - 1], id[TOPK - 1])) continue;
++        int k = TOPK - 1;
++        while (k > 0 && beats(x, g, v[k - 1], id[k - 1])) {
++            v[k] = v[k - 1];
++            id[k] = id[k - 1];
++            --k;
++        }
++        v[k] = x;
++        id[k] = g;
++    }
++    int ptr = 0;
++    for (int pick = 0; pick < TOPK; ++pick) {
++        hv[t] = ptr < TOPK ? v[ptr] : -CUDART_INF_F;
++        hi[t] = ptr < TOPK ? id[ptr] : 0x7fffffff;
++        ht[t] = t;
++        __syncthreads();
++        for (int o = 128; o > 0; o >>= 1) {
++            if (t < o && beats(hv[t + o], hi[t + o], hv[t], hi[t])) {
++                hv[t] = hv[t + o];
++                hi[t] = hi[t + o];
++                ht[t] = ht[t + o];
++            }
++            __syncthreads();
++        }
++        if (t == 0) {
++            out[(int64_t)r * 2 * TOPK + pick] = hv[0];
++            out[(int64_t)r * 2 * TOPK + TOPK + pick] = __int_as_float(hi[0]);
++        }
++        const int won = ht[0];
++        __syncthreads();
++        if (t == won) ++ptr;
++    }
++}
++
++// CandidateSelector.select, greedy: a block per stream s (512 threads, warp k = candidate k). Draft position i is
++// row s * P + i of the gathered top 16s (recv [W, n1, 32]) and of gate fp16 [n1, R] (hidden_projection of the draft
++// state). Candidates: the best 16 of the ranks' 16 each; score_k = unary_k + sum_r (pcb[a, r] * gate[r]) * scb[c_k, r]
++// with a the previous path token (the anchor first); the first maximum wins. Codebooks [V, R], bf16 or fp16.
++extern "C" __global__ void __launch_bounds__(512) dfl_walk(const float* __restrict__ recv, int W, int n1,
++                                                           const __half* __restrict__ gate, int R,
++                                                           const uint16_t* __restrict__ pcb,
++                                                           const uint16_t* __restrict__ scb, int cb_bf16,
++                                                           const int64_t* __restrict__ anchors, int P,
++                                                           int32_t* __restrict__ out) {
++    __shared__ float cv[TOPK];
++    __shared__ int cid[TOPK];
++    __shared__ float sc[TOPK];
++    __shared__ int pred;
++    const int s = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (threadIdx.x == 0) pred = (int)anchors[s];
++    for (int i = 0; i < P; ++i) {
++        const int row = s * P + i;
++        if (threadIdx.x == 0) {
++            float av[64];
++            int ai[64];
++            const int m = W * TOPK;
++            for (int q = 0; q < W; ++q)
++                for (int j = 0; j < TOPK; ++j) {
++                    const float* src = recv + ((int64_t)q * n1 + row) * 2 * TOPK;
++                    av[q * TOPK + j] = src[j];
++                    ai[q * TOPK + j] = __float_as_int(src[TOPK + j]);
++                }
++            for (int k = 0; k < TOPK; ++k) {
++                int best = -1;
++                for (int j = 0; j < m; ++j)
++                    if (ai[j] != -1 && (best < 0 || beats(av[j], ai[j], av[best], ai[best]))) best = j;
++                cv[k] = av[best];
++                cid[k] = ai[best];
++                ai[best] = -1;
++            }
++        }
++        __syncthreads();
++        if (warp < TOPK) {
++            const int c = cid[warp], a = pred;
++            const __half* g = gate + (int64_t)row * R;
++            float acc = 0.f;
++            for (int k = lane; k < R; k += 32)
++                acc += (w16(pcb, (int64_t)a * R + k, cb_bf16) * __half2float(g[k])) * w16(scb, (int64_t)c * R + k, cb_bf16);
++            acc = warp_sum(acc);
++            if (lane == 0) sc[warp] = cv[warp] + acc;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            int best = 0;
++            for (int k = 1; k < TOPK; ++k)
++                if (sc[k] > sc[best]) best = k;
++            pred = cid[best];
++            out[row] = pred;
++        }
++        __syncthreads();
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index c65be75f..f0b1dc82 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -47,6 +47,7 @@ pub const mimo_dflash: []const u8 = if (available) &Blob("fatbin_mimo_dflash").b
+ pub const mimo_kv8: []const u8 = if (available) &Blob("fatbin_mimo_kv8").bytes else &.{};
+ pub const muse_glue: []const u8 = if (available) &Blob("fatbin_muse_glue").bytes else &.{};
+ pub const muse_attention: []const u8 = if (available) &Blob("fatbin_muse_attention").bytes else &.{};
++pub const muse_dflash2: []const u8 = if (available) &Blob("fatbin_muse_dflash2").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+diff --git a/zig/src/families/muse_spark/dflash2.zig b/zig/src/families/muse_spark/dflash2.zig
+new file mode 100644
+index 00000000..1c691a24
+--- /dev/null
++++ b/zig/src/families/muse_spark/dflash2.zig
+@@ -0,0 +1,618 @@
++//! Muse Spark's DFlash2 drafter (RadixArk/Muse-Spark-Open-DFlash2) as an EXL3 pack, fed from inside the target's run
++//! (residual taps after its target_layer_ids, then the context K/V update), its draft pass graph-capturable per stream
++//! count. Under TP=2 it is split like the target (q / o by heads, k / v by KV heads, MLP by width, fc by outputs):
++//! ~1.15 GB of reads a rank a pass at 4 bpw against ~2.2 GB replicated, for 11 small all-gathers (docs/ZIG-MUSE.md).
++//! Reuses MiMo-V2's DFlash kernels (embed, taps, per-head norm + RoPE, cache stores, block attention, row take).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const mimo = @import("mimo_v2");
++const fwd = @import("forward.zig");
++const load_ = @import("load.zig");
++const dc = @import("dflash2_config.zig");
++const exl3 = cuda.exl3;
++const ml = mimo.load;
++const Stream = cuda.Stream;
++
++pub const MAX_STREAMS = 16; // a draft pass's streams: 16 x block 8 = the EXL3 GEMV's 128 rows
++
++fn u(x: usize) u32 {
++    return @intCast(x);
++}
++fn ci(x: usize) c_int {
++    return @intCast(x);
++}
++
++/// A matrix: EXL3 (the drafter pack's quantised linears) or 16-bit dense rows [N, K] (an unquantised Linear).
++const Lin = union(enum) {
++    q: exl3.Linear,
++    dense: struct { w: u64, n: usize, k: usize, bf16: bool },
++
++    fn n(l: Lin) usize {
++        return switch (l) {
++            .q => |x| x.n,
++            .dense => |x| x.n,
++        };
++    }
++};
++
++const Conv = struct { proj: Lin, base: u64 }; // base fp32 [2, KT, D]
++
++const DLayer = struct {
++    in_norm: u64,
++    post_norm: u64,
++    q_norm: u64,
++    k_norm: u64,
++    q: exl3.Linear,
++    k: exl3.Linear,
++    v: exl3.Linear,
++    o: exl3.Linear,
++    gate: exl3.Linear,
++    up: exl3.Linear,
++    down: exl3.Linear,
++    aconv: Conv,
++    mconv: Conv,
++};
++
++pub const Drafter = struct {
++    m: *fwd.Model,
++    d: *const cuda.Driver,
++    gpa: std.mem.Allocator,
++    mod_m: cuda.Module, // mimo_dflash
++    mod: cuda.Module, // muse_dflash2
++    f: struct { embed: cuda.Function, tap: cuda.Function, norm_rope: cuda.Function, store: cuda.Function, attn: cuda.Function, take: cuda.Function },
++    g: struct { dense: cuda.Function, prep: cuda.Function, finish: cuda.Function, silu: cuda.Function, topk: cuda.Function, walk: cuda.Function },
++    arena: load_.Arena,
++    full: dc.DConfig,
++    c: dc.DConfig, // this rank's view
++    block: usize,
++    taps: []usize,
++    ring: usize,
++    scale: f32,
++    streams: usize,
++    graphs_on: bool,
++    fc: exl3.Linear,
++    fc_norm: u64,
++    layers: []DLayer,
++    norm: u64,
++    mask_emb: u64, // fp32 [D]: the target's embedding row of mask_token_id (raw: the reference skips embed_norm)
++    sel: Lin, // candidate_selector.hidden_projection [rank, D]
++    pcb: u64,
++    scb: u64,
++    cb_bf16: bool,
++    kc: []u64,
++    vc: []u64,
++    cos: u64,
++    sin: u64,
++    b: struct { tapbuf: u64, ctx16: u64, ctxg: u64, ctx: u64, kb: u64, vb: u64, xh: u64, z: u64, x32: u64, h: u64, c16: u64, dyn: u64, q16: u64, q32: u64, a: u64, part: u64, recv: u64, gb: u64, ub: u64, mm: u64, tk: u64, head: u64, top: u64, topg: u64, sg: u64, am: u64, in_tok: u64, in_pos0: u64, in_slot: u64, rpos: u64, rslot: u64 },
++    drafts: usize = 0,
++    graphs: [MAX_STREAMS + 1]?cuda.graph.Exec = @splat(null),
++
++    /// The drafter pack at `dir` (config.json + EXL3 safetensors, mul1) on this rank of the target's TP world.
++    /// `taps_override`: target layers to tap instead of the config's (plumbing checks on k-layer packs only).
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8, s: Stream, graphs_on: bool, taps_override: ?[]const usize) !*Drafter {
++        const d = m.d;
++        const w = m.w;
++        const text = try readFile(gpa, io, dir, "config.json");
++        defer gpa.free(text);
++        const full = try dc.DConfig.parse(gpa, text);
++        if (full.hidden != w.full.hidden) return error.HiddenMismatch;
++        if (full.vocab != w.full.vocab or full.mask_id >= w.full.vocab) return error.VocabMismatch;
++        // the target head already applies output_multiplier and the softcap (muse_softcap): the same, applied once
++        if (!near(full.out_mult, w.full.out_mult) or !near(full.softcap, w.full.softcap)) return error.HeadScaleMismatch;
++        const c = try full.rankView(w.world);
++        const dr = try gpa.create(Drafter);
++        errdefer gpa.destroy(dr);
++        dr.* = undefined;
++        dr.m = m;
++        dr.d = d;
++        dr.gpa = gpa;
++        dr.full = full;
++        dr.c = c;
++        dr.drafts = 0;
++        dr.graphs = @splat(null);
++        dr.graphs_on = graphs_on;
++        dr.block = full.block;
++        dr.ring = m.ring;
++        if (dr.ring < full.window + 2 * full.block) return error.RingShorterThanWindow;
++        dr.scale = @floatCast(std.math.pow(f64, @floatFromInt(full.head_dim), -0.5));
++        dr.streams = @min(m.slots, MAX_STREAMS);
++        const tl = taps_override orelse full.tapList();
++        if (tl.len != full.ntaps) return error.TapCount; // fc's input width is fixed by the checkpoint
++        dr.taps = try gpa.dupe(usize, tl);
++        errdefer gpa.free(dr.taps);
++        for (dr.taps, 0..) |t, i| if (t >= w.layers.len or (i > 0 and t < dr.taps[i - 1])) return error.TapPastLastLayer;
++        dr.mod_m = try cuda.Module.load(d, cuda.kernels.mimo_dflash);
++        errdefer dr.mod_m.unload();
++        dr.mod = try cuda.Module.load(d, cuda.kernels.muse_dflash2);
++        errdefer dr.mod.unload();
++        dr.f = .{ .embed = try dr.mod_m.function("dr_block_embed"), .tap = try dr.mod_m.function("dr_tap"), .norm_rope = try dr.mod_m.function("dr_norm_rope"), .store = try dr.mod_m.function("dr_store"), .attn = try dr.mod_m.function("dr_attn"), .take = try dr.mod_m.function("dr_take") };
++        dr.g = .{ .dense = try dr.mod.function("dfl_dense"), .prep = try dr.mod.function("dfl_conv_prep"), .finish = try dr.mod.function("dfl_conv_finish"), .silu = try dr.mod.function("dfl_silu_mul"), .topk = try dr.mod.function("dfl_topk"), .walk = try dr.mod.function("dfl_walk") };
++        dr.arena = .{ .d = d, .gpa = gpa };
++        errdefer dr.arena.deinit();
++        try dr.loadWeights(io, dir);
++        errdefer gpa.free(dr.layers);
++        try dr.allocState(s);
++        errdefer {
++            gpa.free(dr.kc);
++            gpa.free(dr.vc);
++        }
++        try s.synchronize();
++        return dr;
++    }
++
++    pub fn deinit(dr: *Drafter) void {
++        const gpa = dr.gpa;
++        for (&dr.graphs) |*g| if (g.*) |*e| {
++            e.deinit();
++            g.* = null;
++        };
++        gpa.free(dr.taps);
++        gpa.free(dr.layers);
++        gpa.free(dr.kc);
++        gpa.free(dr.vc);
++        dr.mod.unload();
++        dr.mod_m.unload();
++        dr.arena.deinit();
++        gpa.destroy(dr);
++    }
++
++    fn loadWeights(dr: *Drafter, io: std.Io, dir: []const u8) !void {
++        const gpa = dr.gpa;
++        const ar = &dr.arena;
++        const full = dr.full;
++        const rank = dr.m.w.rank;
++        const world = dr.m.w.world;
++        var ck = try core.Checkpoint.openModel(gpa, io, dir);
++        defer ck.close();
++        dr.fc = try ml.linear(gpa, ar, try ml.cut(gpa, try ml.readMat(gpa, &ck, "fc"), load_.mc(dc.fcCut(full, rank, world))));
++        if (dr.fc.k != full.ntaps * full.hidden) return error.FcWidth;
++        dr.fc_norm = try f32Up(gpa, ar, try ck.get("hidden_norm.weight"));
++        dr.norm = try f32Up(gpa, ar, try ck.get("norm.weight"));
++        dr.sel = try lin(gpa, ar, &ck, "candidate_selector.hidden_projection", .{ .prefix = "candidate_selector.hidden_projection" });
++        if (dr.sel.n() != full.sel_rank) return error.SelectorShape;
++        const pc = try codebook(&ck, "candidate_selector.predecessor_codebook");
++        const sc = try codebook(&ck, "candidate_selector.successor_codebook");
++        for ([_]core.safetensors.Tensor{ pc, sc }) |t| if (t.rank != 2 or t.shape[0] != full.vocab or t.shape[1] != full.sel_rank or t.dtype != pc.dtype or (t.dtype != .bf16 and t.dtype != .f16)) return error.CodebookShape;
++        dr.cb_bf16 = pc.dtype == .bf16;
++        dr.pcb = try ar.upload(pc.bytes);
++        dr.scb = try ar.upload(sc.bytes);
++        dr.layers = try gpa.alloc(DLayer, full.layers);
++        errdefer gpa.free(dr.layers);
++        var nb: [160]u8 = undefined;
++        var pb: [160]u8 = undefined;
++        for (dr.layers, 0..) |*L, i| {
++            L.in_norm = try f32Up(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "layers.{d}.input_layernorm.weight", .{i})));
++            L.post_norm = try f32Up(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "layers.{d}.post_attention_layernorm.weight", .{i})));
++            L.q_norm = try f32Up(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "layers.{d}.self_attn.q_norm.weight", .{i})));
++            L.k_norm = try f32Up(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "layers.{d}.self_attn.k_norm.weight", .{i})));
++            inline for (.{ "q", "k", "v", "o", "gate", "up", "down" }, 0..) |f, j| {
++                const prefix = try std.fmt.bufPrint(&pb, "layers.{d}.{s}", .{ i, dc.mat_names[j] });
++                const cut = dc.layerCut(full, @fromBackingInt(@intCast(j)), prefix, rank, world);
++                @field(L, f) = try ml.linear(gpa, ar, try ml.cut(gpa, try ml.readMat(gpa, &ck, prefix), load_.mc(cut)));
++            }
++            inline for (.{ "aconv", "mconv" }, .{ "attention_conv", "mlp_conv" }, 7..) |f, cname, j| {
++                const prefix = try std.fmt.bufPrint(&pb, "layers.{d}.{s}", .{ i, dc.mat_names[j] });
++                @field(L, f).proj = try lin(gpa, ar, &ck, prefix, .{ .prefix = prefix });
++                if (@field(L, f).proj.n() != 2 * full.conv_k * (full.hidden / full.conv_g)) return error.ConvShape;
++                const bt = try ck.get(try std.fmt.bufPrint(&nb, "layers.{d}.{s}.base_kernel", .{ i, cname }));
++                if (bt.numel() != 2 * full.conv_k * full.hidden) return error.ConvShape;
++                @field(L, f).base = try f32Up(gpa, ar, bt);
++            }
++        }
++        // the mask rows: a shipped mask_embedding, else the target's (raw) embedding row of mask_token_id
++        if (ck.get("mask_embedding")) |t| {
++            dr.mask_emb = try f32Up(gpa, ar, t);
++        } else |_| {
++            const D = full.hidden;
++            const row = try gpa.alloc(u16, D);
++            defer gpa.free(row);
++            try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(@ptrCast(row.ptr), dr.m.w.embed + full.mask_id * D * 2, D * 2), "mask row");
++            const f = try gpa.alloc(f32, D);
++            defer gpa.free(f);
++            for (row, f) |x, *o| o.* = @bitCast(@as(u32, x) << 16);
++            dr.mask_emb = try ar.upload(std.mem.sliceAsBytes(f));
++        }
++    }
++
++    fn allocState(dr: *Drafter, s: Stream) !void {
++        const gpa = dr.gpa;
++        const ar = &dr.arena;
++        const m = dr.m;
++        const c = dr.c;
++        const D = c.hidden;
++        const L = dr.layers.len;
++        dr.kc = try gpa.alloc(u64, L);
++        errdefer gpa.free(dr.kc);
++        dr.vc = try gpa.alloc(u64, L);
++        errdefer gpa.free(dr.vc);
++        for (0..L) |i| {
++            dr.kc[i] = try ar.zeros(m.slots * dr.ring * c.kv_heads * 128 * 2);
++            dr.vc[i] = try ar.zeros(m.slots * dr.ring * c.kv_heads * 128 * 2);
++        }
++        const tlen = m.context + dr.block;
++        dr.cos = try ar.alloc(tlen * 64 * 4);
++        dr.sin = try ar.alloc(tlen * 64 * 4);
++        {
++            const f = try m.glue.function("muse_rope_tables");
++            var a: cuda.Args = .{};
++            a.add(dr.cos);
++            a.add(dr.sin);
++            a.add(ci(tlen));
++            a.add(c.theta);
++            a.add(ci(128));
++            try cuda.launch.launch(f, .{ .grid = .{ .x = 256, .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        }
++        const R = m.rows;
++        const SB = dr.streams * dr.block;
++        const RR = @max(R, SB);
++        const S1 = dr.streams * (dr.block - 1);
++        const W = m.w.world;
++        const HQ = c.heads * 128;
++        const HK = c.kv_heads * 128;
++        const vr = m.w.head.n;
++        var max_z: usize = @max(zBytes(dr.fc, R), zBytes(m.w.head, S1));
++        for (dr.layers) |ly| {
++            inline for (.{ "q", "k", "v", "o", "gate", "up", "down" }) |f| max_z = @max(max_z, zBytes(@field(ly, f), RR));
++            for ([_]Lin{ ly.aconv.proj, ly.mconv.proj }) |p| if (p == .q) {
++                max_z = @max(max_z, zBytes(p.q, SB));
++            };
++        }
++        if (dr.sel == .q) max_z = @max(max_z, zBytes(dr.sel.q, S1));
++        var b = &dr.b;
++        b.tapbuf = try ar.zeros(R * dr.taps.len * D * 2);
++        b.ctx16 = try ar.zeros(R * dr.fc.n * 2);
++        b.ctxg = if (W > 1) try ar.zeros(W * R * dr.fc.n * 2) else 0;
++        b.ctx = try ar.zeros(R * D * 2);
++        b.kb = try ar.zeros(RR * HK * 2);
++        b.vb = try ar.zeros(RR * HK * 2);
++        b.xh = try ar.zeros(RR * @max(dr.taps.len * D, @max(c.inter, HQ)) * 2);
++        b.z = try ar.zeros(@max(max_z, 4));
++        b.x32 = try ar.zeros(SB * D * 4);
++        b.h = try ar.zeros(SB * D * 2);
++        b.c16 = try ar.zeros(SB * D * 2);
++        b.dyn = try ar.zeros(SB * dr.layers[0].aconv.proj.n() * 2);
++        b.q16 = try ar.zeros(SB * HQ * 2);
++        b.q32 = try ar.zeros(SB * HQ * 4);
++        b.a = try ar.zeros(SB * HQ * 2);
++        b.part = try ar.zeros(SB * D * 4);
++        b.recv = if (W > 1) try ar.zeros(W * SB * D * 4) else 0;
++        b.gb = try ar.zeros(SB * c.inter * 2);
++        b.ub = try ar.zeros(SB * c.inter * 2);
++        b.mm = try ar.zeros(SB * c.inter * 2);
++        b.tk = try ar.zeros(S1 * D * 2);
++        b.head = try ar.zeros(S1 * vr * 4);
++        b.top = try ar.zeros(S1 * 32 * 4);
++        b.topg = if (W > 1) try ar.zeros(W * S1 * 32 * 4) else 0;
++        b.sg = try ar.zeros(S1 * c.sel_rank * 2);
++        b.am = try ar.zeros(S1 * 4);
++        b.in_tok = try ar.zeros(dr.streams * 8);
++        b.in_pos0 = try ar.zeros(dr.streams * 4);
++        b.in_slot = try ar.zeros(dr.streams * 4);
++        b.rpos = try ar.zeros(SB * 4);
++        b.rslot = try ar.zeros(SB * 4);
++    }
++
++    /// Device bytes the drafter holds on this rank (weights, caches, scratch).
++    pub fn bytes(dr: *const Drafter) usize {
++        return dr.arena.total;
++    }
++
++    fn zBytes(l: exl3.Linear, R: usize) usize {
++        return if (l.split[0] > 1) l.split[0] * R * l.n * 4 else 0;
++    }
++
++    fn proj(dr: *Drafter, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
++        try dr.m.k3.linear(s, l, x, .f16, dr.b.xh, out, if (out_f32) .f32 else .f16, if (l.split[0] > 1) dr.b.z else 0, n);
++    }
++
++    fn projL(dr: *Drafter, s: Stream, l: Lin, x: u64, out: u64, out_f32: bool, n: usize) !void {
++        switch (l) {
++            .q => |q| try dr.proj(s, q, x, out, out_f32, n),
++            .dense => |w| {
++                var a: cuda.Args = .{};
++                a.add(x);
++                a.add(w.w);
++                a.add(@as(c_int, @intFromBool(w.bf16)));
++                a.add(out);
++                a.add(@as(c_int, @intFromBool(out_f32)));
++                a.add(ci(n));
++                a.add(ci(w.k));
++                a.add(ci(w.n));
++                try launch(dr.g.dense, s, (w.n + 7) / 8, (n + 7) / 8, 256, &a);
++            },
++        }
++    }
++
++    /// muse_rms: out fp16 = x * rsqrt(mean x^2 + eps) * w; parts > 0: x is the ranks' gathered column slices.
++    fn rms(dr: *Drafter, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, parts: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(@as(c_int, @intFromBool(x_half)));
++        a.add(w);
++        a.add(out);
++        a.add(ci(dr.c.hidden));
++        a.add(@as(f32, @floatCast(dr.c.eps)));
++        a.add(ci(parts));
++        try launch(dr.m.f_rms, s, n, 1, fwd.NORM_THREADS, &a);
++    }
++
++    fn launch(f: cuda.Function, s: Stream, gx: usize, gy: usize, threads: usize, a: *cuda.Args) !void {
++        try cuda.launch.launch(f, .{ .grid = .{ .x = u(gx), .y = u(gy), .z = 1 }, .block = .{ .x = u(threads), .y = 1, .z = 1 } }, s, a);
++    }
++
++    /// The target's tap: residual rows after target layer `layer` (when tapped) into the tap buffer (fp16).
++    pub fn tap(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize) !void {
++        for (dr.taps, 0..) |t, j| if (t == layer) {
++            var a: cuda.Args = .{};
++            a.add(res);
++            a.add(dr.b.tapbuf);
++            a.add(ci(dr.c.hidden));
++            a.add(ci(dr.taps.len));
++            a.add(ci(j));
++            try launch(dr.f.tap, s, n, 1, 256, &a);
++        };
++    }
++
++    /// The context update of the target's n rows (positions / slots staged in its buffers): fc, hidden_norm, then each
++    /// layer's k (k_norm, RoPE at the row's position) and v into the window ring.
++    pub fn update(dr: *Drafter, s: Stream, n: usize) !void {
++        const m = dr.m;
++        try dr.proj(s, dr.fc, dr.b.tapbuf, dr.b.ctx16, false, n);
++        if (m.comm) |comm| {
++            try comm.allGather(dr.b.ctx16, dr.b.ctxg, n * dr.fc.n, .f16, s.handle);
++            try dr.rms(s, dr.b.ctxg, true, dr.fc_norm, dr.b.ctx, n, dr.fc.n);
++        } else try dr.rms(s, dr.b.ctx16, true, dr.fc_norm, dr.b.ctx, n, 0);
++        for (dr.layers, 0..) |L, i| {
++            try dr.proj(s, L.k, dr.b.ctx, dr.b.kb, false, n);
++            try dr.normRope(s, dr.b.kb, L.k_norm, m.b.pos, m.b.slot, 0, dr.kc[i], dr.c.kv_heads, n);
++            try dr.proj(s, L.v, dr.b.ctx, dr.b.vb, false, n);
++            try dr.store(s, dr.b.vb, m.b.pos, m.b.slot, dr.vc[i], n);
++        }
++    }
++
++    fn normRope(dr: *Drafter, s: Stream, in: u64, w: u64, pos: u64, slot: u64, out32: u64, cache: u64, nh: usize, n: usize) !void {
++        var a: cuda.Args = .{};
++        inline for (.{ in, w, dr.cos, dr.sin, pos, slot, out32, cache }) |p| a.add(p);
++        a.add(ci(nh));
++        a.add(ci(128));
++        a.add(ci(dr.ring));
++        a.add(@as(f32, @floatCast(dr.c.eps)));
++        try launch(dr.f.norm_rope, s, n, nh, 128, &a);
++    }
++
++    fn store(dr: *Drafter, s: Stream, in: u64, pos: u64, slot: u64, cache: u64, n: usize) !void {
++        var a: cuda.Args = .{};
++        inline for (.{ in, pos, slot, cache }) |p| a.add(p);
++        a.add(ci(dr.c.kv_heads));
++        a.add(ci(dr.ring));
++        try launch(dr.f.store, s, n, 1, 256, &a);
++    }
++
++    /// conv.prepare on h: the kernel projection into dyn, the first convolution into c16.
++    fn convPrep(dr: *Drafter, s: Stream, cv: Conv, n: usize) !void {
++        try dr.projL(s, cv.proj, dr.b.h, dr.b.dyn, false, n);
++        var a: cuda.Args = .{};
++        inline for (.{ dr.b.h, dr.b.dyn, cv.base, dr.b.c16 }) |p| a.add(p);
++        a.add(ci(dr.block));
++        a.add(ci(dr.c.hidden));
++        a.add(ci(dr.c.conv_k));
++        a.add(ci(dr.c.conv_g));
++        try launch(dr.g.prep, s, n, 1, 256, &a);
++    }
++
++    /// The sublayer's fp32 partials (part) gathered, summed in rank order, convolved (conv.finish) into the residual.
++    fn convFinish(dr: *Drafter, s: Stream, cv: Conv, n: usize) !void {
++        const D = dr.c.hidden;
++        var y0 = dr.b.part;
++        var y1: u64 = 0;
++        if (dr.m.comm) |comm| {
++            try comm.allGather(dr.b.part, dr.b.recv, n * D, .f32, s.handle);
++            y0 = dr.b.recv;
++            y1 = dr.b.recv + n * D * 4;
++        }
++        var a: cuda.Args = .{};
++        inline for (.{ dr.b.x32, y0, y1, dr.b.dyn, cv.base + dr.c.conv_k * D * 4 }) |p| a.add(p);
++        a.add(ci(dr.block));
++        a.add(ci(D));
++        a.add(ci(dr.c.conv_k));
++        a.add(ci(dr.c.conv_g));
++        try launch(dr.g.finish, s, n, 1, 256, &a);
++    }
++
++    /// Stage a draft: each stream's pending (anchor) token, its position and slot (the draft pass's fixed inputs).
++    pub fn stage(dr: *Drafter, tokens: []const i64, pos0: []const u32, slots: []const u32) !void {
++        const S = tokens.len;
++        if (S == 0 or S > dr.streams) return error.TooManyStreams;
++        var pz: [MAX_STREAMS]i32 = undefined;
++        var sz: [MAX_STREAMS]i32 = undefined;
++        var rp: [MAX_STREAMS * 16]i32 = undefined;
++        var rs: [MAX_STREAMS * 16]i32 = undefined;
++        for (0..S) |i| {
++            if (pos0[i] >= dr.m.context) return error.PastContext;
++            if (slots[i] >= dr.m.slots) return error.BadSlot;
++            if (tokens[i] < 0 or tokens[i] >= dr.full.vocab) return error.BadToken;
++            pz[i] = @intCast(pos0[i]);
++            sz[i] = @intCast(slots[i]);
++            for (0..dr.block) |b| {
++                rp[i * dr.block + b] = @intCast(pos0[i] + b);
++                rs[i * dr.block + b] = @intCast(slots[i]);
++            }
++        }
++        const d = dr.d;
++        try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_tok, std.mem.sliceAsBytes(tokens).ptr, S * 8), "draft in");
++        try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_pos0, @ptrCast(&pz), S * 4), "draft in");
++        try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_slot, @ptrCast(&sz), S * 4), "draft in");
++        try d.check(d.api.cuMemcpyHtoD_v2(dr.b.rpos, @ptrCast(&rp), S * dr.block * 4), "draft in");
++        try d.check(d.api.cuMemcpyHtoD_v2(dr.b.rslot, @ptrCast(&rs), S * dr.block * 4), "draft in");
++    }
++
++    /// The draft pass on staged inputs for S streams, kernels only: drafts [S, block - 1] (int32) left in `am`.
++    pub fn run(dr: *Drafter, s: Stream, S: usize) !void {
++        const m = dr.m;
++        const c = dr.c;
++        const B = dr.block;
++        const n = S * B;
++        const D = c.hidden;
++        const bb = &dr.b;
++        {
++            var a: cuda.Args = .{};
++            inline for (.{ m.w.embed, dr.mask_emb, bb.in_tok, bb.x32 }) |p| a.add(p);
++            a.add(ci(B));
++            a.add(ci(D));
++            try launch(dr.f.embed, s, n, 1, 256, &a);
++        }
++        for (dr.layers, 0..) |L, i| {
++            try dr.rms(s, bb.x32, false, L.in_norm, bb.h, n, 0);
++            try dr.convPrep(s, L.aconv, n);
++            try dr.proj(s, L.q, bb.c16, bb.q16, false, n);
++            try dr.normRope(s, bb.q16, L.q_norm, bb.rpos, bb.rslot, bb.q32, 0, c.heads, n);
++            try dr.proj(s, L.k, bb.c16, bb.kb, false, n);
++            try dr.normRope(s, bb.kb, L.k_norm, bb.rpos, bb.rslot, 0, dr.kc[i], c.kv_heads, n);
++            try dr.proj(s, L.v, bb.c16, bb.vb, false, n);
++            try dr.store(s, bb.vb, bb.rpos, bb.rslot, dr.vc[i], n);
++            {
++                var a: cuda.Args = .{};
++                inline for (.{ bb.q32, dr.kc[i], dr.vc[i], @as(u64, 0), bb.in_pos0, bb.in_slot, bb.a }) |p| a.add(p);
++                a.add(ci(B));
++                a.add(ci(c.window));
++                a.add(ci(dr.ring));
++                a.add(ci(c.heads));
++                a.add(ci(c.kv_heads));
++                a.add(dr.scale);
++                try launch(dr.f.attn, s, n, c.kv_heads, 256, &a); // a block per (row, KV head), a warp per head
++            }
++            try dr.proj(s, L.o, bb.a, bb.part, true, n);
++            try dr.convFinish(s, L.aconv, n);
++            try dr.rms(s, bb.x32, false, L.post_norm, bb.h, n, 0);
++            try dr.convPrep(s, L.mconv, n);
++            try dr.proj(s, L.gate, bb.c16, bb.gb, false, n);
++            try dr.proj(s, L.up, bb.c16, bb.ub, false, n);
++            {
++                var a: cuda.Args = .{};
++                inline for (.{ bb.gb, bb.ub, bb.mm }) |p| a.add(p);
++                a.add(@as(i64, @intCast(n * c.inter)));
++                try launch(dr.g.silu, s, @min((n * c.inter + 255) / 256, 4096), 1, 256, &a);
++            }
++            try dr.proj(s, L.down, bb.mm, bb.part, true, n);
++            try dr.convFinish(s, L.mconv, n);
++        }
++        try dr.rms(s, bb.x32, false, dr.norm, bb.h, n, 0);
++        const n1 = S * (B - 1);
++        {
++            var a: cuda.Args = .{};
++            a.add(bb.h);
++            a.add(bb.tk);
++            a.add(ci(B));
++            a.add(ci(D));
++            try launch(dr.f.take, s, n1, 1, 256, &a);
++        }
++        try dr.headTop(s, n1);
++        try dr.projL(s, dr.sel, bb.tk, bb.sg, false, n1);
++        var a: cuda.Args = .{};
++        a.add(if (m.comm != null) bb.topg else bb.top);
++        a.add(ci(m.w.world));
++        a.add(ci(n1));
++        a.add(bb.sg);
++        a.add(ci(c.sel_rank));
++        inline for (.{ dr.pcb, dr.scb }) |p| a.add(p);
++        a.add(@as(c_int, @intFromBool(dr.cb_bf16)));
++        a.add(bb.in_tok);
++        a.add(ci(B - 1));
++        a.add(bb.am);
++        try launch(dr.g.walk, s, S, 1, 512, &a);
++    }
++
++    /// The target's head on the draft rows (this rank's slice, scaled and softcapped), each rank's top 16, gathered.
++    fn headTop(dr: *Drafter, s: Stream, n1: usize) !void {
++        const m = dr.m;
++        const bb = &dr.b;
++        try dr.proj(s, m.w.head, bb.tk, bb.head, true, n1);
++        const vr = m.w.head.n;
++        {
++            var a: cuda.Args = .{};
++            a.add(bb.head);
++            a.add(@as(i64, @intCast(n1 * vr)));
++            a.add(@as(f32, @floatCast(m.w.full.out_mult)));
++            a.add(@as(f32, @floatCast(m.w.full.softcap)));
++            try launch(m.f_softcap, s, @min((n1 * vr + 255) / 256, 4096), 1, 256, &a);
++        }
++        var a: cuda.Args = .{};
++        a.add(bb.head);
++        a.add(ci(vr));
++        a.add(ci(@min(vr, m.w.full.vocab - m.w.head_lo)));
++        a.add(ci(m.w.head_lo));
++        a.add(bb.top);
++        try launch(dr.g.topk, s, n1, 1, 256, &a);
++        if (m.comm) |comm| try comm.allGather(bb.top, bb.topg, n1 * 32, .f32, s.handle);
++    }
++
++    /// A draft for S streams: drafts [S, block - 1] into `out` (row-major). Graphed per stream count when enabled.
++    pub fn draft(dr: *Drafter, s: Stream, tokens: []const i64, pos0: []const u32, slots: []const u32, out: []i32) !void {
++        try dr.stage(tokens, pos0, slots);
++        const S = tokens.len;
++        if (!dr.graphs_on) {
++            try dr.run(s, S);
++        } else if (dr.graphs[S]) |e| {
++            try e.launchOn(s);
++        } else {
++            try dr.run(s, S); // warm-up: writes the same cache rows the replay will
++            try s.synchronize();
++            try cuda.graph.beginCapture(s, .thread_local);
++            dr.run(s, S) catch |err| {
++                if (cuda.graph.endCapture(s)) |g| {
++                    var gg = g;
++                    gg.deinit();
++                } else |_| {}
++                return err;
++            };
++            var g = try cuda.graph.endCapture(s);
++            defer g.deinit();
++            dr.graphs[S] = try g.instantiate();
++            try dr.graphs[S].?.launchOn(s);
++        }
++        try s.synchronize();
++        const n1 = S * (dr.block - 1);
++        try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), dr.b.am, n1 * 4), "drafts");
++        dr.drafts += 1;
++    }
++};
++
++fn near(a: f64, b: f64) bool {
++    return @abs(a - b) <= 1e-6 * @max(@abs(a), @abs(b));
++}
++
++fn readFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, name });
++    defer gpa.free(path);
++    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++}
++
++fn f32Up(gpa: std.mem.Allocator, ar: *load_.Arena, t: core.safetensors.Tensor) !u64 {
++    const f = try ml.asF32(gpa, t);
++    defer gpa.free(f);
++    return ar.upload(std.mem.sliceAsBytes(f));
++}
++
++/// A replicated matrix: EXL3 when the pack quantised it, else its 16-bit rows (`{prefix}.weight`, [N, K]).
++fn lin(gpa: std.mem.Allocator, ar: *load_.Arena, ck: *core.Checkpoint, prefix: []const u8, cut: @import("config.zig").Cut) !Lin {
++    if (ml.readMat(gpa, ck, prefix)) |mat| {
++        return .{ .q = try ml.linear(gpa, ar, try ml.cut(gpa, mat, load_.mc(cut))) };
++    } else |_| {}
++    var nb: [192]u8 = undefined;
++    const t = try ck.get(try std.fmt.bufPrint(&nb, "{s}.weight", .{prefix}));
++    if (t.rank != 2 or (t.dtype != .bf16 and t.dtype != .f16)) return error.BadDenseMatrix;
++    return .{ .dense = .{ .w = try ar.upload(t.bytes), .n = t.shape[0], .k = t.shape[1], .bf16 = t.dtype == .bf16 } };
++}
++
++/// The selector codebooks: bare keys, or with `.weight` (older trainers), 16-bit.
++fn codebook(ck: *core.Checkpoint, key: []const u8) !core.safetensors.Tensor {
++    if (ck.get(key)) |t| return t else |_| {}
++    var nb: [128]u8 = undefined;
++    return ck.get(try std.fmt.bufPrint(&nb, "{s}.weight", .{key}));
++}
++
++test "drafter modules" {
++    _ = dc;
++}
+diff --git a/zig/src/families/muse_spark/dflash2_config.zig b/zig/src/families/muse_spark/dflash2_config.zig
+new file mode 100644
+index 00000000..21c1907f
+--- /dev/null
++++ b/zig/src/families/muse_spark/dflash2_config.zig
+@@ -0,0 +1,255 @@
++//! RadixArk's DFlash2 drafter for Muse Spark (RadixArk/Muse-Spark-Open-DFlash2): its config and a rank's matrix cuts.
++//! Semantics follow the reference trainer's model.py (z-lab/dflash, DFlash2DraftModel), docs/ZIG-MUSE.md in the recipe.
++
++const std = @import("std");
++const config = @import("config.zig");
++const Cut = config.Cut;
++
++pub const DConfig = struct {
++    hidden: usize, // 8192: the target's
++    inter: usize, // 28672 (a rank's under TP: rankView)
++    layers: usize, // 5
++    heads: usize, // 64 query heads (a rank's under TP)
++    kv_heads: usize, // 8
++    head_dim: usize, // 128
++    eps: f64, // rms_norm_eps: every drafter norm
++    theta: f64, // RoPE theta, NeoX over the whole head
++    window: usize, // sliding_window: keys q - k < window behind each query, the whole block ahead (is_causal false)
++    block: usize, // block_size: the anchor and block - 1 mask rows
++    mask_id: usize,
++    taps: [8]usize = @splat(0), // target layers whose OUTPUT (residual) feeds the context, increasing
++    ntaps: usize = 0,
++    conv_k: usize, // conv_kernel_size: taps of each grouped dynamic convolution
++    conv_g: usize, // conv_group_size: channels sharing a dynamic weight
++    sel_rank: usize, // selector_rank
++    sel_k: usize, // selector_top_k (the walk kernel takes 16)
++    out_mult: f64, // output_multiplier on the draft logits (the target head's own: applied once)
++    softcap: f64, // final_logit_softcapping (likewise)
++    vocab: usize,
++
++    pub fn tapList(c: *const DConfig) []const usize {
++        return c.taps[0..c.ntaps];
++    }
++
++    /// config.json of the drafter (the bf16 release or exllamav3's EXL3 export of it); refuses what is not wired.
++    pub fn parse(gpa: std.mem.Allocator, text: []const u8) !DConfig {
++        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
++        defer parsed.deinit();
++        const top = parsed.value.object;
++        const arch = if (top.get("architectures")) |a| (if (a == .array and a.array.items.len > 0 and a.array.items[0] == .string) a.array.items[0].string else "") else "";
++        if (!std.mem.eql(u8, arch, "DFlash2DraftModel")) return error.NotDFlash2;
++        const df: ?std.json.ObjectMap = if (top.get("dflash_config")) |v| (if (v == .object) v.object else null) else null;
++        var c: DConfig = .{
++            .hidden = try need(top, "hidden_size"),
++            .inter = try need(top, "intermediate_size"),
++            .layers = try need(top, "num_hidden_layers"),
++            .heads = try need(top, "num_attention_heads"),
++            .kv_heads = try need(top, "num_key_value_heads"),
++            .head_dim = int(top, "head_dim") orelse return error.MissingField,
++            .eps = num(top.get("rms_norm_eps") orelse return error.MissingField),
++            .theta = 0,
++            .window = int(top, "sliding_window") orelse 2048,
++            .block = try pick(df, top, "block_size"),
++            .mask_id = try pick(df, top, "mask_token_id"),
++            .conv_k = pickOr(df, top, "conv_kernel_size", 2),
++            .conv_g = pickOr(df, top, "conv_group_size", 16),
++            .sel_rank = try pick(df, top, "selector_rank"),
++            .sel_k = try pick(df, top, "selector_top_k"),
++            .out_mult = pickNum(df, top, "output_multiplier", 1.0),
++            .softcap = pickNum(df, top, "final_logit_softcapping", 0.0),
++            .vocab = try need(top, "vocab_size"),
++        };
++        c.theta = if (top.get("rope_theta")) |v| num(v) else 0;
++        if (top.get("rope_parameters")) |rp| if (rp == .object) {
++            if (rp.object.get("rope_theta")) |v| c.theta = num(v);
++            if (!std.mem.eql(u8, str(rp.object, "rope_type") orelse "default", "default")) return error.UnsupportedRope;
++        };
++        if (c.theta == 0) c.theta = 10000.0;
++        if (boolean(top, "attention_bias")) return error.Unsupported;
++        if (!std.mem.eql(u8, str(top, "hidden_act") orelse "silu", "silu")) return error.UnsupportedActivation;
++        // the reference reads is_causal (default: causal on sliding layers); this checkpoint ships false
++        const causal = if (top.get("is_causal")) |v| (v == .bool and v.bool) else true;
++        if (causal) return error.CausalDrafter;
++        const lt = top.get("layer_types") orelse return error.LayerPattern;
++        if (lt.array.items.len != c.layers) return error.LayerPattern;
++        for (lt.array.items) |t| if (!std.mem.eql(u8, t.string, "sliding_attention")) return error.LayerPattern;
++        if (pickNum(df, top, "input_embedding_scale", 1.0) != 1.0) return error.Unsupported;
++        if (pickOr(df, top, "tap_shift", 0) != 0) return error.Unsupported; // DFlash2: hidden_states[id + 1] = layer id's output
++        const ids = (if (df) |d| d.get("target_layer_ids") else null) orelse top.get("target_layer_ids") orelse return error.MissingField;
++        for (ids.array.items) |v| {
++            if (c.ntaps == c.taps.len) return error.TooManyTaps;
++            c.taps[c.ntaps] = @intCast(v.integer);
++            if (c.ntaps > 0 and c.taps[c.ntaps] <= c.taps[c.ntaps - 1]) return error.TapsOutOfOrder;
++            c.ntaps += 1;
++        }
++        if (c.head_dim != 128) return error.HeadDim; // mimo_dflash's norm/rope and attention: 128 threads a head
++        if (c.heads % c.kv_heads != 0 or c.heads / c.kv_heads > 8) return error.GroupWiderThan8;
++        if (c.sel_k != 16) return error.SelectorTopK; // dfl_walk: a warp a candidate, 16 warps
++        if (c.block < 2 or c.block > 16) return error.BlockSize;
++        if (c.conv_k == 0 or c.conv_k > c.block or c.conv_k > 4) return error.ConvKernel;
++        if (c.hidden % c.conv_g != 0) return error.ConvGroups;
++        if (c.sel_rank % 32 != 0 or c.sel_rank > 1024) return error.SelectorRank;
++        return c;
++    }
++
++    /// A rank's view: query / KV heads and the MLP width split (the context projection fc by outputs).
++    pub fn rankView(c: DConfig, world: usize) !DConfig {
++        if (world != 1 and world != 2) return error.World;
++        if (c.heads % world != 0 or c.kv_heads % world != 0) return error.HeadsSplit;
++        if ((c.kv_heads / world) * c.head_dim % 128 != 0) return error.HeadsSplit;
++        if (c.inter % (128 * world) != 0 or c.hidden % (128 * world) != 0) return error.WidthSplit;
++        var r = c;
++        r.heads = c.heads / world;
++        r.kv_heads = c.kv_heads / world;
++        r.inter = c.inter / world;
++        return r;
++    }
++};
++
++/// The drafter's matrices: fc, then per layer q, k, v, o, gate, up, down, the two convolutions' kernel projections.
++pub const Mat = enum { q, k, v, o, gate, up, down, aconv, mconv };
++pub const mat_names = [_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "attention_conv.kernel_projection", "mlp_conv.kernel_projection" };
++
++/// A layer matrix's cut for `rank` of `world`: q / o by query heads, k / v by KV heads, gate / up by outputs and down
++/// by inputs of the MLP width; the kernel projections whole (small, read by every rank's conv).
++pub fn layerCut(c: DConfig, mat: Mat, prefix: []const u8, rank: usize, world: usize) Cut {
++    if (world == 1) return .{ .prefix = prefix };
++    const hq = c.heads / world * c.head_dim;
++    const hk = c.kv_heads / world * c.head_dim;
++    const wi = c.inter / world;
++    const r = rank;
++    return switch (mat) {
++        .q => .{ .prefix = prefix, .axis = .n, .lo = r * hq, .hi = (r + 1) * hq },
++        .k, .v => .{ .prefix = prefix, .axis = .n, .lo = r * hk, .hi = (r + 1) * hk },
++        .o => .{ .prefix = prefix, .axis = .k, .lo = r * hq, .hi = (r + 1) * hq },
++        .gate, .up => .{ .prefix = prefix, .axis = .n, .lo = r * wi, .hi = (r + 1) * wi },
++        .down => .{ .prefix = prefix, .axis = .k, .lo = r * wi, .hi = (r + 1) * wi },
++        .aconv, .mconv => .{ .prefix = prefix },
++    };
++}
++
++/// fc (taps -> hidden) by outputs: each rank projects its half of the context row; the halves are gathered (fp16).
++pub fn fcCut(c: DConfig, rank: usize, world: usize) Cut {
++    if (world == 1) return .{ .prefix = "fc" };
++    const w = c.hidden / world;
++    return .{ .prefix = "fc", .axis = .n, .lo = rank * w, .hi = (rank + 1) * w };
++}
++
++/// Weight bytes a draft pass reads on one rank (bpw for the EXL3 matrices; the head and the context update excluded).
++pub fn passBytes(c: DConfig, world: usize, bpw: f64) f64 {
++    const H = @as(f64, @floatFromInt(c.hidden));
++    const q = H * @as(f64, @floatFromInt(c.heads * c.head_dim));
++    const kv = 2 * H * @as(f64, @floatFromInt(c.kv_heads * c.head_dim));
++    const mlp = 3 * H * @as(f64, @floatFromInt(c.inter));
++    const conv = 2 * H * @as(f64, @floatFromInt(2 * c.conv_k * (c.hidden / c.conv_g)));
++    const w: f64 = @floatFromInt(world);
++    return @as(f64, @floatFromInt(c.layers)) * ((2 * q + kv + mlp) / w + conv) * bpw / 8;
++}
++
++fn str(o: std.json.ObjectMap, k: []const u8) ?[]const u8 {
++    const v = o.get(k) orelse return null;
++    return if (v == .string) v.string else null;
++}
++fn int(o: std.json.ObjectMap, k: []const u8) ?usize {
++    const v = o.get(k) orelse return null;
++    return if (v == .integer) @intCast(v.integer) else null;
++}
++fn need(o: std.json.ObjectMap, k: []const u8) !usize {
++    return int(o, k) orelse error.MissingField;
++}
++fn num(v: std.json.Value) f64 {
++    return switch (v) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        .number_string => |s| std.fmt.parseFloat(f64, s) catch 0,
++        else => 0,
++    };
++}
++fn boolean(o: std.json.ObjectMap, k: []const u8) bool {
++    const v = o.get(k) orelse return false;
++    return v == .bool and v.bool;
++}
++/// dflash_config->key first, then the top level (the reference's _draft_value).
++fn pickOr(df: ?std.json.ObjectMap, top: std.json.ObjectMap, k: []const u8, default: usize) usize {
++    if (df) |d| if (int(d, k)) |v| return v;
++    return int(top, k) orelse default;
++}
++fn pick(df: ?std.json.ObjectMap, top: std.json.ObjectMap, k: []const u8) !usize {
++    if (df) |d| if (int(d, k)) |v| return v;
++    return int(top, k) orelse error.MissingField;
++}
++fn pickNum(df: ?std.json.ObjectMap, top: std.json.ObjectMap, k: []const u8, default: f64) f64 {
++    if (df) |d| if (d.get(k)) |v| return num(v);
++    return if (top.get(k)) |v| num(v) else default;
++}
++
++// RadixArk/Muse-Spark-Open-DFlash2 @ 46c90f41's config.json (the fields parse reads).
++pub const fixture =
++    \\{"architectures": ["DFlash2DraftModel"], "attention_bias": false, "dflash_config": {"attention_mode": "gqa",
++    \\ "block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "final_logit_softcapping": 20, "mask_token_id": 200002,
++    \\ "output_multiplier": 0.1767766952966369, "selector_rank": 256, "selector_top_k": 16,
++    \\ "target_layer_ids": [1, 16, 30, 44, 59]}, "head_dim": 128, "hidden_act": "silu", "hidden_size": 8192,
++    \\ "intermediate_size": 28672, "is_causal": false, "layer_types": ["sliding_attention", "sliding_attention",
++    \\ "sliding_attention", "sliding_attention", "sliding_attention"], "num_attention_heads": 64, "num_hidden_layers": 5,
++    \\ "num_key_value_heads": 8, "rms_norm_eps": 1e-05, "rope_parameters": {"rope_theta": 500000, "rope_type": "default"},
++    \\ "rope_theta": 500000, "sliding_window": 2048, "vocab_size": 202048}
++;
++
++test "DConfig.parse reads RadixArk's Muse Spark DFlash2" {
++    const c = try DConfig.parse(std.testing.allocator, fixture);
++    try std.testing.expectEqual(@as(usize, 5), c.layers);
++    try std.testing.expectEqual(@as(usize, 8), c.block);
++    try std.testing.expectEqual(@as(usize, 200002), c.mask_id);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 16, 30, 44, 59 }, c.tapList());
++    try std.testing.expectEqual(@as(f64, 500000), c.theta);
++    try std.testing.expectEqual(@as(usize, 2048), c.window);
++    try std.testing.expectEqual(@as(usize, 2), c.conv_k);
++    try std.testing.expectEqual(@as(f64, 20), c.softcap);
++    try std.testing.expectApproxEqRel(@as(f64, 0.17677669529663687), c.out_mult, 1e-12);
++    const r = try c.rankView(2);
++    try std.testing.expectEqual(@as(usize, 32), r.heads);
++    try std.testing.expectEqual(@as(usize, 4), r.kv_heads);
++    try std.testing.expectEqual(@as(usize, 14336), r.inter);
++}
++
++test "DConfig.parse refuses what the drafter does not wire" {
++    const a = std.testing.allocator;
++    const bad = [_][2][]const u8{
++        .{ "\"is_causal\": false", "\"is_causal\": true" },
++        .{ "\"selector_top_k\": 16", "\"selector_top_k\": 8" },
++        .{ "\"head_dim\": 128", "\"head_dim\": 64" },
++        .{ "\"DFlash2DraftModel\"", "\"DFlashDraftModel\"" },
++        .{ "[1, 16, 30, 44, 59]", "[16, 1, 30, 44, 59]" },
++        .{ "\"sliding_attention\", \"sliding_attention\"]", "\"sliding_attention\", \"full_attention\"]" },
++    };
++    for (bad) |b| {
++        const t = try std.mem.replaceOwned(u8, a, fixture, b[0], b[1]);
++        defer a.free(t);
++        try std.testing.expect(std.meta.isError(DConfig.parse(a, t)));
++    }
++}
++
++test "drafter cuts at TP=2 sit on 128-column blocks" {
++    const c = try DConfig.parse(std.testing.allocator, fixture);
++    const q1 = layerCut(c, .q, "layers.0.self_attn.q_proj", 1, 2);
++    try std.testing.expectEqual(@as(usize, 4096), q1.lo);
++    try std.testing.expectEqual(@as(usize, 8192), q1.hi);
++    const k1 = layerCut(c, .k, "x", 1, 2);
++    try std.testing.expectEqual(@as(usize, 512), k1.lo);
++    try std.testing.expect(layerCut(c, .o, "x", 0, 2).axis == .k);
++    const d1 = layerCut(c, .down, "x", 1, 2);
++    try std.testing.expectEqual(@as(usize, 14336), d1.lo);
++    try std.testing.expect(d1.axis == .k);
++    try std.testing.expect(layerCut(c, .aconv, "x", 1, 2).axis == .whole);
++    try std.testing.expectEqual(@as(usize, 4096), fcCut(c, 1, 2).lo);
++    for (std.enums.values(Mat)) |m| {
++        const cc = layerCut(c, m, "x", 1, 2);
++        try std.testing.expect(cc.lo % 128 == 0 and cc.hi % 128 == 0);
++    }
++    try std.testing.expect(layerCut(c, .q, "x", 0, 1).axis == .whole);
++    // a draft pass at 4 bpw: ~1.15 GB a rank split, ~2.2 GB replicated (the TP plan in docs/ZIG-MUSE.md)
++    const split = passBytes(c, 2, 4.0) / 1e9;
++    const repl = passBytes(c, 1, 4.0) / 1e9;
++    try std.testing.expect(split > 1.0 and split < 1.3);
++    try std.testing.expect(repl > 2.0 and repl < 2.4);
++}
+diff --git a/zig/src/families/muse_spark/forward.zig b/zig/src/families/muse_spark/forward.zig
+index 6937822d..0c940da9 100644
+--- a/zig/src/families/muse_spark/forward.zig
++++ b/zig/src/families/muse_spark/forward.zig
+@@ -6,6 +6,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const tp = @import("tp");
+ const load_ = @import("load.zig");
++const dflash2 = @import("dflash2.zig");
+ const exl3 = cuda.exl3;
+ const Weights = load_.Weights;
+ const Stream = cuda.Stream;
+@@ -110,6 +111,7 @@ pub const Model = struct {
+     b: Bufs,
+     arena: load_.Arena,
+     gpa: std.mem.Allocator,
++    dr: ?*dflash2.Drafter = null, // fed inside run: taps after its layers, the context update after the last layer
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
+         const cfg = w.cfg;
+@@ -129,6 +131,7 @@ pub const Model = struct {
+         m.slots = slots;
+         m.nch_max = @max(@min(MAX_CHUNKS, (context + CK - 1) / CK), (cfg.window + 1 + CK - 1) / CK);
+         m.gpa = gpa;
++        m.dr = null;
+         m.arena = .{ .d = d, .gpa = gpa };
+         errdefer m.arena.deinit();
+         m.glue = try cuda.Module.load(d, cuda.kernels.muse_glue);
+@@ -508,7 +511,9 @@ pub const Model = struct {
+             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].in_norm else m.w.norm;
+             try m.gateNorm(s, m.b.part, L.post_ffn, L.mlp_ab, after, 0, n);
+             if (cap) |c| try c.hook(c.ctx, .mlp, i, m.b.res, n);
++            if (m.dr) |dr| if (cap == null) try dr.tap(s, i, m.b.res, n);
+         }
++        if (m.dr) |dr| if (cap == null) try dr.update(s, n);
+         try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
+         const cfgf = m.w.full;
+         var a: cuda.Args = .{};
+diff --git a/zig/src/families/muse_spark/load.zig b/zig/src/families/muse_spark/load.zig
+index 20fb0e02..80e9b654 100644
+--- a/zig/src/families/muse_spark/load.zig
++++ b/zig/src/families/muse_spark/load.zig
+@@ -147,7 +147,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
+ }
+ 
+ /// The same cut in MiMo-V2's type (its `cut` does the trellis slicing).
+-fn mc(c: config.Cut) mimo.config.Cut {
++pub fn mc(c: config.Cut) mimo.config.Cut {
+     return .{ .prefix = c.prefix, .axis = switch (c.axis) {
+         .whole => .whole,
+         .n => .n,
+diff --git a/zig/src/families/muse_spark/root.zig b/zig/src/families/muse_spark/root.zig
+index 2c39f834..07514bd1 100644
+--- a/zig/src/families/muse_spark/root.zig
++++ b/zig/src/families/muse_spark/root.zig
+@@ -5,6 +5,8 @@ pub const load = @import("load.zig");
+ pub const forward = @import("forward.zig");
+ pub const engine = @import("engine.zig");
+ pub const native = @import("native.zig");
++pub const dflash2 = @import("dflash2.zig");
++pub const dflash2_config = @import("dflash2_config.zig");
+ pub const Config = config.Config;
+ 
+ test {
+@@ -13,4 +15,6 @@ test {
+     _ = forward;
+     _ = engine;
+     _ = native;
++    _ = dflash2;
++    _ = dflash2_config;
+ }
+-- 
+2.53.0
+

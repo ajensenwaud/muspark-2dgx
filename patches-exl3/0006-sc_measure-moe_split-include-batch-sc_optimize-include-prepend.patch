@@ -1,0 +1,253 @@
+From 8e7581ae9bde58ffda320e1e3eb0bc9ab10f001b Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 02:07:33 +1100
+Subject: [PATCH] sc_measure: --moe_split (a target per expert projection for
+ MoE modules with gates/ups/downs lists, incl. muse_spark), --include, --batch
+ (streaming rows batched across pending experiments, control within
+ --ctrl_tol); sc_optimize: --include, --prepend fixed entries
+
+---
+ sc_measure.py  | 84 ++++++++++++++++++++++++++++++++++++++++++++------
+ sc_optimize.py | 19 +++++++++++-
+ 2 files changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/sc_measure.py b/sc_measure.py
+index a99157d..ee8702d 100644
+--- a/sc_measure.py
++++ b/sc_measure.py
+@@ -3,6 +3,7 @@ import sys, os
+ import argparse
+ import json
+ import math
++import re
+ import zlib
+ from collections import defaultdict
+ from contextlib import contextmanager
+@@ -73,11 +74,12 @@ class ModuleRunner:
+     """Run rows through one module at a time. Clone states because modules may mutate inputs,
+     including modules that run on CPU."""
+ 
+-    def __init__(self, config, modules, device, streaming):
++    def __init__(self, config, modules, device, streaming, batch = 1):
+         self.config = config
+         self.modules = modules
+         self.device = device
+         self.streaming = streaming
++        self.batch = batch
+ 
+     @contextmanager
+     def loaded(self, idx):
+@@ -103,6 +105,22 @@ class ModuleRunner:
+ 
+     def rows(self, mod, states, capture=None, consume=None):
+         outputs = []
++        # --batch: float states of one shape run B rows per forward (concatenated on dim 0, a new tensor, so no
++        # clone). Never for capture passes, token-id inputs or the logits module (full-vocab logits per row).
++        if self.batch > 1 and capture is None and len(states) > 1 and states[0].is_floating_point() \
++                and not mod.caps.get("logits_output") and all(s.shape == states[0].shape for s in states):
++            for c in range(0, len(states), self.batch):
++                chunk = states[c : c + self.batch]
++                params = {}
++                x = mod.prepare_for_device(torch.cat(chunk, dim = 0), params)
++                x = mod.forward(x, params)
++                for j in range(len(chunk)):
++                    if consume is None:
++                        outputs.append(x[j : j + 1].to("cpu", copy=True))
++                    else:
++                        consume(c + j, x[j : j + 1])
++                del x, params
++            return outputs
+         for r, state in enumerate(states):
+             params = {} if capture is None else {"capture": capture}
+             x = mod.prepare_for_device(state.clone(), params)
+@@ -204,7 +222,7 @@ class Target:
+         return sum(lin.weights_numel() for lin in self.linears)
+ 
+ 
+-def collect_targets(mod):
++def collect_targets(mod, moe_split = False):
+     """Targets under one top-level module: the routed experts of each BlockSparseMLP as one
+     grouped target (its routing gate and latent projections stay individual); the gate and up
+     projections of each GatedMLP (dense MLPs and MoE shared experts alike) as one grouped target,
+@@ -232,7 +250,19 @@ def collect_targets(mod):
+             group(m, "qkv", qkv)
+         elif isinstance(m, GatedDeltaNet):
+             group(m, "qkvz", [getattr(m, "qkv_proj", None), getattr(m, "z_proj", None)])
+-        if isinstance(m, BlockSparseMLP):
++        is_moe = isinstance(m, BlockSparseMLP) or (
++            not isinstance(m, GatedMLP) and isinstance(getattr(m, "gates", None), list)
++            and isinstance(getattr(m, "downs", None), list) and len(m.downs) > 1)
++        if is_moe and moe_split:
++            # --moe_split: one grouped target per expert projection (all experts' gate, up or down of one layer),
++            # so the recipe can give e.g. down_proj more bits than gate/up. Needs inference kernels that take a K
++            # per projection (exllamav3's per-expert path for muse_spark, TensorFold's grouped expert kernels)
++            for name, lst in (("gate_proj", m.gates), ("up_proj", m.ups), ("down_proj", m.downs)):
++                lins = [lin for lin in lst if lin is not None and lin.qmap is not None and id(lin) not in grouped_ids]
++                if lins:
++                    targets.append(Target(f"{m.key}.experts.{name}", lins, lins[0].qbits_key))
++                    grouped_ids.update(id(lin) for lin in lins)
++        elif is_moe:
+             experts = [lin for lin in (m.gates + m.ups + m.downs) if lin is not None and lin.qmap is not None]
+             if experts:
+                 targets.append(Target(f"{m.key}.experts", experts, experts[0].qbits_key))
+@@ -305,7 +335,7 @@ def main(args):
+         if streaming:
+             torch.cuda.empty_cache()
+             print(" -- Full-model load exceeded VRAM; switching to layer streaming")
+-    runner = ModuleRunner(config, model.modules, device, streaming)
++    runner = ModuleRunner(config, model.modules, device, streaming, args.batch)
+ 
+     total_rows = args.rows + (args.h_rows if args.shaped else 0)
+     if args.trace:
+@@ -410,8 +440,11 @@ def main(args):
+     targets_by_idx = defaultdict(list)
+     num_targets = 0
+     num_grouped = 0
++    include = re.compile(args.include) if args.include else None
+     for i in range(num_mods):
+-        for t in collect_targets(mods[i]):
++        for t in collect_targets(mods[i], args.moe_split):
++            if include is not None and not include.search(t.key):
++                continue
+             if not streaming:
+                 for lin in t.linears:
+                     assert isinstance(lin.inner, LinearFP16), \
+@@ -449,6 +482,8 @@ def main(args):
+         w = [lin.weights_numel() for lin in target.linears]
+         return math.sqrt(sum(wi * r * r for wi, r in zip(w, per)) / sum(w)), per
+ 
++    control_kld = {}    # per top-level module: KL of the unperturbed restart (0 row by row, a noise floor with --batch)
++
+     # Resume from partial output
+     results = []
+     done = set()
+@@ -475,6 +510,10 @@ def main(args):
+                 rfn_ref = args.rfn_ref,
+                 rfn_scale = args.rfn_scale if args.rfn_ref else None,
+                 rfn = None if args.rfn_ref else args.rfn,
++                batch = args.batch,
++                moe_split = args.moe_split,
++                include = args.include,
++                controls = {str(k): v for k, v in control_kld.items()},
+                 results = results,
+             )
+             json.dump(output, f, indent = 2)
+@@ -634,7 +673,6 @@ def main(args):
+     print(f" -- {num_targets} target tensors, {args.draws} draw(s) at {num_levels} noise level(s), "
+           f"{'shaped' if args.shaped else 'iid'} noise")
+ 
+-    control_kld = {}
+     quant_args = {"sigma_reg": 0.025}
+ 
+     def finalize_shaping(top_idx, capture):
+@@ -698,7 +736,13 @@ def main(args):
+         # No-perturbation control: restarting from the cached boundary must reproduce the
+         # reference exactly
+         control_kld[top_idx] = kld
+-        assert kld == 0.0, f"ctrl {kld} != 0 at module {top_idx}, restart machinery broken"
++        if args.batch > 1:
++            # With --cross_batch the batch composition differs from the reference pass, so the control is a
++            # noise floor instead of exactly zero; it is recorded with the results
++            print(f"    control at module {top_idx}: kld {kld:.3e}")
++            assert kld <= args.ctrl_tol, f"ctrl {kld} > {args.ctrl_tol} at module {top_idx}, restart machinery broken"
++        else:
++            assert kld == 0.0, f"ctrl {kld} != 0 at module {top_idx}, restart machinery broken"
+ 
+     if streaming:
+         # Load each module once per pass, advancing pending states and spawning new perturbed states
+@@ -754,9 +798,24 @@ def main(args):
+                             shaping = finalize_shaping(idx, capture)
+                         del capture
+ 
+-                    # Advance pending states through the unperturbed module
+-                    for exp in pending:
+-                        exp["states"], exp["kld"] = run(exp["states"])
++                    # Advance pending states through the unperturbed module. With --batch each experiment's own
++                    # rows run as one batch, the same composition as the reference pass, so the control stays
++                    # exactly 0. --cross_batch packs rows of different experiments together instead (faster), but
++                    # changed GEMM shapes flip near-tie top-k routing somewhere in a deep MoE: on Muse Spark (62
++                    # layers) the control reached KL 1.3e-3, above most expert targets' own KL. Don't use it there.
++                    if args.cross_batch and runner.batch > 1 and pending and not last_mod:
++                        flat = [st for exp in pending for st in exp["states"]]
++                        out = runner.rows(mod, flat)
++                        del flat
++                        i0 = 0
++                        for exp in pending:
++                            n = len(exp["states"])
++                            exp["states"], exp["kld"] = out[i0 : i0 + n], None
++                            i0 += n
++                        del out
++                    else:
++                        for exp in pending:
++                            exp["states"], exp["kld"] = run(exp["states"])
+ 
+                     if spawn:
+                         states, kld = run(boundary[idx])
+@@ -907,4 +966,9 @@ if __name__ == "__main__":
+     parser.add_argument("-dr", "--draws", type = int, default = 1, help = "Noise draws per level, default: 1")
+     parser.add_argument("-t", "--top", type = int, default = 15, help = "Top contributors to print")
+     parser.add_argument("-o", "--out", type = str, default = None, help = "Output file (JSON), resumes if present")
++    parser.add_argument("-b", "--batch", type = int, default = 1, help = "Streaming: rows per module forward (pending experiments share forwards); default 1 = row by row, exact controls")
++    parser.add_argument("--ctrl_tol", type = float, default = 0.0, help = "With --batch > 1: largest accepted control KL, default 0 (exact; only --cross_batch needs more)")
++    parser.add_argument("--cross_batch", action = "store_true", help = "Streaming: pack rows of different pending experiments into one forward (not exact: see the comment in main)")
++    parser.add_argument("--moe_split", action = "store_true", help = "One target per expert projection (gate/up/down of all experts of a layer) instead of one per MoE layer")
++    parser.add_argument("--include", type = str, default = None, help = "Regex over target keys: measure only matching targets (e.g. experts, plus dense targets of chosen layers)")
+     main(parser.parse_args())
+diff --git a/sc_optimize.py b/sc_optimize.py
+index eeb1cbe..738bdb5 100644
+--- a/sc_optimize.py
++++ b/sc_optimize.py
+@@ -37,6 +37,13 @@ def main(args):
+         meas = json.load(f)
+ 
+     results = meas["results"]
++    if args.include:
++        # --include: allocate only over matching targets (e.g. the routed experts, with the dense tensors fixed by
++        # --prepend entries outside the budget)
++        import re
++        rx = re.compile(args.include)
++        results = [r for r in results if rx.search(r["key"])]
++        print(f" -- --include {args.include!r}: {len(results)} targets")
+     tensors = [r for r in results if r["qbits_key"] == "bits"]
+     head = [r for r in results if r["qbits_key"] == "head_bits"]
+ 
+@@ -270,11 +277,19 @@ def main(args):
+         tensors = {m: (int(k_assign[r["key"]]) if float(k_assign[r["key"]]).is_integer() else float(k_assign[r["key"]]))
+                    for r in tensors for m in r.get("members", [r["key"]])},
+     )
++    prepend = []
++    if args.prepend:
++        # Fixed entries written first (patterns resolve top to bottom, later entries override): "pattern=bits"
++        for item in args.prepend.split(","):
++            pat, _, b = item.rpartition("=")
++            prepend.append((pat.strip(), float(b) if "." in b else int(b)))
+     with open(args.out, "w") as f:
+         f.write("# Quantization recipe generated by sc_optimize.py\n")
+         for k, v in recipe.items():
+             if k == "tensors":
+                 f.write("tensors:\n")
++                for key, bits in prepend:
++                    f.write(f"  \"{key}\": {bits}\n")
+                 for key, bits in v.items():
+                     f.write(f"  {key}: {bits}\n")
+             else:
+@@ -294,7 +309,7 @@ def main(args):
+                     qbits_key = r["qbits_key"],
+                     numel = r["numel"],
+                     S = r["S"],
+-                    kld = {k: kld_at(r, k) for k in range(args.min_k, args.max_k + 1)},
++                    kld = {k: kld_at(r, k) for k in [args.min_k + i * args.k_step for i in range(int(round((args.max_k - args.min_k) / args.k_step)) + 1)]},
+                 )
+                 for r in tensors + head
+             ],
+@@ -328,5 +343,7 @@ if __name__ == "__main__":
+                         help = "Suffix groups forced to share a bitrate (fused GEMMs in the inference paths), tied within the same parent module. Pass \"\" to optimize all "
+                                "tensors independently. Default: k_proj+v_proj,gate_proj+up_proj")
+     parser.add_argument("-o", "--out", type = str, required = True, help = "Output recipe (YAML)")
++    parser.add_argument("--include", type = str, default = None, help = "Regex over measured target keys: allocate the budget only over these (others must be covered by --prepend)")
++    parser.add_argument("--prepend", type = str, default = None, help = "Comma-separated pattern=bits entries written before the optimized ones (fixed tensors outside the budget, e.g. '*.self_attn.*=4')")
+     parser.add_argument("-t", "--table", type = str, default = None, help = "Optionally save full predicted per-tensor per-K KLD table (JSON)")
+     main(parser.parse_args())
+-- 
+2.53.0
+

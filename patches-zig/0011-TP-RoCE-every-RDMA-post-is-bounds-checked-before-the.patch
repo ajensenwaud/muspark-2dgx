@@ -1,0 +1,599 @@
+From fcfb9b27f53bfcd39103cc5e8c3c3ec8abb87b7b Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:39:14 +0700
+Subject: [PATCH 11/60] TP RoCE: every RDMA post is bounds-checked before the
+ verb, and peers with another region layout are refused
+
+roce_guard.stripes computes each HCA's share of a post (its send stripe, the peer's receive range and its flag word)
+and refuses with error.OutOfRegion any range past its slot, its flag area or the registered region, before
+post_send. The verbs wire and the shm wire both post through it. The shm wire moves to roce_shm.zig and can stripe
+like the verbs wire (Options.shm_stripes), with an optional tap that sees every post for tests. The connection record
+carries the slot and registered length, so a peer with another layout is refused at connect; its magic is bumped.
+
+Tests: stripes tile the slot over two HCAs and refuse a post past the slot, a third slot, an unpadded or empty post,
+no HCA and a short region. On fake verbs a post past its slot reaches no verb, and a full slot stays inside the
+region. Over the shm wire striped as two HCAs, 2,000 variable-length gathers stay inside slot and region, bit for bit.
+
+(cherry picked from commit e16e331a087bb6e60d0d04854a4cdcc7c3f02ed0)
+---
+ zig/src/fabric/tp/roce.zig           | 60 ++++-------------
+ zig/src/fabric/tp/roce_fake.zig      | 96 ++++++++++++++++++++++++++++
+ zig/src/fabric/tp/roce_guard.zig     | 63 ++++++++++++++++++
+ zig/src/fabric/tp/roce_post_test.zig | 20 ++++++
+ zig/src/fabric/tp/roce_shm.zig       | 63 ++++++++++++++++++
+ zig/src/fabric/tp/roce_test.zig      | 41 +++++++++++-
+ zig/src/fabric/tp/roce_verbs.zig     | 44 ++++++++-----
+ zig/src/fabric/tp/tp.zig             |  2 +
+ 8 files changed, 323 insertions(+), 66 deletions(-)
+ create mode 100644 zig/src/fabric/tp/roce_fake.zig
+ create mode 100644 zig/src/fabric/tp/roce_guard.zig
+ create mode 100644 zig/src/fabric/tp/roce_post_test.zig
+ create mode 100644 zig/src/fabric/tp/roce_shm.zig
+
+diff --git a/zig/src/fabric/tp/roce.zig b/zig/src/fabric/tp/roce.zig
+index 58f88e34..7806fd60 100644
+--- a/zig/src/fabric/tp/roce.zig
++++ b/zig/src/fabric/tp/roce.zig
+@@ -6,6 +6,8 @@ const collective = @import("collective.zig");
+ const Bootstrap = @import("bootstrap.zig").Bootstrap;
+ const sock = @import("sock.zig");
+ const rv = @import("roce_verbs.zig");
++const shm = @import("roce_shm.zig");
++const guard = @import("roce_guard.zig");
+ const HostRegister = @import("mailbox.zig").HostRegister;
+ const posix = std.posix;
+ const DevicePtr = collective.DevicePtr;
+@@ -71,30 +73,20 @@ pub const Options = struct {
+     fast: u32 = 0,
+     /// TF_TP_ROCE_BLOCKS: the largest grid (config.roce_blocks)
+     blocks: u32 = 16,
+-};
+-
+-/// The shm wire: the peer's region is mapped here; a post copies the slot, then stores the flag with release order.
+-const ShmWire = struct {
+-    peer: []u8,
+-    local: []u8,
+-    slot_bytes: usize,
+-
+-    fn post(w: *ShmWire, slot: u32, seq: u32, padded: u32) void {
+-        const recv = send_off + 2 * w.slot_bytes;
+-        @memcpy(w.peer[recv + slot * w.slot_bytes ..][0..padded], w.local[send_off + slot * w.slot_bytes ..][0..padded]);
+-        const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(w.peer[flag_off + slot * 2 * flag_stride ..].ptr));
+-        flag.store(seq, .release);
+-    }
++    /// The shm wire's stripes, as HCAs: its posts take the verbs wire's split and bounds.
++    shm_stripes: u32 = 1,
++    /// Tests: sees every shm post's stripes before the copy.
++    tap: ?*shm.PostTap = null,
+ };
+ 
+ const Wire = union(WireKind) {
+     verbs: rv.VerbsWire,
+-    shm: ShmWire,
++    shm: shm.ShmWire,
+ 
+     fn post(w: *Wire, slot: u32, seq: u32, padded: u32) !void {
+         switch (w.*) {
+             .verbs => |*v| try v.post(slot, seq, padded),
+-            .shm => |*s| s.post(slot, seq, padded),
++            .shm => |*s| try s.post(slot, seq, padded),
+         }
+     }
+ 
+@@ -108,7 +100,7 @@ const Wire = union(WireKind) {
+     fn hcas(w: *const Wire) u32 {
+         return switch (w.*) {
+             .verbs => |v| v.n_hca,
+-            .shm => 1,
++            .shm => |s| s.stripes,
+         };
+     }
+ };
+@@ -204,9 +196,10 @@ pub const Roce = struct {
+                 r.wire = .{ .verbs = try rv.VerbsWire.open(o.hcas, r.region, .{ .send = send_off, .recv = send_off + 2 * r.slot_bytes, .flags = flag_off, .slot = r.slot_bytes }, o.traffic_class) };
+             },
+             .shm => {
+-                r.mapping = try sharedPair(b, len);
++                r.mapping = try shm.sharedPair(b, len);
+                 r.region = @alignCast(r.mapping[r.me * len ..][0..len]);
+-                r.wire = .{ .shm = .{ .peer = r.mapping[(1 - r.me) * len ..][0..len], .local = r.region, .slot_bytes = r.slot_bytes } };
++                const layout: guard.Layout = .{ .send = send_off, .recv = send_off + 2 * r.slot_bytes, .flags = flag_off, .slot = r.slot_bytes, .len = len };
++                r.wire = .{ .shm = .{ .peer = r.mapping[(1 - r.me) * len ..][0..len], .layout = layout, .local = r.region, .stripes = o.shm_stripes, .tap = o.tap } };
+             },
+         }
+         return true;
+@@ -422,35 +415,6 @@ pub const Roce = struct {
+     }
+ };
+ 
+-/// One shared mapping holding both ranks' regions (rank 0 creates and sizes the file before anyone learns its name).
+-fn sharedPair(b: *Bootstrap, len: usize) ![]align(page) u8 {
+-    var name: [64]u8 = undefined;
+-    var name_len: u8 = 0;
+-    var fd: std.c.fd_t = -1;
+-    defer if (fd >= 0) {
+-        _ = std.c.close(fd);
+-    };
+-    if (b.rank == 0) blk: {
+-        const s = std.fmt.bufPrint(&name, "/dev/shm/tf-tp-roce-{d}-{x}", .{ std.c.getpid(), sock.nowNs() }) catch break :blk;
+-        name[s.len] = 0;
+-        fd = std.c.open(name[0..s.len :0], .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+-        if (fd >= 0 and std.c.ftruncate(fd, @intCast(2 * len)) == 0) name_len = @intCast(s.len);
+-    }
+-    // an empty name tells the other rank that rank 0 failed (it must not wait for a name that never comes)
+-    try b.broadcast(std.mem.asBytes(&name_len), std.mem.asBytes(&name_len));
+-    if (name_len == 0) return error.SharedMemoryUnavailable;
+-    try b.broadcast(name[0..name_len], name[0..name_len]);
+-    name[name_len] = 0;
+-    if (b.rank != 0) {
+-        fd = std.c.open(name[0..name_len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+-        if (fd < 0) return error.SharedMemoryUnavailable;
+-    }
+-    const m = try posix.mmap(null, 2 * len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+-    try b.agree("mapped", "RoCE shm wire");
+-    if (b.rank == 0) _ = std.c.unlink(name[0..name_len :0]);
+-    return m;
+-}
+-
+ fn pin(cpu: u32) void {
+     var set: std.os.linux.cpu_set_t = @splat(0);
+     set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+diff --git a/zig/src/fabric/tp/roce_fake.zig b/zig/src/fabric/tp/roce_fake.zig
+new file mode 100644
+index 00000000..e556c199
+--- /dev/null
++++ b/zig/src/fabric/tp/roce_fake.zig
+@@ -0,0 +1,96 @@
++//! Fake verbs for host tests of VerbsWire: each QP's posted writes counted from the requests, completions that lag.
++const std = @import("std");
++const verbs = @import("verbs");
++const abi = verbs.abi;
++const rv = @import("roce_verbs.zig");
++
++pub const slot: u64 = 1 << 20;
++pub const send_off = 8192;
++
++/// What the HCAs hold (posted, not completed); every count comes from the work requests themselves.
++pub const Fake = struct {
++    pub var region: []const u8 = &.{};
++    pub var lag: u32 = 1;
++    pub var polls: u64 = 0;
++    pub var queue: [2][512]u64 = undefined;
++    pub var head: [2]u32 = .{ 0, 0 };
++    pub var len: [2]u32 = .{ 0, 0 };
++    pub var inflight: u64 = 0;
++    pub var max_inflight: u64 = 0;
++    pub var max_write: u64 = 0;
++    pub var outside: u64 = 0;
++    pub var bytes: u64 = 0;
++    pub var posts: u64 = 0;
++
++    pub fn reset(l: u32) void {
++        lag = l;
++        polls = 0;
++        head = .{ 0, 0 };
++        len = .{ 0, 0 };
++        inflight = 0;
++        max_inflight = 0;
++        max_write = 0;
++        outside = 0;
++        bytes = 0;
++        posts = 0;
++    }
++
++    pub fn postSend(qp: *abi.Qp, wr: *abi.SendWr, _: *?*abi.SendWr) callconv(.c) c_int {
++        const q = qp.qp_num;
++        posts += 1;
++        var sum: u64 = 0;
++        var at: ?*abi.SendWr = wr;
++        while (at) |w| : (at = w.next) {
++            if (w.send_flags & abi.send_inline == 0) {
++                const sge = w.sg_list[0];
++                const lo = @intFromPtr(region.ptr);
++                if (sge.addr < lo + send_off or sge.addr + sge.length > lo + send_off + 2 * slot) outside += 1;
++                max_write = @max(max_write, sge.length);
++                sum += sge.length;
++            }
++            if (w.send_flags & abi.send_signaled != 0) {
++                queue[q][(head[q] + len[q]) % 512] = sum;
++                len[q] += 1;
++                inflight += sum;
++                bytes += sum;
++                max_inflight = @max(max_inflight, inflight);
++                sum = 0;
++            }
++        }
++        return 0;
++    }
++
++    /// One completion every `lag` polls of a QP's CQ: the HCA finishes writes far slower than they are posted.
++    pub fn pollCq(cq: *abi.Cq, _: c_int, wc: [*]abi.Wc) callconv(.c) c_int {
++        const q = cq.handle;
++        polls += 1;
++        if (polls % lag != 0 or len[q] == 0) return 0;
++        inflight -= queue[q][head[q]];
++        head[q] = (head[q] + 1) % 512;
++        len[q] -= 1;
++        wc[0] = std.mem.zeroes(abi.Wc);
++        wc[0].status = abi.wc_success;
++        return 1;
++    }
++};
++
++/// Two fake HCAs behind one VerbsWire, connected to a peer whose region has this rank's layout.
++pub const Hw = struct {
++    ctx: [2]abi.Context = undefined,
++    qp: [2]abi.Qp = undefined,
++    cq: [2]abi.Cq = undefined,
++    mr: [2]abi.Mr = undefined,
++
++    pub fn wire(hw: *Hw, region: []u8) rv.VerbsWire {
++        var w: rv.VerbsWire = .{ .v = undefined, .traffic_class = 0, .recv_off = send_off + 2 * slot, .flag_off = 4096, .send_off = send_off, .slot_bytes = slot, .region = region };
++        for (0..2) |i| {
++            hw.ctx[i].ops = .{ ._before_poll = @splat(null), .poll_cq = Fake.pollCq, ._before_post = @splat(null), .post_send = Fake.postSend, .post_recv = undefined, ._after = @splat(null) };
++            hw.qp[i].qp_num = @intCast(i);
++            hw.cq[i].handle = @intCast(i);
++            hw.mr[i].lkey = 7;
++            w.hcas[i] = .{ .ctx = &hw.ctx[i], .pd = undefined, .mr = &hw.mr[i], .cq = &hw.cq[i], .qp = &hw.qp[i], .gid_index = 0, .gid = @splat(0), .mtu = 0, .lid = 0 };
++        }
++        w.n_hca = 2;
++        return w;
++    }
++};
+diff --git a/zig/src/fabric/tp/roce_guard.zig b/zig/src/fabric/tp/roce_guard.zig
+new file mode 100644
+index 00000000..6851f9a6
+--- /dev/null
++++ b/zig/src/fabric/tp/roce_guard.zig
+@@ -0,0 +1,63 @@
++//! Every RoCE post's bounds before the verb: each HCA's stripe inside its slot and the registered region.
++const std = @import("std");
++
++pub const max_hcas = 2;
++pub const flag_stride = 128;
++
++pub const Error = error{OutOfRegion};
++
++/// Both ranks' region layout (roce.zig's): byte offsets and the registered length every post must stay inside.
++pub const Layout = struct { send: u64, recv: u64, flags: u64, slot: u64, len: u64 };
++
++/// One HCA's share of a post: its data stripe in this rank's send slot and the peer's receive slot, and its flag word.
++pub const Stripe = struct { local: u64, remote: u64, len: u32, flag: u64 };
++
++/// Slot `slot`'s first `padded` bytes striped over `n_hca` HCAs; error.OutOfRegion before any verb past a slot or MR.
++pub fn stripes(l: Layout, n_hca: u32, slot: u32, padded: u32, out: *[max_hcas]Stripe) Error!void {
++    if (n_hca == 0 or n_hca > max_hcas or slot > 1) return error.OutOfRegion;
++    if (padded == 0 or padded % 16 != 0 or padded > l.slot) return error.OutOfRegion;
++    const packs = padded / 16;
++    var offset: u64 = 0;
++    for (out[0..n_hca], 0..) |*o, i| {
++        var stripe = packs / n_hca;
++        if (i < packs % n_hca) stripe += 1;
++        o.* = .{ .local = l.send + slot * l.slot + offset, .remote = l.recv + slot * l.slot + offset, .len = stripe * 16, .flag = l.flags + (@as(u64, slot) * max_hcas + i) * flag_stride };
++        if (!within(o.local, o.len, l.send + slot * l.slot, l.slot) or !within(o.remote, o.len, l.recv + slot * l.slot, l.slot)) return error.OutOfRegion;
++        if (!within(o.flag, 4, l.flags, l.send - l.flags) or !within(o.local, o.len, 0, l.len) or !within(o.remote, o.len, 0, l.len)) return error.OutOfRegion;
++        offset += o.len;
++    }
++}
++
++fn within(at: u64, len: u64, lo: u64, size: u64) bool {
++    return at >= lo and at + len <= lo + size;
++}
++
++/// roce.zig's layout for a 64 KiB slot: ctrl 4 KiB, flags 4 KiB, send [2][slot], recv [2][slot].
++fn testLayout() Layout {
++    const slot: u64 = 64 << 10;
++    return .{ .send = 8192, .recv = 8192 + 2 * slot, .flags = 4096, .slot = slot, .len = 8192 + 4 * slot };
++}
++
++test "a post striped over two HCAs: the stripes tile the slot's first bytes, each flag on its own word" {
++    const l = testLayout();
++    var s: [max_hcas]Stripe = undefined;
++    try stripes(l, 2, 1, 48, &s);
++    try std.testing.expectEqual(Stripe{ .local = l.send + l.slot, .remote = l.recv + l.slot, .len = 32, .flag = l.flags + 2 * flag_stride }, s[0]);
++    try std.testing.expectEqual(Stripe{ .local = l.send + l.slot + 32, .remote = l.recv + l.slot + 32, .len = 16, .flag = l.flags + 3 * flag_stride }, s[1]);
++    try stripes(l, 2, 1, @intCast(l.slot), &s);
++    try std.testing.expectEqual(l.recv + 2 * l.slot, s[1].remote + s[1].len);
++}
++
++test "a post past its slot, a third slot, an unpadded or empty post, or no HCA is refused" {
++    const l = testLayout();
++    var s: [max_hcas]Stripe = undefined;
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 2, 0, @intCast(l.slot + 16), &s));
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 2, 2, 16, &s));
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 2, 0, 24, &s));
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 2, 0, 0, &s));
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 0, 0, 16, &s));
++    try std.testing.expectError(error.OutOfRegion, stripes(l, 3, 0, 16, &s));
++    var short = l;
++    short.len -= 16;
++    try std.testing.expectError(error.OutOfRegion, stripes(short, 2, 1, @intCast(l.slot), &s));
++}
+diff --git a/zig/src/fabric/tp/roce_post_test.zig b/zig/src/fabric/tp/roce_post_test.zig
+new file mode 100644
+index 00000000..fe931e1e
+--- /dev/null
++++ b/zig/src/fabric/tp/roce_post_test.zig
+@@ -0,0 +1,20 @@
++//! VerbsWire.post on fake verbs: a post that would leave its slot or region is refused before any verb.
++const std = @import("std");
++const fake = @import("roce_fake.zig");
++const Roce = @import("roce.zig").Roce;
++const Fake = fake.Fake;
++
++test "a post past its slot is refused before any verb; a full slot posts inside the region" {
++    const region = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), Roce.regionBytes(fake.slot));
++    defer std.testing.allocator.free(region);
++    Fake.region = region;
++    Fake.reset(1);
++    var hw: fake.Hw = .{};
++    var w = hw.wire(region);
++    try std.testing.expectError(error.OutOfRegion, w.post(1, 1, fake.slot + 16));
++    try std.testing.expectError(error.OutOfRegion, w.post(2, 1, 16));
++    try std.testing.expectEqual(@as(u64, 0), Fake.posts);
++    try w.post(1, 1, fake.slot);
++    try std.testing.expectEqual(@as(u64, 2), Fake.posts);
++    try std.testing.expectEqual(@as(u64, 0), Fake.outside);
++}
+diff --git a/zig/src/fabric/tp/roce_shm.zig b/zig/src/fabric/tp/roce_shm.zig
+new file mode 100644
+index 00000000..3924be3e
+--- /dev/null
++++ b/zig/src/fabric/tp/roce_shm.zig
+@@ -0,0 +1,63 @@
++//! The RoCE protocol's shm wire: both ranks' regions in one shared mapping, posts through the guard's stripes.
++const std = @import("std");
++const Bootstrap = @import("bootstrap.zig").Bootstrap;
++const sock = @import("sock.zig");
++const guard = @import("roce_guard.zig");
++const posix = std.posix;
++const page = std.heap.page_size_min;
++
++/// A test's view of each post: slot, padded bytes and the stripes the wire is about to move.
++pub const PostTap = struct {
++    ctx: *anyopaque,
++    seen: *const fn (ctx: *anyopaque, l: guard.Layout, slot: u32, padded: u32, s: []const guard.Stripe) void,
++};
++
++/// The peer's region is mapped here; a post copies each stripe, then stores its flag with release order.
++pub const ShmWire = struct {
++    peer: []u8,
++    layout: guard.Layout,
++    local: []u8,
++    /// Stripes a post makes, as HCAs would: the verbs wire's split, flags and bounds on one host.
++    stripes: u32 = 1,
++    tap: ?*PostTap = null,
++
++    pub fn post(w: *ShmWire, slot: u32, seq: u32, padded: u32) guard.Error!void {
++        var plan: [guard.max_hcas]guard.Stripe = undefined;
++        try guard.stripes(w.layout, w.stripes, slot, padded, &plan);
++        if (w.tap) |t| t.seen(t.ctx, w.layout, slot, padded, plan[0..w.stripes]);
++        for (plan[0..w.stripes]) |s| {
++            @memcpy(w.peer[s.remote..][0..s.len], w.local[s.local..][0..s.len]);
++            const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(w.peer[s.flag..].ptr));
++            flag.store(seq, .release);
++        }
++    }
++};
++
++/// One shared mapping holding both ranks' regions (rank 0 creates and sizes the file before anyone learns its name).
++pub fn sharedPair(b: *Bootstrap, len: usize) ![]align(page) u8 {
++    var name: [64]u8 = undefined;
++    var name_len: u8 = 0;
++    var fd: std.c.fd_t = -1;
++    defer if (fd >= 0) {
++        _ = std.c.close(fd);
++    };
++    if (b.rank == 0) blk: {
++        const s = std.fmt.bufPrint(&name, "/dev/shm/tf-tp-roce-{d}-{x}", .{ std.c.getpid(), sock.nowNs() }) catch break :blk;
++        name[s.len] = 0;
++        fd = std.c.open(name[0..s.len :0], .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
++        if (fd >= 0 and std.c.ftruncate(fd, @intCast(2 * len)) == 0) name_len = @intCast(s.len);
++    }
++    // an empty name tells the other rank that rank 0 failed (it must not wait for a name that never comes)
++    try b.broadcast(std.mem.asBytes(&name_len), std.mem.asBytes(&name_len));
++    if (name_len == 0) return error.SharedMemoryUnavailable;
++    try b.broadcast(name[0..name_len], name[0..name_len]);
++    name[name_len] = 0;
++    if (b.rank != 0) {
++        fd = std.c.open(name[0..name_len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(std.c.mode_t, 0));
++        if (fd < 0) return error.SharedMemoryUnavailable;
++    }
++    const m = try posix.mmap(null, 2 * len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
++    try b.agree("mapped", "RoCE shm wire");
++    if (b.rank == 0) _ = std.c.unlink(name[0..name_len :0]);
++    return m;
++}
+diff --git a/zig/src/fabric/tp/roce_test.zig b/zig/src/fabric/tp/roce_test.zig
+index 51e9d791..d8cf3fc0 100644
+--- a/zig/src/fabric/tp/roce_test.zig
++++ b/zig/src/fabric/tp/roce_test.zig
+@@ -2,6 +2,8 @@
+ const std = @import("std");
+ const roce = @import("roce.zig");
+ const rv = @import("roce_verbs.zig");
++const shm = @import("roce_shm.zig");
++const guard = @import("roce_guard.zig");
+ const bootstrap = @import("bootstrap.zig");
+ const sock = @import("sock.zig");
+ const reference = @import("reference.zig");
+@@ -21,6 +23,30 @@ const Run = struct {
+     max_bytes: usize = 16 * 1024,
+     /// Variable lengths (`Roce.allGatherV`'s contract): each op's lens[r] bytes of rank r's n, 0 and n included.
+     var_lens: bool = false,
++    /// The shm wire's stripes (2: the verbs wire's split over two HCAs).
++    stripes: u32 = 1,
++    /// Each rank's shm posts as the tap saw them: how many, and how many left their slot or the region.
++    taps: [2]Tap = .{ .{}, .{} },
++};
++
++/// Counts an shm wire's posts and any stripe outside its slot, its flag words or the region.
++const Tap = struct {
++    posts: u32 = 0,
++    outside: u32 = 0,
++    tap: shm.PostTap = undefined,
++
++    fn seen(ctx: *anyopaque, l: guard.Layout, slot: u32, padded: u32, s: []const guard.Stripe) void {
++        const t: *Tap = @ptrCast(@alignCast(ctx));
++        t.posts += 1;
++        var sum: u64 = 0;
++        for (s) |x| {
++            sum += x.len;
++            const in_slot = x.local >= l.send + slot * l.slot and x.local + x.len <= l.send + (slot + 1) * l.slot;
++            const in_peer = x.remote >= l.recv + slot * l.slot and x.remote + x.len <= l.recv + (slot + 1) * l.slot;
++            if (!in_slot or !in_peer or x.remote + x.len > l.len or x.flag < l.flags or x.flag + 4 > l.send) t.outside += 1;
++        }
++        if (sum != padded) t.outside += 1;
++    }
+ };
+ 
+ fn rank(run: *Run, me: u32, lfd: sock.Fd) void {
+@@ -32,7 +58,9 @@ fn body(run: *Run, me: u32, lfd: sock.Fd) ?anyerror {
+     defer b.close();
+     var spec: [1]rv.HcaSpec = .{.{}};
+     if (run.wire == .verbs) _ = rv.parseSpecs(run.devs[me], @ptrCast(&spec)) catch |e| return e;
+-    const r = roce.Roce.init(null, &b, "", .{ .wire = run.wire, .hcas = if (run.wire == .verbs) &spec else &.{}, .max_bytes = run.max_bytes, .timeout_ns = run.timeout_ns }) catch |e| return e;
++    const mine = &run.taps[me];
++    mine.tap = .{ .ctx = mine, .seen = Tap.seen };
++    const r = roce.Roce.init(null, &b, "", .{ .wire = run.wire, .hcas = if (run.wire == .verbs) &spec else &.{}, .max_bytes = run.max_bytes, .timeout_ns = run.timeout_ns, .shm_stripes = run.stripes, .tap = &mine.tap }) catch |e| return e;
+     defer r.deinit();
+     var abort_thread: ?std.Thread = null;
+     defer if (abort_thread) |t| t.join();
+@@ -94,6 +122,17 @@ test "the RoCE protocol with variable lengths over the shm wire: each rank posts
+     try std.testing.expectEqual([2]u32{ 2000, 2000 }, run.done);
+ }
+ 
++test "the shm wire striped as over two HCAs: every post inside its slot and the region, bytes and lengths exact" {
++    var run: Run = .{ .port = 0, .wire = .shm, .ops = 2000, .var_lens = true, .stripes = 2 };
++    try twoRanks(&run);
++    for (run.errs) |e| if (e) |err| return err;
++    try std.testing.expectEqual([2]u32{ 2000, 2000 }, run.done);
++    for (run.taps) |t| {
++        try std.testing.expectEqual(@as(u32, 2000), t.posts);
++        try std.testing.expectEqual(@as(u32, 0), t.outside);
++    }
++}
++
+ test "a peer that stops makes the waiting rank time out, and abort ends a wait at once" {
+     var run: Run = .{ .port = 0, .wire = .shm, .ops = 50, .stop_after = 20, .timeout_ns = 100 * std.time.ns_per_ms };
+     try twoRanks(&run);
+diff --git a/zig/src/fabric/tp/roce_verbs.zig b/zig/src/fabric/tp/roce_verbs.zig
+index a540a4ce..2502aa07 100644
+--- a/zig/src/fabric/tp/roce_verbs.zig
++++ b/zig/src/fabric/tp/roce_verbs.zig
+@@ -4,15 +4,15 @@ const log = @import("log.zig");
+ const verbs = @import("verbs");
+ const abi = verbs.abi;
+ const Verbs = verbs.Verbs;
++const guard = @import("roce_guard.zig");
+ 
+-pub const max_hcas = 2;
++pub const max_hcas = guard.max_hcas;
+ /// Work requests a queue pair holds; at most a quarter outstanding (two requests a stripe).
+ const send_depth = 256;
+-const flag_stride = 128;
+ const link_ethernet = 2;
+-const record_magic: u32 = 0x5446_5244 + 1; // "TFRD", bumped once for this record's layout
++const record_magic: u32 = 0x5446_5244 + 2; // "TFRD", bumped for each change of this record's layout
+ 
+-pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord };
++pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord } || guard.Error;
+ 
+ /// One HCA as configured: its device name and RoCE v2 GID index (null: detected).
+ pub const HcaSpec = struct { name: [64]u8 = @splat(0), name_len: u8 = 0, gid: ?u8 = null };
+@@ -22,6 +22,9 @@ pub const Record = extern struct {
+     magic: u32 = record_magic,
+     n_hca: u32 = 0,
+     region: u64 = 0,
++    /// The region's slot and registered length: a peer whose layout differs is refused at connect.
++    slot_bytes: u64 = 0,
++    region_len: u64 = 0,
+     rkey: [max_hcas]u32 = @splat(0),
+     lid: [max_hcas]u32 = @splat(0),
+     mtu: [max_hcas]u32 = @splat(0),
+@@ -195,7 +198,7 @@ pub const VerbsWire = struct {
+     }
+ 
+     pub fn record(w: *const VerbsWire) Record {
+-        var r: Record = .{ .n_hca = w.n_hca, .region = @intFromPtr(w.region.ptr) };
++        var r: Record = .{ .n_hca = w.n_hca, .region = @intFromPtr(w.region.ptr), .slot_bytes = w.slot_bytes, .region_len = w.region.len };
+         for (w.hcas[0..w.n_hca], 0..) |h, i| {
+             r.rkey[i] = h.mr.rkey;
+             r.lid[i] = h.lid;
+@@ -209,7 +212,7 @@ pub const VerbsWire = struct {
+     /// The peer HCA for each of ours: the same IPv4 /24 (functions pair by subnet, names may differ), else position.
+     pub fn pairing(mine: Record, peer: Record) ![max_hcas]u32 {
+         if (peer.magic != record_magic) return error.BadRecord;
+-        if (peer.n_hca != mine.n_hca) return error.BadRecord;
++        if (peer.n_hca != mine.n_hca or peer.slot_bytes != mine.slot_bytes or peer.region_len != mine.region_len) return error.BadRecord;
+         var out: [max_hcas]u32 = undefined;
+         for (0..mine.n_hca) |i| {
+             out[i] = @intCast(i);
+@@ -242,27 +245,28 @@ pub const VerbsWire = struct {
+ 
+     /// Slot `slot`'s first `padded` bytes to the peer, striped over the HCAs, each stripe's `seq` flag on the same QP.
+     pub fn post(w: *VerbsWire, slot: u32, seq: u32, padded: u32) !void {
+-        const packs = padded / 16;
+-        var offset: u64 = 0;
++        var plan: [max_hcas]guard.Stripe = undefined;
++        try guard.stripes(w.regionLayout(), w.n_hca, slot, padded, &plan);
+         var seq_copy = seq;
+-        for (w.hcas[0..w.n_hca], 0..) |*h, i| {
++        for (w.hcas[0..w.n_hca], plan[0..w.n_hca], 0..) |*h, s, i| {
+             while (h.outstanding >= send_depth / 4) try w.reapHca(h);
+-            var stripe = packs / w.n_hca;
+-            if (i < packs % w.n_hca) stripe += 1;
+-            const bytes: u32 = stripe * 16;
+             var flag_sge: abi.Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
+-            var flag_wr: abi.SendWr = .{ .wr_id = seq, .sg_list = @ptrCast(&flag_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = abi.send_signaled | abi.send_inline, .remote_addr = w.peer_region + w.flag_off + (@as(u64, slot) * max_hcas + i) * flag_stride, .rkey = w.peer_rkey[i] };
+-            var data_sge: abi.Sge = .{ .addr = @intFromPtr(w.region.ptr) + w.send_off + slot * w.slot_bytes + offset, .length = bytes, .lkey = h.mr.lkey };
+-            var data_wr: abi.SendWr = .{ .wr_id = seq, .next = &flag_wr, .sg_list = @ptrCast(&data_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = 0, .remote_addr = w.peer_region + w.recv_off + slot * w.slot_bytes + offset, .rkey = w.peer_rkey[i] };
++            var flag_wr: abi.SendWr = .{ .wr_id = seq, .sg_list = @ptrCast(&flag_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = abi.send_signaled | abi.send_inline, .remote_addr = w.peer_region + s.flag, .rkey = w.peer_rkey[i] };
++            var data_sge: abi.Sge = .{ .addr = @intFromPtr(w.region.ptr) + s.local, .length = s.len, .lkey = h.mr.lkey };
++            var data_wr: abi.SendWr = .{ .wr_id = seq, .next = &flag_wr, .sg_list = @ptrCast(&data_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = 0, .remote_addr = w.peer_region + s.remote, .rkey = w.peer_rkey[i] };
+             var bad: ?*abi.SendWr = null;
+-            const first: *abi.SendWr = if (bytes > 0) &data_wr else &flag_wr;
++            const first: *abi.SendWr = if (s.len > 0) &data_wr else &flag_wr;
+             if (h.ctx.ops.post_send(h.qp, first, &bad) != 0) return error.PostFailed;
+             h.outstanding += 1;
+-            offset += bytes;
+         }
+         w.posted += 1;
+     }
+ 
++    /// This rank's layout; the MR covers `region` exactly and the peer's record matched it at connect.
++    pub fn regionLayout(w: *const VerbsWire) guard.Layout {
++        return .{ .send = w.send_off, .recv = w.recv_off, .flags = w.flag_off, .slot = w.slot_bytes, .len = w.region.len };
++    }
++
+     fn reapHca(w: *VerbsWire, h: *Hca) !void {
+         var wc: [32]abi.Wc = undefined;
+         const n = h.ctx.ops.poll_cq(h.cq, 32, &wc);
+@@ -303,4 +307,10 @@ test "HCA lists parse and subnets pair the functions" {
+     try std.testing.expect(ipv4Mapped(sub100));
+     b.n_hca = 1;
+     try std.testing.expectError(error.BadRecord, VerbsWire.pairing(a, b));
++    b.n_hca = 2;
++    b.slot_bytes = 1 << 20;
++    try std.testing.expectError(error.BadRecord, VerbsWire.pairing(a, b));
++    b.slot_bytes = 0;
++    b.region_len = 4096;
++    try std.testing.expectError(error.BadRecord, VerbsWire.pairing(a, b));
+ }
+diff --git a/zig/src/fabric/tp/tp.zig b/zig/src/fabric/tp/tp.zig
+index 3fe6d3fa..8e5d5b0d 100644
+--- a/zig/src/fabric/tp/tp.zig
++++ b/zig/src/fabric/tp/tp.zig
+@@ -200,7 +200,9 @@ test {
+     _ = roce_verbs;
+     _ = roce_pick;
+     _ = planlink;
++    _ = @import("roce_guard.zig");
+     _ = @import("roce_test.zig");
++    _ = @import("roce_post_test.zig");
+     _ = @import("host_test.zig");
+     _ = @import("fate_test.zig");
+ }
+-- 
+2.53.0
+

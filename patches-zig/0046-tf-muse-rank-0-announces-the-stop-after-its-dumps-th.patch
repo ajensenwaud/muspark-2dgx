@@ -1,0 +1,36 @@
+From a3c1295a313558b53fa6940b266d172da797fc0c Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 07:22:16 +1100
+Subject: [PATCH 46/60] tf-muse: rank 0 announces the stop after its dumps,
+ then both ranks meet before closing the TP session
+
+---
+ zig/src/families/muse_spark/m1_main.zig | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/muse_spark/m1_main.zig b/zig/src/families/muse_spark/m1_main.zig
+index 42b10440..c6e6335f 100644
+--- a/zig/src/families/muse_spark/m1_main.zig
++++ b/zig/src/families/muse_spark/m1_main.zig
+@@ -147,11 +147,14 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     var session: tp.Session = undefined;
+     if (world > 1) try session.open(&driver, tpc.?, @import("tp_kernel").mailbox);
+-    defer if (world > 1) {
+-        session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast when this rank ends first
+-        session.close();
+-    };
++    // a failed rank only closes: its hang-up fails the peer fast (exit 70) instead of leaving it in a collective
++    defer if (world > 1) session.close();
+     try runRank(gpa, ar, io, &driver, args, rank, world, if (world > 1) session.comm() else null, kn);
++    if (world > 1) { // the stop: rank 0 (dumps written) announces it, then both meet, so neither close fails the other
++        if (rank == 0) session.announceStop();
++        try session.comm().barrier();
++        std.debug.print("STOPPED rank {d}: both ranks done\n", .{rank});
++    }
+     return 0;
+ }
+ 
+-- 
+2.53.0
+

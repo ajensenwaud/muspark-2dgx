@@ -1,0 +1,81 @@
+From 352fc6378dd8a7c69b0882d8f2a0d97e93f5ef05 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:33:54 +0700
+Subject: [PATCH 19/60] Sessions: the page map is rehashed before tombstones
+ fill it
+
+The prefix index keeps one node per distinct full page of every saved entry in `by_digest`. Each saved turn adds its
+new pages, and each entry dropped or evicted removes the pages no other entry passes through, for the life of the
+server. std's tombstones never clear, so in time they take every free slot, and each save's new pages and each find's
+walk past the cached prefix then probe the whole map. The map now counts its removals and is rehashed in place once
+they reach a tenth of its capacity.
+
+Test: 3,000 turns of up to 60 fresh pages, the oldest dropped past eight, keep a tenth of the map free after every
+turn; without the rehash it fails.
+
+(cherry picked from commit 0ba7d30557c5a4bd6f0646dd7fd125bb58105704)
+---
+ zig/src/sessions/prefix.zig | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/sessions/prefix.zig b/zig/src/sessions/prefix.zig
+index 28c639fb..98634bbf 100644
+--- a/zig/src/sessions/prefix.zig
++++ b/zig/src/sessions/prefix.zig
+@@ -85,6 +85,7 @@ pub fn Index(comptime Extra: type) type {
+         nodes: std.ArrayList(Node) = .empty,
+         free_nodes: std.ArrayList(u32) = .empty,
+         by_digest: std.AutoHashMapUnmanaged(Digest, u32) = .empty,
++        dead: u32 = 0, // nodes dropped from `by_digest` since it was last rehashed
+         entries: std.ArrayList(Entry) = .empty,
+         free_entries: std.ArrayList(u32) = .empty,
+         by_key: std.AutoHashMapUnmanaged(Digest, u32) = .empty,
+@@ -259,12 +260,20 @@ pub fn Index(comptime Extra: type) type {
+                     if (nd.prev_sib != none) x.nodes.items[nd.prev_sib].next_sib = nd.next_sib else x.nodes.items[nd.parent].first_child = nd.next_sib;
+                     if (nd.next_sib != none) x.nodes.items[nd.next_sib].prev_sib = nd.prev_sib;
+                 }
+-                _ = x.by_digest.remove(nd.digest);
++                if (x.by_digest.remove(nd.digest)) x.dropped();
+                 x.free_nodes.append(x.gpa, m) catch {};
+                 m = nd.parent;
+             }
+         }
+ 
++        /// std's tombstones never clear and keys fill 80 %: rehash at a tenth, so a tenth of the map always stays free.
++        fn dropped(x: *Self) void {
++            x.dead += 1;
++            if (@as(u64, x.dead) * 10 < x.by_digest.capacity()) return;
++            x.by_digest.rehash(std.hash_map.AutoContext(Digest){});
++            x.dead = 0;
++        }
++
+         /// The entry's tail matches the prompt there and the entry is shorter (its full pages matched by digest).
+         fn tailOf(e: *const Entry, prompt: []const i32) bool {
+             const at: usize = @intCast(e.pos - e.tail.len);
+@@ -455,3 +464,23 @@ test "longest strict prefix, ties, tags and coverage" {
+     try std.testing.expectEqual(@as(?u32, null), x.find(7, chat[0..150], d[0..9], .any));
+     try std.testing.expectEqual(@as(u32, 1 + 6), x.by_digest.count()); // tag 8's root + its 6 full pages
+ }
++
++test "a long run of turns saved and dropped leaves the page map free slots" {
++    const gpa = std.testing.allocator;
++    var x = T.init(gpa, 16);
++    defer x.deinit();
++    var live: std.ArrayList(u32) = .empty;
++    defer live.deinit(gpa);
++    var rng = std.Random.DefaultPrng.init(5);
++    for (0..3000) |i| {
++        // a chat's turn (its own pages), the oldest dropped once eight are kept: nodes come and go
++        const ids = try seq(gpa, 16 * 60, @intCast(i));
++        defer gpa.free(ids);
++        try live.append(gpa, try add(&x, 7, ids[0 .. 16 * (1 + rng.random().uintLessThan(usize, 60))], true, i));
++        if (live.items.len > 8) x.remove(live.orderedRemove(0));
++        const meta = x.by_digest.metadata orelse continue;
++        var free: usize = 0;
++        for (meta[0..x.by_digest.capacity()]) |m| free += @intFromBool(m.isFree());
++        try std.testing.expect(free * 10 >= x.by_digest.capacity());
++    }
++}
+-- 
+2.53.0
+

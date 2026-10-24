@@ -1,0 +1,52 @@
+From 81a81acbb567c9394b92222e90bcb9f70f46d12e Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 07:53:09 +1100
+Subject: [PATCH 2/2] muse_spark: keep norm/gate numel across unload (converter
+ reports bpw after unload)
+
+---
+ exllamav3/modules/arch_specific/muse_spark.py | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/exllamav3/modules/arch_specific/muse_spark.py b/exllamav3/modules/arch_specific/muse_spark.py
+index 4ed77e3..f7a98d8 100644
+--- a/exllamav3/modules/arch_specific/muse_spark.py
++++ b/exllamav3/modules/arch_specific/muse_spark.py
+@@ -43,7 +43,7 @@ class MuseSparkInputScaledRMSNorm(Module):
+         self.round_bf16 = round_bf16
+         self.weight = None
+         self.scale = None
+-        self._numel = None
++        self._numel = 0
+ 
+     @override
+     def optimizer_targets(self):
+@@ -337,6 +337,7 @@ class MuseSparkBlock(TransformerBlock):
+         self.mlp_gate_t = None
+         self.attn_ab = None
+         self.mlp_ab = None
++        self._gate_numel = 0
+         self.caps.update({"supports_tp": False})
+ 
+     def _alpha_beta(self, g: torch.Tensor):
+@@ -353,6 +354,8 @@ class MuseSparkBlock(TransformerBlock):
+         self.mlp_gate_t = get(self.key_mlp_gate)
+         self.attn_ab = self._alpha_beta(self.attn_gate_t)
+         self.mlp_ab = self._alpha_beta(self.mlp_gate_t)
++        # Kept across unload: the converter reports a layer's bpw after unloading it
++        self._gate_numel = self.attn_gate_t.numel() + self.mlp_gate_t.numel()
+ 
+     @override
+     def unload(self):
+@@ -371,7 +374,7 @@ class MuseSparkBlock(TransformerBlock):
+ 
+     @override
+     def weights_numel(self):
+-        return super().weights_numel() + self.attn_gate_t.numel() + self.mlp_gate_t.numel()
++        return super().weights_numel() + self._gate_numel
+ 
+     @staticmethod
+     def _gate_(x: torch.Tensor, y: torch.Tensor, ab: tuple) -> torch.Tensor:
+-- 
+2.53.0
+

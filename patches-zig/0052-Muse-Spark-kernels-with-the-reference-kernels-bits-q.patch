@@ -1,0 +1,935 @@
+From a0d454288bfdfd2a52e21d4c6493e37e2ceae9d9 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:56:06 +1100
+Subject: [PATCH 52/60] Muse Spark kernels with the reference kernels' bits:
+ q/k/v/gate in one launch and 32-row passes (linear_multi.cu, linear_kernel's
+ body), 32-member expert tiles (experts2.cu), 2-warp router blocks with loads
+ ahead, cluster gate norm and expert sum
+
+---
+ zig/build/cuda.zig                          |   2 +
+ zig/kernels/cuda/muse_spark/experts2.cu     | 236 ++++++++++
+ zig/kernels/cuda/muse_spark/glue.cu         | 112 ++++-
+ zig/kernels/cuda/muse_spark/linear_multi.cu | 486 ++++++++++++++++++++
+ zig/src/cuda/kernels.zig                    |   2 +
+ 5 files changed, 835 insertions(+), 3 deletions(-)
+ create mode 100644 zig/kernels/cuda/muse_spark/experts2.cu
+ create mode 100644 zig/kernels/cuda/muse_spark/linear_multi.cu
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 2633d6a8..f78b6078 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -57,6 +57,8 @@ const kernels = [_]Kernel{
+     .{ .name = "muse_glue", .src = "muse_spark/glue", .flags = glue }, // Muse Spark: norms, gates, router, expert sums, head
+     .{ .name = "muse_attention", .src = "muse_spark/attention", .flags = &.{"-O3"} }, // Muse Spark: head_dim 64 decode attention
+     .{ .name = "muse_dflash2", .src = "muse_spark/dflash2", .flags = glue }, // Muse Spark: DFlash2 drafter convs, top-k, selector walk
++    .{ .name = "muse_experts2", .src = "muse_spark/experts2", .flags = &.{ "-O3", "-lineinfo" } }, // Muse Spark: 32-member expert tiles
++    .{ .name = "muse_linear", .src = "muse_spark/linear_multi", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // Muse Spark: q/k/v/gate in one launch
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/kernels/cuda/muse_spark/experts2.cu b/zig/kernels/cuda/muse_spark/experts2.cu
+new file mode 100644
+index 00000000..0e0491dd
+--- /dev/null
++++ b/zig/kernels/cuda/muse_spark/experts2.cu
+@@ -0,0 +1,236 @@
++// Muse Spark prompt path: the grouped EXL3 expert kernel (experts_grouped.cuh, unchanged helpers) with 32-member
++// tiles: each step's trellis words decoded once for two 16-member groups (two mma accumulator sets). Every member's
++// mma, warp order and output are grouped_kernel's, so the bits are its bits; half the decoding for experts with more
++// than 16 members (prompt windows of hundreds of rows).
++
++#include "../mimo_v2/experts_grouped.cuh"
++
++namespace muse_x2 {
++
++using namespace tf_exl3x;
++
++template <int CB, int K2, int NT, int PF>
++__device__ __forceinline__ void warp_tiles2(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
++                                            const half* const (&x0)[2], const half* const (&x1)[2],
++                                            const bool (&ok0)[2], const bool (&ok1)[2], bool two, int lane,
++                                            float (&acc)[2][NT][2][4]) {
++    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
++    const LaneMap<K2> map(lane);
++    const size_t kstride = (size_t)NTILES * TW;
++    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + lane;
++
++    uint32_t pf[PF][NT][LW];
++#pragma unroll
++    for (int d = 0; d < PF; ++d)
++        if (d < nkt)
++#pragma unroll
++            for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
++
++    for (int ib = 0; ib < nkt; ib += PF) {
++#pragma unroll
++        for (int d = 0; d < PF; ++d) {
++            const int it = ib + d;
++            if (it < nkt) {
++                uint32_t w[NT][LW];
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++#pragma unroll
++                    for (int l = 0; l < LW; ++l) w[i][l] = pf[d][i][l];
++                if (it + PF < nkt)
++#pragma unroll
++                    for (int i = 0; i < NT; ++i)
++                        load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
++                const int k = (kt0 + it) * 16;
++                uint32_t a[2][4];
++#pragma unroll
++                for (int q = 0; q < 2; ++q) {
++                    a[q][0] = load_pair(x0[q] + k, ok0[q]);
++                    a[q][1] = load_pair(x1[q] + k, ok1[q]);
++                    a[q][2] = load_pair(x0[q] + k + 8, ok0[q]);
++                    a[q][3] = load_pair(x1[q] + k + 8, ok1[q]);
++                }
++#pragma unroll
++                for (int i = 0; i < NT; ++i) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
++                    mma16816(acc[0][i][0], a[0], b0);
++                    mma16816(acc[0][i][1], a[0], b1);
++                    if (two) {
++                        mma16816(acc[1][i][0], a[1], b0);
++                        mma16816(acc[1][i][1], a[1], b1);
++                    }
++                }
++            }
++        }
++    }
++}
++
++// grouped_kernel with 32-member tiles: grid (nexp_max, N / (16 NT), mats * SK * MT2), MT2 = (maxm + 31) / 32.
++template <int CB, int NT, int W, int PF, int LO, int HI>
++__device__ __forceinline__ void grouped2(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
++    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
++    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    const int u = blockIdx.x;
++    if (u >= ucount[0]) return;
++    const int MT = (maxm + 31) / 32;
++    const int mtile = blockIdx.z % MT;
++    const int split = (blockIdx.z / MT) % SK;
++    const int mat = blockIdx.z / MT / SK;
++    const half* X = mat ? X1 : X0;
++    const int e = uids[u];
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
++    const int k2 = mat ? K2_1[e] : K2_0[e];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4;
++
++    __shared__ int rows_sh[32];
++    if (threadIdx.x < 32) {
++        const int m = mtile * 32 + threadIdx.x;
++        const int code = m < maxm ? members[u * maxm + m] : -1;
++        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++    }
++    __syncthreads();
++    if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
++    const bool two = rows_sh[16] >= 0;
++    const half* x0[2];
++    const half* x1[2];
++    bool ok0[2], ok1[2];
++#pragma unroll
++    for (int q = 0; q < 2; ++q) {
++        const int r0 = rows_sh[16 * q + g], r1 = rows_sh[16 * q + g + 8];
++        x0[q] = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
++        x1[q] = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
++        ok0[q] = r0 >= 0;
++        ok1[q] = r1 >= 0;
++    }
++
++    const int per_split = KT / SK, per_warp = per_split / W;
++    const int kt0 = split * per_split + warp * per_warp;
++    const int nt0 = blockIdx.y * NT;
++
++    float acc[2][NT][2][4];
++#pragma unroll
++    for (int q = 0; q < 2; ++q)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[q][i][h][c] = 0.f;
++
++    switch (k2) {
++#define MUSE_X2_CASE(K2_)                                                                                       \
++    case K2_:                                                                                                   \
++        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
++            warp_tiles2<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, two, lane, acc);      \
++        else                                                                                                    \
++            __trap();                                                                                           \
++        break;
++        MUSE_X2_CASE(2)
++        MUSE_X2_CASE(3)
++        MUSE_X2_CASE(4)
++        MUSE_X2_CASE(5)
++        MUSE_X2_CASE(6)
++        MUSE_X2_CASE(7)
++        MUSE_X2_CASE(8)
++        MUSE_X2_CASE(9)
++        MUSE_X2_CASE(10)
++        MUSE_X2_CASE(11)
++        MUSE_X2_CASE(12)
++        MUSE_X2_CASE(13)
++        MUSE_X2_CASE(14)
++        MUSE_X2_CASE(15)
++        MUSE_X2_CASE(16)
++#undef MUSE_X2_CASE
++        default:
++            __trap();
++    }
++
++    // each group's warps' partial sums through shared memory, added in warp order (grouped_kernel's)
++    __shared__ float red[W][16][NT * 16];
++#pragma unroll
++    for (int q = 0; q < 2; ++q) {
++        if (q == 1 && !two) break;
++        if (q) __syncthreads();
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[warp][g][col] = acc[q][i][h][0];
++                red[warp][g][col + 1] = acc[q][i][h][1];
++                red[warp][g + 8][col] = acc[q][i][h][2];
++                red[warp][g + 8][col + 1] = acc[q][i][h][3];
++            }
++        __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[16 * q + row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++        }
++    }
++}
++
++}  // namespace muse_x2
++
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_1_8_8(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 1, 8, 8>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_1_2_10(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 1, 2, 10>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_1_2_16(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 1, 2, 16>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_2_8_8(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 2, 8, 8>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_2_2_10(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 2, 2, 10>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_8_4_2_2_16(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 8, 4, 2, 2, 16>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_4_4_2_8_8(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 4, 4, 2, 8, 8>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_4_4_2_2_10(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 4, 4, 2, 2, 10>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_grouped2_4_4_2_2_16(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
++    const int* __restrict__ K2_0, const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    muse_x2::grouped2<2, 4, 4, 2, 2, 16>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
++}
+diff --git a/zig/kernels/cuda/muse_spark/glue.cu b/zig/kernels/cuda/muse_spark/glue.cu
+index 8b581387..77539c4c 100644
+--- a/zig/kernels/cuda/muse_spark/glue.cu
++++ b/zig/kernels/cuda/muse_spark/glue.cu
+@@ -2,6 +2,7 @@
+ // Each op follows exllamav3's muse_spark modules (the parity oracle) in its roundings; fp32 inside.
+ // Built with the glue flags (no contraction, IEEE division and square root): zig/build/cuda.zig.
+ 
++#include <cooperative_groups.h>
+ #include <cstdint>
+ #include <cuda_fp16.h>
+ #include <cuda_bf16.h>
+@@ -37,6 +38,20 @@ __device__ float block_sum(float v) {
+     return total;
+ }
+ 
++// block_sum of a 1024-thread block spread over a cluster of 8 blocks of 128 (thread t of the row = rank * 128 +
++// threadIdx.x): the same warp sums, the 32 warp partials read back in warp order by every warp, the same final
++// warp_sum, so the total has block_sum's bits. `part`: 4 floats of shared memory not reused before the last sync.
++__device__ __forceinline__ float cluster_sum(float v, float* part) {
++    namespace cg = cooperative_groups;
++    cg::cluster_group cl = cg::this_cluster();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    v = warp_sum(v);
++    if (lane == 0) part[warp] = v;
++    cl.sync();
++    const float* rp = cl.map_shared_rank(part, lane >> 2);
++    return warp_sum(rp[lane & 3]);
++}
++
+ }  // namespace
+ 
+ // x = rms(embed[ids].float()) (Embedding then the weightless embed_norm, fp32 out). A block a row.
+@@ -121,19 +136,75 @@ extern "C" __global__ void muse_gate_norm(float* __restrict__ res, const float*
+     }
+ }
+ 
++// muse_gate_norm on a cluster of 8 blocks of 128 threads a row (grid rows * 8): thread t's columns, sums and
++// arithmetic as muse_gate_norm's thread t, so the outputs have its bits; the row's loads spread over 8 SMs.
++extern "C" __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(128)
++    muse_gate_norm_c(float* __restrict__ res, const float* __restrict__ y, const float* __restrict__ y2,
++                     const float* __restrict__ scale, int round_bf16, float post_eps, const float* __restrict__ ab,
++                     const float* __restrict__ w_next, float next_eps, __half* __restrict__ x,
++                     float* __restrict__ xf, int D) {
++    __shared__ float part[2][4];
++    const int64_t r = blockIdx.x >> 3;
++    const int t0 = cooperative_groups::this_cluster().block_rank() * 128 + threadIdx.x;
++    float v[kMaxPer];
++    float ss = 0.f;
++    int n = 0;
++    for (int d = t0; d < D; d += 1024, ++n) {
++        float t = y[r * D + d];
++        if (y2) t = t + y2[r * D + d];
++        if (scale) {
++            t = t * scale[d];
++            if (round_bf16) t = bf16r(t);
++        }
++        v[n] = t;
++        ss += t * t;
++    }
++    const float rs = rsqrtf(cluster_sum(ss, part[0]) / (float)D + post_eps);
++    float ss2 = 0.f;
++    n = 0;
++    for (int d = t0; d < D; d += 1024, ++n) {
++        const float yn = v[n] * rs;
++        const float h = res[r * D + d] * ab[d] + yn * ab[D + d];
++        res[r * D + d] = h;
++        v[n] = h;
++        ss2 += h * h;
++    }
++    const float rs2 = rsqrtf(cluster_sum(ss2, part[1]) / (float)D + next_eps);
++    n = 0;
++    for (int d = t0; d < D; d += 1024, ++n) {
++        const float o = v[n] * rs2 * w_next[d];
++        x[r * D + d] = __float2half_rn(o);
++        if (xf) xf[r * D + d] = o;
++    }
++    cooperative_groups::this_cluster().sync();  // no block leaves while another reads its partials
++}
++
+ // Router logits in fp32: out[r, e] = x[r] . W[e] (F.linear(x.float(), router_weight)) on the fp32 normed input; W
+ // bf16 or fp32.
+-// Grid (E / 8, rows), 8 warps: a warp an expert.
++// Grid (E / warps, rows), a warp an expert (any warps a block: 2 spread one row over every SM). A lane sums its
++// columns d = lane + 32 j in order; the bf16 loop loads 8 columns ahead (the same sums, more loads in flight).
+ extern "C" __global__ void muse_router(const float* __restrict__ x, const void* __restrict__ W, int w_bf16,
+                                        float* __restrict__ out, int D, int E) {
+     const int r = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+-    const int e = blockIdx.x * 8 + warp;
++    const int e = blockIdx.x * (blockDim.x >> 5) + warp;
+     if (e >= E) return;
+     const float* xr = x + (int64_t)r * D;
+     float acc = 0.f;
+     if (w_bf16) {
+         const uint16_t* wr = (const uint16_t*)W + (int64_t)e * D;
+-        for (int d = lane; d < D; d += 32) acc += xr[d] * __uint_as_float(((uint32_t)wr[d]) << 16);
++        int d = lane;
++        for (; d + 224 < D; d += 256) {
++            uint16_t wv[8];
++            float xv[8];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                wv[j] = __ldg(wr + d + 32 * j);
++                xv[j] = xr[d + 32 * j];
++            }
++#pragma unroll
++            for (int j = 0; j < 8; ++j) acc += xv[j] * __uint_as_float(((uint32_t)wv[j]) << 16);
++        }
++        for (; d < D; d += 32) acc += xr[d] * __uint_as_float(((uint32_t)wr[d]) << 16);
+     } else {
+         const float* wr = (const float*)W + (int64_t)e * D;
+         for (int d = lane; d < D; d += 32) acc += xr[d] * wr[d];
+@@ -231,6 +302,41 @@ extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const fl
+         if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
+ }
+ 
++// muse_expert_sum on a cluster of 8 blocks of 128 threads a row (grid rows * 8), muse_expert_sum's bits (as
++// muse_gate_norm_c). K <= 16.
++extern "C" __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(128)
++    muse_expert_sum_c(const float* __restrict__ y, const float* __restrict__ y2, const float* __restrict__ wts,
++                      const float* __restrict__ scale, float eps, __half* __restrict__ out, int L, int K, int out_lo,
++                      int out_w) {
++    __shared__ float part[16][4];
++    const int64_t r = blockIdx.x >> 3;
++    const int t0 = cooperative_groups::this_cluster().block_rank() * 128 + threadIdx.x;
++    float acc[kMaxPer];
++    float v[kMaxPer];
++    int n = 0;
++    for (int d = t0; d < L; d += 1024, ++n) acc[n] = 0.f;
++    for (int k = 0; k < K; ++k) {
++        const int64_t p = r * K + k;
++        float ss = 0.f;
++        n = 0;
++        for (int d = t0; d < L; d += 1024, ++n) {
++            float t = y[p * L + d];
++            if (y2) t = t + y2[p * L + d];
++            t = bf16r(t * scale[d]);
++            v[n] = t;
++            ss += t * t;
++        }
++        const float rs = rsqrtf(cluster_sum(ss, part[k]) / (float)L + eps);
++        const float wk = wts[p];
++        n = 0;
++        for (int d = t0; d < L; d += 1024, ++n) acc[n] = acc[n] + (v[n] * rs) * wk;
++    }
++    n = 0;
++    for (int d = t0; d < L; d += 1024, ++n)
++        if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
++    cooperative_groups::this_cluster().sync();
++}
++
+ // The head: x = x * mult, then cap * tanh(x / cap) when cap > 0 (Linear pre_scale, ext.softcap), in place.
+ extern "C" __global__ void muse_softcap(float* __restrict__ x, int64_t n, float mult, float cap) {
+     for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+diff --git a/zig/kernels/cuda/muse_spark/linear_multi.cu b/zig/kernels/cuda/muse_spark/linear_multi.cu
+new file mode 100644
+index 00000000..49fa2fd9
+--- /dev/null
++++ b/zig/kernels/cuda/muse_spark/linear_multi.cu
+@@ -0,0 +1,486 @@
++// Muse Spark: several EXL3 linears over the same rows in one launch (q, k, v, gate: the k / v GEMVs alone fill only
++// 64 blocks). Each block runs the body of linear_kernel (exl3_linear.cu, unchanged) for its (linear, column block,
++// split), so every output has linear_kernel's bits; rot_in for several suh vectors in one launch likewise.
++
++#include "../mimo_v2/exl3_linear.cu"
++
++namespace muse_linear {
++
++using namespace tf_exl3_linear;
++
++template <int K2, int CB, int WK>
++__device__ __forceinline__ void linear_body(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK, const int nb, const int split,
++    const int NB) {
++    constexpr int TW = tile_words<K2>();
++    constexpr int LW = lane_words<K2>();
++    extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
++    __shared__ int last;
++    const int RH = min(M, 8);                                 // rows of red a warp
++
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int per_warp = (K >> 4) / SK / WK;
++    const int kt0 = split * (per_warp * WK) + warp * per_warp;
++    const uint32_t* tiles = T + nb * stride_nb;
++    const int col0 = nb * 128;
++    bool prev = false;
++    if constexpr (step_shuffled<K2>()) {
++        int word, offset;
++        lane_start<K2>(lane, word, offset);
++        prev = word != lane / (8 / K2);
++    }
++
++    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
++        const int R = min(16, M - m0);
++
++        float acc[8][2][4];
++#pragma unroll
++        for (int i = 0; i < 8; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++
++        // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
++        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
++        const half* x0 = xh + (size_t)r0 * K;
++        const half* x1 = xh + (size_t)r1 * K;
++        const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
++        // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
++        constexpr bool PF = K2 <= 12;
++        constexpr int SR = step_regs<K2>();
++        uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
++        if constexpr (PF) load_step<K2>(tile, lane, cur);
++#pragma unroll 1
++        for (int i = 0; i < per_warp; ++i) {
++            const int kt = kt0 + i;
++            uint32_t a[4];
++            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
++            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
++            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
++            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
++            if constexpr (PF) {
++                if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
++            }
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                uint32_t w[LW];
++                if constexpr (PF) step_lane_words<K2>(cur, j, lane, prev, w);
++                else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
++                uint32_t b0[2], b1[2];
++                decode_lane<K2, CB>(w, lane, b0, b1);
++                mma16816(acc[j][0], a, b0);
++                mma16816(acc[j][1], a, b1);
++            }
++            if constexpr (PF) {
++#pragma unroll
++                for (int q = 0; q < SR; ++q) cur[q] = nxt[q];
++            }
++        }
++
++        // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
++        for (int rlo = 0; rlo < R; rlo += 8) {
++            const int rn = min(R - rlo, 8);
++            __syncthreads();                         // red is reused by every half and pass
++            if (g < RH) {
++#pragma unroll
++                for (int i = 0; i < 8; ++i)
++#pragma unroll
++                    for (int h = 0; h < 2; ++h) {
++                        const int col = i * 16 + h * 8 + 2 * t;
++                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
++                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
++                    }
++            }
++            __syncthreads();
++
++            if (SK == 1) {
++                for (int r = warp; r < rn; r += WK) {
++                    float v[4];
++                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
++                    v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
++#pragma unroll
++                    for (int w = 1; w < WK; ++w) {
++                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
++                        v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
++                    }
++                    finish(v, lane, svh, bias, col0 + 4 * lane);
++                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
++                }
++            } else {
++                for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
++                    const int r = idx >> 5, c = 4 * (idx & 31);
++                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
++#pragma unroll
++                    for (int w = 1; w < WK; ++w) {
++                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
++                        s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
++                    }
++                    *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
++                }
++            }
++        }
++        if (SK > 1) {
++            __threadfence();
++            __syncthreads();
++            if (threadIdx.x == 0) last = atomicAdd(counters + pass * NB + nb, 1) == SK - 1;
++            __syncthreads();
++            if (last) {
++                __threadfence();
++                for (int r = warp; r < R; r += WK) {
++                    const size_t at = ((size_t)m0 + r) * N + col0 + 4 * lane;
++                    float4 s = __ldcg(reinterpret_cast<const float4*>(Z + at));
++                    for (int q = 1; q < SK; ++q) {
++                        const float4 u = __ldcg(reinterpret_cast<const float4*>(Z + (size_t)q * M * N + at));
++                        s.x += u.x; s.y += u.y; s.z += u.z; s.w += u.w;
++                    }
++                    float v[4] = {s.x, s.y, s.z, s.w};
++                    finish(v, lane, svh, bias, col0 + 4 * lane);
++                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
++                }
++                if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
++            }
++        }
++        __syncthreads();                             // red is reused in the next pass
++    }
++}
++
++
++// linear_body with 32-row passes: the step's weights decoded once for two 16-row groups (two mma accumulator sets),
++// each group's mma, warp sums, split tickets (pass = its 16-row index) and finish exactly linear_body's, so every row
++// has linear_kernel's bits; half the weight decoding at 17-128 rows.
++template <int K2, int CB, int WK>
++__device__ __forceinline__ void linear_body2(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK, const int nb, const int split,
++    const int NB) {
++    constexpr int TW = tile_words<K2>();
++    constexpr int LW = lane_words<K2>();
++    extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
++    __shared__ int last;
++    const int RH = min(M, 8);                                 // rows of red a warp
++
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int per_warp = (K >> 4) / SK / WK;
++    const int kt0 = split * (per_warp * WK) + warp * per_warp;
++    const uint32_t* tiles = T + nb * stride_nb;
++    const int col0 = nb * 128;
++    bool prev = false;
++    if constexpr (step_shuffled<K2>()) {
++        int word, offset;
++        lane_start<K2>(lane, word, offset);
++        prev = word != lane / (8 / K2);
++    }
++
++    for (int mb = 0; mb < M; mb += 32) {
++        const int ng = M - mb > 16 ? 2 : 1;                   // 16-row groups in this pass
++        float acc[2][8][2][4];
++#pragma unroll
++        for (int q = 0; q < 2; ++q)
++#pragma unroll
++            for (int i = 0; i < 8; ++i)
++#pragma unroll
++                for (int h = 0; h < 2; ++h)
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) acc[q][i][h][c] = 0.f;
++        const half* x0[2];
++        const half* x1[2];
++#pragma unroll
++        for (int q = 0; q < 2; ++q) {   // linear_body's clamped rows; an empty second group reads row M - 1 (unused)
++            const int m0 = mb + 16 * q;
++            int r0 = M - 1, r1 = M - 1;
++            if (m0 < M) {
++                const int R = min(16, M - m0);
++                r0 = m0 + (g < R ? g : R - 1);
++                r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
++            }
++            x0[q] = xh + (size_t)r0 * K;
++            x1[q] = xh + (size_t)r1 * K;
++        }
++        const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
++        constexpr bool PF = K2 <= 12;
++        constexpr int SR = step_regs<K2>();
++        uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
++        if constexpr (PF) load_step<K2>(tile, lane, cur);
++#pragma unroll 1
++        for (int i = 0; i < per_warp; ++i) {
++            const int kt = kt0 + i;
++            uint32_t a[2][4];
++#pragma unroll
++            for (int q = 0; q < 2; ++q) {
++                a[q][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t));
++                a[q][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t));
++                a[q][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t + 8));
++                a[q][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t + 8));
++            }
++            if constexpr (PF) {
++                if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
++            }
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                uint32_t w[LW];
++                if constexpr (PF) step_lane_words<K2>(cur, j, lane, prev, w);
++                else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
++                uint32_t b0[2], b1[2];
++                decode_lane<K2, CB>(w, lane, b0, b1);
++                mma16816(acc[0][j][0], a[0], b0);
++                mma16816(acc[0][j][1], a[0], b1);
++                if (ng == 2) {
++                    mma16816(acc[1][j][0], a[1], b0);
++                    mma16816(acc[1][j][1], a[1], b1);
++                }
++            }
++            if constexpr (PF) {
++#pragma unroll
++                for (int q = 0; q < SR; ++q) cur[q] = nxt[q];
++            }
++        }
++
++#pragma unroll
++        for (int q = 0; q < 2; ++q) {
++            if (q >= ng) break;
++            const int m0 = mb + 16 * q, pass = m0 >> 4;
++            const int R = min(16, M - m0);
++            // the warps' sums, added in warp order, rows 0-7 of the group and then rows 8-15 (linear_body's)
++            for (int rlo = 0; rlo < R; rlo += 8) {
++                const int rn = min(R - rlo, 8);
++                __syncthreads();
++                if (g < RH) {
++#pragma unroll
++                    for (int i = 0; i < 8; ++i)
++#pragma unroll
++                        for (int h = 0; h < 2; ++h) {
++                            const int col = i * 16 + h * 8 + 2 * t;
++                            *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
++                                rlo ? make_float2(acc[q][i][h][2], acc[q][i][h][3]) : make_float2(acc[q][i][h][0], acc[q][i][h][1]);
++                        }
++                }
++                __syncthreads();
++                if (SK == 1) {
++                    for (int r = warp; r < rn; r += WK) {
++                        float v[4];
++                        const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
++                        v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
++#pragma unroll
++                        for (int w = 1; w < WK; ++w) {
++                            const float4 qq = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
++                            v[0] += qq.x; v[1] += qq.y; v[2] += qq.z; v[3] += qq.w;
++                        }
++                        finish(v, lane, svh, bias, col0 + 4 * lane);
++                        store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
++                    }
++                } else {
++                    for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
++                        const int r = idx >> 5, c = 4 * (idx & 31);
++                        float4 sm = *reinterpret_cast<const float4*>(red + r * 128 + c);
++#pragma unroll
++                        for (int w = 1; w < WK; ++w) {
++                            const float4 qq = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
++                            sm.x += qq.x; sm.y += qq.y; sm.z += qq.z; sm.w += qq.w;
++                        }
++                        *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = sm;
++                    }
++                }
++            }
++            if (SK > 1) {
++                __threadfence();
++                __syncthreads();
++                if (threadIdx.x == 0) last = atomicAdd(counters + pass * NB + nb, 1) == SK - 1;
++                __syncthreads();
++                if (last) {
++                    __threadfence();
++                    for (int r = warp; r < R; r += WK) {
++                        const size_t at = ((size_t)m0 + r) * N + col0 + 4 * lane;
++                        float4 sm = __ldcg(reinterpret_cast<const float4*>(Z + at));
++                        for (int qq = 1; qq < SK; ++qq) {
++                            const float4 u = __ldcg(reinterpret_cast<const float4*>(Z + (size_t)qq * M * N + at));
++                            sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w;
++                        }
++                        float v[4] = {sm.x, sm.y, sm.z, sm.w};
++                        finish(v, lane, svh, bias, col0 + 4 * lane);
++                        store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
++                    }
++                    if (threadIdx.x == 0) counters[pass * NB + nb] = 0;
++                }
++            }
++            __syncthreads();
++        }
++    }
++}
++
++struct Job {
++    const half* xh;
++    const uint32_t* T;
++    long long stride_k, stride_nb;
++    const half* svh;
++    const half* bias;
++    void* y;
++    float* Z;
++    int* counters;
++    int y_dtype, K, N, SK, b0, pad;
++};
++struct Batch {
++    Job j[4];
++    int n, M, pad[2];
++};
++struct Rot {
++    const half* suh[4];
++    half* xh[4];
++};
++
++}  // namespace muse_linear
++
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k2(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<2, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k3(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<3, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k4(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<4, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k5(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<5, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k6(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<6, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear_multi_k8(const muse_linear::Batch b) {
++    int ji = 0;
++    while (ji + 1 < b.n && (int)blockIdx.x >= b.j[ji + 1].b0) ++ji;
++    const muse_linear::Job& J = b.j[ji];
++    const int NB = J.N / 128, local = blockIdx.x - J.b0;
++    muse_linear::linear_body<8, 2, 4>(J.xh, J.T, J.stride_k, J.stride_nb, J.svh, J.bias, J.y, J.y_dtype, J.Z,
++                                        J.counters, b.M, J.K, J.N, J.SK, local % NB, local / NB, NB);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_rot_multi(const void* __restrict__ x, int x_dtype,
++                                                                const muse_linear::Rot r, int K) {
++    const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
++    if (blk * 128 >= K) return;
++    const half* suh = r.suh[blockIdx.z];
++    half* xh = r.xh[blockIdx.z];
++    const int k = blk * 128 + 4 * lane;
++    float v[4], s[4];
++    tf_exl3_linear::load4(x, x_dtype, (size_t)row * K + k, v);
++    tf_exl3_linear::load4(suh, tf_exl3_linear::F16, k, s);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) v[j] *= s[j];
++    fwht128(v, lane);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
++    tf_exl3_linear::store4(xh, tf_exl3_linear::F16, (size_t)row * K + k, v);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k2_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<2, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k2_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<2, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k3_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<3, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k3_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<3, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k4_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<4, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k4_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<4, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k5_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<5, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k5_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<5, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k6_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<6, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k6_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<6, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) muse_linear2_k8_w4(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<8, 2, 4>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(256) muse_linear2_k8_w8(
++    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
++    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
++    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
++    muse_linear::linear_body2<8, 2, 8>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z, counters, M, K, N, SK,
++                                          blockIdx.x, blockIdx.y, gridDim.x);
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index f0b1dc82..67fd173f 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -48,6 +48,8 @@ pub const mimo_kv8: []const u8 = if (available) &Blob("fatbin_mimo_kv8").bytes e
+ pub const muse_glue: []const u8 = if (available) &Blob("fatbin_muse_glue").bytes else &.{};
+ pub const muse_attention: []const u8 = if (available) &Blob("fatbin_muse_attention").bytes else &.{};
+ pub const muse_dflash2: []const u8 = if (available) &Blob("fatbin_muse_dflash2").bytes else &.{};
++pub const muse_experts2: []const u8 = if (available) &Blob("fatbin_muse_experts2").bytes else &.{};
++pub const muse_linear: []const u8 = if (available) &Blob("fatbin_muse_linear").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+-- 
+2.53.0
+
