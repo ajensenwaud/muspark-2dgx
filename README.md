@@ -1,4 +1,6 @@
-# Muse Spark Open on 2x DGX Spark with TensorFold
+# Muspark
+
+Muse Spark Open on 2x DGX Spark with TensorFold.
 
 Meta's Muse Spark Open (816B parameters, MoE, about 42B active per token; 62 layers, 16 of them full
 attention and 46 sliding-window) served across two DGX Sparks nodes with tensor parallelism. The model runs on
@@ -8,14 +10,14 @@ average. RadixArk's DFlash2 drafter is used for speculative decoding.
 Currently text only, vision to be added later. Muse Spark is a heavy model for Sparks to run so don't expect high speed. The default profile serves one stream with a 905K token context, a second profile serves four at 192K each.
 
 The comparison point throughout is llama.cpp running Unsloth's UD-IQ2_XXS GGUF (225.6 GB) across the same two
-Sparks over RPC: the most direct way to run this model on this hardware before this recipe.
+Sparks over RPC: the most direct way to run this model on this hardware before Muspark.
 
 ## Speed and quality
 
 Speed, measured with [spark-bench](https://github.com/ajensenwaud/spark-bench) on the release configuration,
 both GPUs free, no other client, greedy, 512-token replies, reasoning effort low:
 
-| | llama.cpp, UD-IQ2_XXS | This recipe |
+| | llama.cpp, UD-IQ2_XXS | Muspark |
 |---|---|---|
 | Decode, 1 stream (tok/s, mean of 4 workloads) | 7.4 | 31.6 (29.4-33.7) |
 | Decode, 1 stream at temperature 1.0 (Meta's sampling, top_k off) | not measured | 23.2 (21.9-24.0); 25.4 at the server's default top_k 64 |
@@ -31,8 +33,8 @@ low):
 | Arm | GSM8K | MMLU-Pro | Replies that looped to the cap |
 |---|---|---|---|
 | llama.cpp, Unsloth UD-IQ2_XXS | 193/200 | not measured | 0 |
-| This recipe, 1.8 bpw pack, fp16 KV cache | 195/200 | 167/200 | 0 |
-| **This recipe, 1.8 bpw pack, 8-bit KV cache (the release)** | **196/200** | **167/200** | 0 |
+| Muspark, 1.8 bpw pack, fp16 KV cache | 195/200 | 167/200 | 0 |
+| **Muspark, 1.8 bpw pack, 8-bit KV cache (the release)** | **196/200** | **167/200** | 0 |
 
 Use temperature 1.0 (Meta's default); greedy decoding can loop on this model at these bit rates.
 
@@ -69,7 +71,7 @@ scripts/fetch_pack.sh    # the 1.8 bpw pack from Hugging Face (182 GiB, pinned r
 
 The pack: [ajensenwaud/Muse-Spark-Open-816B-A42B-EXL3-1.8bpw](https://huggingface.co/ajensenwaud/Muse-Spark-Open-816B-A42B-EXL3-1.8bpw).
 `prepare.sh` also fetches RadixArk's drafter at a pinned revision and quantises it on your own GPU (a few minutes,
-after a one-time 30-60 minute image build); this recipe does not redistribute it. `SKIP_DRAFTER=1 scripts/prepare.sh`
+after a one-time 30-60 minute image build); Muspark does not redistribute it. `SKIP_DRAFTER=1 scripts/prepare.sh`
 skips that, and `DRAFTER=0 ./start.sh` then serves without it (about 18 tok/s for one stream instead of 31.6 with it).
 
 Making the pack yourself instead of downloading it took about three days with the conversion split across both
@@ -105,7 +107,7 @@ free memory drops under 512 MiB. If the watchdog fires, `./start.sh` says so; re
 
 ## How it was built
 
-- Engine: TensorFold's Zig engine had no Muse family. This recipe adds one (`patches-zig/`, 60 patches on v1.0.11):
+- Engine: TensorFold's Zig engine had no Muse family. Muspark adds one (`patches-zig/`, 60 patches on v1.0.11):
   the model's forward on EXL3 packs, split across the two Sparks, CUDA graphs for decode, the DFlash2 drafter,
   a prompt path, the 8-bit KV cache, the prompt cache and the memory reductions. It is checked against exllamav3's
   reference forward within exllamav3's own noise.
@@ -129,7 +131,7 @@ tensor-parallel and RoCE work carried in `patches-zig/` and the method this port
 
 ## License
 
-The recipe's own code is under the BSD 3-Clause License (`LICENSE`). The engine and quantiser patches in
+Muspark's own code is under the BSD 3-Clause License (`LICENSE`). The engine and quantiser patches in
 `patches-zig/` and `patches-exl3/` modify TensorFold (Apache-2.0) and exllamav3 (MIT) and stay under those projects'
 licences. The model remains under Meta's own Muse License.
 

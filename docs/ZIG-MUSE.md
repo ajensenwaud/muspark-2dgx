@@ -313,7 +313,7 @@ file, so read them as worked examples.
 
 Parity with exllamav3:
 
-1. Answer key: `python3 tools/g6/muse_ref_stream.py MODEL OUT_DIR [--texts tools/g5/muse_texts.json]` in the recipe
+1. Answer key: `python3 tools/g6/muse_ref_stream.py MODEL OUT_DIR [--texts tools/g5/muse_texts.json]` in Muspark's
    image on one GPU (about 10 GB; the full pack is streamed module by module because it does not fit one Spark).
    It writes the ids, fp32 logits at every position and the noise floor (forwards over the first T/2 and T-17
    tokens against the full forward). `tools/g5/muse_texts.json` holds English prose, Chinese prose, code and an agent
