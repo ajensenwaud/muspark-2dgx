@@ -69,7 +69,8 @@ zig_args() {   # RANK: docker run arguments for one rank
        "--ulimit memlock=-1 --ulimit stack=67108864 --user $(id -u):$(id -g) -e HOME=/tmp" \
        "-e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$NCCL_HCAS -e NCCL_IB_GID_INDEX=$NCCL_GID" \
        "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=$MASTER -e TF_TP_PORT=$ZIG_TP_PORT" \
-       "-e TF_COMM_BACKEND=$ZIG_COMM -e TF_TP_ROCE_HCA=$NCCL_HCAS -e TF_TP_ROCE_FAST=1 $draft_env $ZIG_LEVERS ${ZIG_ENV:-}" \
+       "-e TF_COMM_BACKEND=$ZIG_COMM -e TF_TP_ROCE_HCA=$NCCL_HCAS -e TF_TP_ROCE_FAST=1" \
+       "-e TENSORFOLD_MEMORY_RESERVE_GIB=$MEM_RESERVE_GIB $draft_env $ZIG_LEVERS ${ZIG_ENV:-}" \
        "-v $MODEL_DIR:/model:ro -v $BIN:/zig:ro"
 }
 

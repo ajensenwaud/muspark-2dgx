@@ -59,7 +59,7 @@ embeddings, head_dim other than 64, GQA other than 8:1, non-default RoPE, codebo
 | `forward.zig`, `ops.zig` | The decode forward for a window of rows over any slots and positions, eager or graphed, with capture hooks for per-layer checks and teacher forcing |
 | `prompt.zig` | The prompt path (below) |
 | `engine.zig` | The model, its kernels and TP session; the plan link's words (`hello`, `forward`, `prompt`, `cache`, `stop`); rank 0 sends each window to rank 1 before launching it |
-| `native.zig` | `model_type = "muse_spark"` behind `tensorfold-native serve`: the lanes backend, keyed sampling, device argmax when greedy, the family's memory reserve (3 GiB) and prompt-cache budget (1 GiB) |
+| `native.zig` | `model_type = "muse_spark"` behind `tensorfold-native serve`: the lanes backend, keyed sampling, device argmax when greedy, and the family's prompt-cache budget (1 GiB) |
 | `kept.zig` | The prompt cache's state copies, slot pins and chunk cuts |
 | `dflash2.zig`, `dflash2_config.zig`, `dflash2_load.zig` | The DFlash2 drafter |
 | `pair.zig` | A test-only collective that runs both TP ranks as two threads on one GPU |
@@ -208,8 +208,8 @@ keeps the state at each mark through the `snap_*` hooks:
 | The drafter's context ring | the same buffer | 21.3 MiB (with the drafter) |
 
 A kept state costs about 0.2 GiB a rank whatever its length. `--prompt-cache-gib` caps the store (family default 1;
-`PROMPT_CACHE_GIB` in the recipe). The family holds back 3 GiB of memory rather than the server's default tenth,
-which would leave the cache no room beside the pack (`TENSORFOLD_MEMORY_RESERVE_GIB` overrides it). A state stays alive while no later pass on its slot rewrites rows
+`PROMPT_CACHE_GIB` in the recipe). The recipe sets the engine's memory reserve to 3 GiB
+(`TENSORFOLD_MEMORY_RESERVE_GIB`, `MEM_RESERVE_GIB`): the default tenth would leave the cache no room beside the pack. A state stays alive while no later pass on its slot rewrites rows
 under `at`: the next turn of the same conversation writes only past `at` and keeps it; another conversation that
 takes the slot ends the states there, and a request that would have used them runs fresh.
 

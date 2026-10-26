@@ -93,6 +93,9 @@ unset _ctx _par
 # MEM_MIN_FREE_GIB, where MEM_FIXED_GIB is the measured per-rank rest beyond weights, drafter and KV; while serving,
 # tools/mem/mem_guard.sh on each node removes both ranks under GUARD_MIB MemAvailable.
 MEM_MIN_FREE_GIB="${MEM_MIN_FREE_GIB:-3}"
+# The engine holds back a tenth of unified memory by default (12.2 GiB on a Spark), leaving this pack's caches no
+# room; the recipe sets 3 GiB explicitly (TENSORFOLD_MEMORY_RESERVE_GIB on both ranks), sized from the idle headroom.
+MEM_RESERVE_GIB="${MEM_RESERVE_GIB:-3}"
 MEM_FIXED_GIB="${MEM_FIXED_GIB:-9.2}"         # measured, includes the 1 GiB prompt cache; at the chosen contexts both
                                               # ranks idled at 5.0-6.7 GiB MemAvailable (long and multi)
 GUARD_MIB="${GUARD_MIB:-512}"
@@ -103,7 +106,7 @@ ZIG_COMM="${ZIG_COMM:-roce}"                  # roce (one-shot RoCE mailbox) or 
 ZIG_LEVERS="${ZIG_LEVERS:--e NCCL_MAX_NCHANNELS=4}"
 # Prompt cache: kept prompt states let a follow-up turn skip the history it shares with an earlier request (replies
 # byte-identical to a cache-off serve on 115 of 115 test requests). On by default in the engine for this family:
-# 1 GiB a rank, inside MEM_FIXED_GIB, with the engine's 3 GiB reserve. PROMPT_CACHE=0 turns it off
+# 1 GiB a rank, inside MEM_FIXED_GIB, with the recipe's 3 GiB reserve (MEM_RESERVE_GIB). PROMPT_CACHE=0 turns it off
 # (--prompt-cache-gib 0); PROMPT_CACHE_GIB=N passes another budget.
 PROMPT_CACHE="${PROMPT_CACHE:-1}"
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"
