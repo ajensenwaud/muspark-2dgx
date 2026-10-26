@@ -8,40 +8,37 @@ update.
 
 ## Engine base and build
 
-- TensorFold v1.0.11 (commit `3a6d1f14`, Zig 0.17.0) plus `patches-zig/` 0001-0060. The patched tree is `bf62c813`
-  (`ZIG_TREE` in `scripts/config.sh`).
-- 0001-0037: generic CUDA infrastructure (keyed graph cache, device arena, tensor parallelism across processes with
-  NCCL and a RoCE mailbox all-gather, a plan link between ranks, fail-fast, session memory, round planner, server
-  drain and SSE keepalives, family chat-rule hooks) and the MiMo-V2 family, whose EXL3 pack helpers, GEMV and grouped
-  expert kernels and DFlash kernels the Muse family reuses. Authors and licences: `CREDITS.md`. None of these
-  commits is in upstream v1.0.11.
-- 0038-0060: the Muse family and the server changes it needed (recipient replies, generation_config stop tokens,
-  the family's own prompt-cache hooks, the keyed sampler fix).
+- Since v1.1: TensorFold `main` at commit `40c6406b` (26 Oct 2026; no release tag yet, Zig 0.17.0) plus
+  `patches-zig/` 0001-0005. The patched tree is `71a9f224` (`ZIG_TREE` in `scripts/config.sh`).
+  - 0001: build wiring (the TP options read once, one mailbox module for every runner that embeds it).
+  - 0002: the `muse_spark` family on main's shared EXL3 operators, fp16 KV, TP=2 over main's `fabric/tp`, the
+    DFlash2 drafter and the prompt cache (with `docs/recipes/muse-spark.md` in the patched tree).
+  - 0003: every Muse kernel registered with main's kernel contract (gates 1-4, and its launches for gate 5).
+  - 0004-0005: the server's recipient-reply split (below), and its review fixes (a call cut by `max_tokens` comes
+    back as the reply's cut call, the reply goes on from the prompt's open message, thinking off keeps reasoning out).
+  0001-0003 are TensorFold pull request #1295 and 0004-0005 are #1336. The keyed-sampler fix that v1.0 carried as a patch
+  is in main already (#1337), as is the tensor-parallel and RoCE work v1.0 carried as patches.
+- v1.0 ran on TensorFold v1.0.11 plus 60 patches (tree `bf62c813`). The v1.1 engine computes the same logits byte for
+  byte on the fp16-KV arm (below), so the quality figures carry over.
 
-`scripts/zig_prepare.sh` (run by `scripts/prepare.sh`) clones the tag, applies the patches with `git am`, refuses
-unless the tree hash equals `ZIG_TREE`, builds the build image (`BASE_IMAGE` plus Zig, `zig/docker/Dockerfile.build`)
-if it is missing, then compiles in a container capped at `ZIG_BUILD_MEM` (8 GiB) and `ZIG_BUILD_JOBS` CPUs:
+`scripts/zig_prepare.sh` (run by `scripts/prepare.sh`) clones TensorFold, checks out `ZIG_TF_COMMIT`, applies the
+patches with `git am`, refuses unless the tree hash equals `ZIG_TREE`, builds the build image (`BASE_IMAGE` plus Zig,
+`zig/docker/Dockerfile.build`) if it is missing, then compiles in a container capped at `ZIG_BUILD_MEM` (8 GiB) and
+`ZIG_BUILD_JOBS` CPUs:
 
 ```bash
 zig build        -j4 -Dnvcc=$(which nvcc) -Dtp-nvcc=$(which nvcc) -Dsm=121 --prefix zig-out
 zig build native -j4 -Dnvcc=$(which nvcc) -Dtp-nvcc=$(which nvcc) -Dsm=121 --prefix zig-out
 ```
 
-It checks for `bin/tensorfold`, `bin/tf-muse`, `bin/tf-mimo`, `bin/tf-cuda-test`, `bin/tf-tp-test` (with its mailbox
-kernel) and `native/bin/tensorfold-native`, writes `zig-out/SHA256SUMS`, and copies `zig-out/` to the worker at the
-same path (`NO_WORKER=1` skips the copy). The cap is there so a build can run beside a serve. Build time is a few
-minutes.
+It checks for `bin/tensorfold`, `bin/tf-muse`, `bin/tf-cuda-test`, `bin/tf-tp-test` (with its mailbox kernel) and
+`native/bin/tensorfold-native`, writes `zig-out/SHA256SUMS`, and copies `zig-out/` to the worker at the same path
+(`NO_WORKER=1` skips the copy). The cap lets a build run beside other work; beside a running Muse serve the Sparks
+do not have 8 GiB to spare, so stop the serve first. Build time is about 10 minutes.
 
-Checks for the base:
-
-- Host tests (no GPU), in the build image: `zig build test` on v1.0.11 with 0001-0037 passed 871 of 877 tests (6
-  skipped); `zig build test-muse` runs the family's own host tests (config parsing, TP cuts, prompt-cache chunk
-  cuts, slot choice, plan words).
-- The two-node fabric: `tf-tp-test` through the `run_hosts.sh` runner described in `zig/src/fabric/tp/README.md` of
-  the patched tree. On two Sparks with `--network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit
-  memlock=-1`, `TF_TP_ROCE_HCA=rocep1s0f0,roceP2p1s0f0`, `NCCL_IB_GID_INDEX=3`, `NCCL_SOCKET_IFNAME=enp1s0f0np0`:
-  1,000 RoCE gathers of 1 B to 256 KiB bit-exact, the RoCE suite 378/378 and the NCCL suite 189/189 on each rank,
-  and every injected failure (fatal or kill, either rank) ends the other rank with exit 70.
+Host checks on the patched tree (no GPU): `zig build test-muse` (the family's host tests: config parsing, TP cuts,
+prompt-cache chunk cuts, slot choice, plan words), `zig build test-server-cpu` (with the recipient-reply tests),
+`zig build test-cuda-host`, and `zig test -lc zig/src/core/lanes/sampling.zig`.
 
 ## The model
 
@@ -57,21 +54,23 @@ embeddings, head_dim other than 64, GQA other than 8:1, non-default RoPE, codebo
 | File | What it does |
 |---|---|
 | `config.zig` | Parses `text_config`; a rank's view; the TP=2 cuts (`layerCuts`, `headCut`) |
-| `load.zig` | Loads a rank's share of the pack: EXL3 matrices through the MiMo-V2 pack helpers; norm weights as `1 + w` (centred and input-scaled norms) or `w` (final norm); residual gates as fp32 `alpha, beta`; the fp32 router kept as bf16 on the GPU when every value is exactly a bf16 (halves its reads) |
-| `forward.zig` | The decode forward for a window of rows over any slots and positions, eager or graphed, with capture hooks for per-layer checks and teacher forcing |
+| `load.zig`, `pack.zig` | Loads a rank's share of the pack: EXL3 strips; norm weights as `1 + w` (centred and input-scaled norms) or `w` (final norm); residual gates as fp32 `alpha, beta`; the fp32 router kept as bf16 on the GPU when every value is exactly a bf16 (halves its reads) |
+| `exl3.zig` | The EXL3 projections and routed experts on main's shared `cuda.exl3` linear and `cuda.exl3_experts` operators |
+| `forward.zig`, `ops.zig` | The decode forward for a window of rows over any slots and positions, eager or graphed, with capture hooks for per-layer checks and teacher forcing |
 | `prompt.zig` | The prompt path (below) |
 | `engine.zig` | The model, its kernels and TP session; the plan link's words (`hello`, `forward`, `prompt`, `cache`, `stop`); rank 0 sends each window to rank 1 before launching it |
-| `native.zig` | `model_type = "muse_spark"` behind `tensorfold-native serve`: the lanes backend, keyed sampling, device argmax when greedy, costs timed at load, per-rank weight admission |
+| `native.zig` | `model_type = "muse_spark"` behind `tensorfold-native serve`: the lanes backend, keyed sampling, device argmax when greedy, the family's memory reserve (3 GiB) and prompt-cache budget (1 GiB) |
 | `kept.zig` | The prompt cache's state copies, slot pins and chunk cuts |
-| `dflash2.zig`, `dflash2_config.zig` | The DFlash2 drafter |
+| `dflash2.zig`, `dflash2_config.zig`, `dflash2_load.zig` | The DFlash2 drafter |
 | `pair.zig` | A test-only collective that runs both TP ranks as two threads on one GPU |
-| `m1_main.zig` and the other `*_main.zig` | `tf-muse`: test drivers (`m1`, `prompt`, `dflash`, `drafted`, `timing`) and `follow` (rank 1 behind the server) |
+| `m1_main.zig`, `draft_main.zig`, `prompt_main.zig` | `tf-muse`: test drivers (`m1`, `prompt`, `dflash`, `drafted`) and `follow` (rank 1 behind the server) |
 | `glue.cu` | Embedding norm, RMS norms, residual gate + post norm + next pre-norm in one kernel, fp32 router, sigmoid + bias top-8, per-expert norm and weighted sum, softcap head, argmax, RoPE tables. Built without FMA contraction and with IEEE division |
-| `attention.cu` | QK norm + NeoX RoPE + cache write; decode attention partials; chunk merge + `o_norm` + sigmoid gate; the 8-bit cache's store and load |
-| `dflash2.cu` | The drafter's selector projection, causal convolutions, SiLU-mul, per-rank top 16 and the candidate walk |
+| `attention.cu` | QK norm + NeoX RoPE + cache write; decode attention partials; chunk merge + `o_norm` + sigmoid gate |
+| `linear_multi.cu`, `experts2.cu` | q/k/v/gate in one launch and 32-row passes over the shared linear's decode code; 32-member tiles of the shared grouped GEMM for prompt windows. Both are registered as bit-equal replacements of the shared kernels |
+| `dflash.cu`, `dflash2.cu` | The drafter's selector projection, causal convolutions, SiLU-mul, per-rank top 16 and the candidate walk |
 
-Build wiring: `zig/build/cuda.zig` (the fatbins, `tf-muse`, `zig build test-muse`) and `cuda/kernels.zig`.
-`server/recipient_reply.zig` handles Muse's reply format (below).
+Build wiring: `zig/build/muse.zig` (`tf-muse`, `zig build test-muse`). Kernel contract: `core/contract/muse_cuda_records.zig`
+and `tests/cuda/contract_muse*.zig`. `server/recipient_reply.zig` handles Muse's reply format (below).
 
 ### Why hand-written CUDA for attention
 
@@ -122,8 +121,7 @@ replicated: splitting it saves about 0.6 ms a token for one more gather a layer.
 
 ## Decode graphs and window invariance
 
-`Model.graphed` captures a CUDA graph per (rows in the window, key bucket); the release sets one bucket
-(`TF_MUSE_GRAPH_BUCKET=1048576`), so one graph a width. A full layer's key chunk width depends only on each row's own
+`Model.graphed` captures a CUDA graph per rows in the window (one key bucket, so one graph a width). A full layer's key chunk width depends only on each row's own
 position (256 keys up to a 16K bucket, then bucket / 64 rounded up to 256), and empty chunks write `max = -inf,
 sum = 0` and are skipped by the merge. So a row's bits do not depend on its window, its neighbours or the bucket:
 graphed logits are byte-equal to eager ones, and windows of 8 rows x 2 slots or 32 rows x 4 slots give the same
@@ -132,16 +130,13 @@ drafter's verify windows and the prompt cache.
 
 ## Prompt path
 
-`TF_MUSE_PROMPT=1` (on in the release) runs prompts of at least `TF_MUSE_PROMPT_MIN` rows (33) as chunks of
-`TF_MUSE_PROMPT_ROWS` (1,024) rows: wide windows for the dense layers, experts in grouped windows of
-`TF_MUSE_PROMPT_EWIN` (512) rows, and the head on the last row only. It gives the same bits as decode rows, which the
-prompt cache depends on. `TF_MUSE_PROMPT_EXACT=0` uses unsplit gate/up projections; its prompt rows differ from
-decode rows, so the prompt cache refuses to start with it. Shorter prompts, and every prompt without the switch, run
-as decode windows of up to 128 rows.
+Prompts of at least 33 rows run as chunks of 1,024 rows: wide windows for the dense layers, experts in grouped
+windows of 512 rows, and the head on the last row only. It gives the same bits as decode rows, which the prompt
+cache depends on. Shorter prompts run as decode windows.
 
-Full-attention layers still read keys with the decode-row kernel, so cold prompt reading slows with depth: 224
-tok/s at 4K tokens, 179 at 31K, 145 at 61K, 108 at 122K, 70 at 244K, 41 at 488K. A flash-style prompt attention
-kernel is planned for v1.1.
+Full-attention layers still read keys with the decode-row kernel, so cold prompt reading slows with depth: on the
+v1.1 engine 209 tok/s at 3.9K tokens and 196 tok/s at 15.4K; on v1.0 (same kernel) 179 at 31K, 145 at 61K, 108 at
+122K, 70 at 244K, 41 at 488K. A flash-style prompt attention kernel is the next engine step.
 
 ## DFlash2 drafter
 
@@ -166,8 +161,8 @@ RadixArk's Muse-Spark-Open-DFlash2 (bf16, 9.8 GB) is quantised to a 4.0 bpw EXL3
 - TP: split like the target (heads, KV heads, MLP width, `fc` outputs; norms, conv kernels, selector and codebooks
   replicated): about 1.15 GB of reads a rank a pass instead of 2.2 GB replicated, for 11 small all-gathers (about
   0.15 ms). Draft passes are captured as CUDA graphs per stream count, up to 16 streams x 8 rows.
-- On: `TF_MUSE_DRAFTER=<drafter pack>` on every rank and drafts on in the server; `start.sh` does both when
-  `DRAFTER=1` (the default).
+- On: `serve --drafter <drafter pack>` on rank 0 and `tf-muse follow <pack> <drafter pack>` on rank 1; `start.sh`
+  does both when `DRAFTER=1` (the default) and passes `--no-drafts` when `DRAFTER=0`.
 
 Measured on the full 2.0 bpw development pack at TP=2, greedy, 5 prompts x 128 steps: mean accepted tokens of 7 were 3.9 (coding), 3.2
 (code edit), 5.0 (reasoning), 0.8 (prose) and 2.9 (tool calls). Against the reference DFlash2 model on the same taps
@@ -188,16 +183,16 @@ nothing measurable against the bf16 weights (3.155 vs 3.122). Drafted replies ar
   arguments. Streaming holds back unfinished headers and call messages.
 - Streams share forwards: the family reports width 8 with or without the drafter, so up to 8 rows of different
   streams run in one window.
-- Sampling: the keyed sampler (patch 0060) no longer sorts the whole vocabulary when top_k and top_p cut nothing; it
-  makes one pass over the row and draws the same token as the sorted path. At temperature 1.0 with top_k off this took
-  one-stream decode from 14.7 to 23.2 tok/s with the drafter and from 13.3 to 18.2 without it.
+- Sampling: TensorFold's keyed sampler does not sort the whole vocabulary when top_k and top_p cut nothing; it makes
+  one pass over the row and draws the same token as the sorted path (upstream #1337; in v1.0 this was patch 0060, and
+  at temperature 1.0 with top_k off it took one-stream decode from 14.7 to 23.2 tok/s with the drafter).
 
 ## Prompt cache
 
 Every chat or agent turn re-sends the whole conversation. Without a cache the server re-reads all of it (a 22.7K-token
 history takes about 2 minutes); with it, a turn resumes from the longest kept prefix and reads only what is new.
-`TF_MUSE_PROMPT_CACHE=1` on rank 0 turns it on (`PROMPT_CACHE=1`, the release default); without it the serve takes
-the plain path.
+It is on by default for this family (1 GiB a rank); `serve --prompt-cache-gib N` sets another budget and `0` turns it
+off (`PROMPT_CACHE=0` in the recipe).
 
 ### What is kept
 
@@ -212,8 +207,9 @@ keeps the state at each mark through the `snap_*` hooks:
 | 46 sliding layers, each K/V ring (2,176 rows: the 2,047-key window + the row + a 128-row window) | a device buffer of the state | 195.5 MiB |
 | The drafter's context ring | the same buffer | 21.3 MiB (with the drafter) |
 
-A kept state costs about 0.2 GiB a rank whatever its length. `TF_MUSE_PROMPT_CACHE_GIB` caps the store (engine default
-2; the release sets 1 through `PROMPT_CACHE_GIB`). A state stays alive while no later pass on its slot rewrites rows
+A kept state costs about 0.2 GiB a rank whatever its length. `--prompt-cache-gib` caps the store (family default 1;
+`PROMPT_CACHE_GIB` in the recipe). The family holds back 3 GiB of memory rather than the server's default tenth,
+which would leave the cache no room beside the pack (`TENSORFOLD_MEMORY_RESERVE_GIB` overrides it). A state stays alive while no later pass on its slot rewrites rows
 under `at`: the next turn of the same conversation writes only past `at` and keeps it; another conversation that
 takes the slot ends the states there, and a request that would have used them runs fresh.
 
@@ -239,13 +235,14 @@ the prompt's end with the keyed sampler, as in a fresh pass.
 
 Rank 0 drives everything: each cache step (save, restore, copy prefix, drop) goes to rank 1 over the plan link before
 rank 0 runs it, and rank 1 replays it on its own stream in plan order with its own copies (each rank holds its half
-of the KV heads). The native server used to build the store from Nemotron's `snap_*` declarations only; patch 0058
-lets any family supply them, with optional `snap_budget`, `snap_lookahead` and `snap_ready`. Nemotron's behaviour is
-unchanged.
+of the KV heads). The native server builds the store from the family's `snap_*` declarations.
 
 ### Measured
 
-On P1.8s at TP=2 (4 slots x 32K, fp16 KV cache), 115 requests (multi-turn chats on the model's own replies, a
+v1.1 engine, P1.8s at TP=2 (multi profile, 4 slots x 110,592, fp16 KV, drafter on): 115 of 115 replies byte-identical
+to a cache-off serve, 49 resumed, 130,544 of 285,822 prompt tokens served from the cache.
+
+v1.0 engine, P1.8s at TP=2 (4 slots x 32K, fp16 KV cache), 115 requests (multi-turn chats on the model's own replies, a
 sampled conversation, an agent session whose tool outputs grow the history, a 22.7K-token document conversation,
 four conversations at once, four resumes of one history at once, six conversations round robin on four slots, and
 resume points across the sliding window's edge, the ring, prompt chunks and decode windows): every reply
@@ -258,56 +255,33 @@ Each Spark has 121.6 GiB shared by CPU and GPU, and an oversized allocation take
 so memory is planned before loading (`tools/mem/estimate.py`, called by `start.sh`) and watched while serving
 (`tools/mem/mem_guard.sh`). `MEM_FIXED_GIB` (9.2) is the measured per-rank rest beyond weights, drafter and KV cache.
 
-8-bit KV cache (`TF_MUSE_KV8=1`, `KV8=1` in the release): the 16 full-attention layers store int8 values with an
-fp32 scale per token and KV head (absmax / 127), dequantised per tile inside the attention kernel; about half the
-bytes of fp16, roughly 17 GiB a Spark for 1M tokens. The sliding layers keep fp16 rings. Unset, the cache is fp16.
-`TF_MUSE_KV8=2` selects e4m3 and is untested. The engine's start-up line says "e4m3" for mode 1 too; it is stale.
+The KV cache is fp16: the 16 full-attention layers hold 32 KiB a token a rank (about 14 GiB a Spark at 470K tokens),
+the sliding layers fp16 rings at their window. v1.0's 8-bit (int8) KV cache, which fitted ~905K tokens, is not in v1.1:
+TensorFold's main line takes no lossy KV cache, so the long profile now fits about 450K-470K tokens and the multi
+profile 4 x ~110K.
 
-Memory levers in the release, each byte-identical to the serve without it:
+The memory levers v1.0 switched on by environment are built into the family on main: the embedding stays in host
+memory (read from the pack's file mapping each window), the load uses 64 MiB arena blocks, and each layer's pages
+leave the page cache once uploaded. The recipe adds `NCCL_MAX_NCHANNELS=4`
+(`ZIG_LEVERS`): NCCL's pinned host buffers from 1.2 GiB to 78 MiB a rank, prompt reading unchanged.
 
-| Lever | Effect a rank |
-|---|---|
-| `TF_MUSE_EMBED_HOST=1` | the embedding is read from the pack's file mapping: 3.3 GB less GPU memory |
-| `TF_LOAD_ARENA_MIB=64` | first-fit 64 MiB arena blocks instead of 1 GiB ones: 1.9 GiB of block tails recovered |
-| `TF_LOAD_FREE_HOST=1` | the host copy of each uploaded matrix is freed: 4.8 GB of host memory that otherwise sat in swap |
-| `TF_MUSE_DROP_CACHE=1` | the pack's pages leave the process and the page cache after each layer uploads |
-| `TF_MUSE_GRAPH_BUCKET=1048576` | one decode graph a width instead of one a width and key bucket (about 53 MiB a graph; 32 graphs instead of up to 128 at 32K) |
-| `NCCL_MAX_NCHANNELS=4` | NCCL's pinned host buffers from 1.2 GiB to 78 MiB; prefill unchanged |
+## Settings
 
-`TF_MUSE_MEMLOG=1` prints a rank's memory at each load stage and graph capture (arena bytes handed out and held, KV
-bytes, process RSS, swap, pinned).
-
-## Environment switches
-
-Engine switches (set on both ranks; `start.sh` passes `ZIG_LEVERS`, the `KV8` / `PROMPT_CACHE` / `DRAFTER`
-settings, and anything in `ZIG_ENV`):
-
-| Switch | Engine default | Release | What it does |
-|---|---|---|---|
-| `TF_MUSE_PROMPT` | 0 | 1 | the prompt path |
-| `TF_MUSE_PROMPT_ROWS`, `_EWIN`, `_MIN` | 1024, 512, 33 | same | prompt chunk rows, expert window rows, shortest prompt on the prompt path |
-| `TF_MUSE_PROMPT_EXACT` | 1 | 1 | 0: unsplit gate/up on the prompt path (other bits; disables the prompt cache) |
-| `TF_MUSE_KV8` | unset (fp16) | 1 | 1: int8 full-layer KV cache; 2: e4m3, untested |
-| `TF_MUSE_PROMPT_CACHE`, `_GIB` | 0, 2 | 1, 1 | the prompt cache and its budget a rank |
-| `TF_MUSE_DRAFTER` | unset | the drafter pack | turns the drafter on (with drafts on in the server) |
-| `TF_MUSE_DEPTH` | unset | unset | `geometric`: a draft depth whose round cost grows with context |
-| `TF_MUSE_FAST` | on | on | launch levers (q/k/v/gate in one launch, router blocks, cluster kernels, 32-row passes, 32-member expert tiles), all byte-identical; 0: the original launches |
-| `TF_MUSE_OVERLAP` | 0 | 0 | router on a side stream beside the latent gather; measured no gain |
-| `TF_MUSE_EMBED_HOST`, `TF_LOAD_ARENA_MIB`, `TF_LOAD_FREE_HOST`, `TF_MUSE_DROP_CACHE`, `TF_MUSE_GRAPH_BUCKET` | off | on | memory levers (above) |
-| `TF_MUSE_GRAPHS` | 0 (no limit) | 0 | LRU cap on decode graphs |
-| `TF_MUSE_TRIM` | 0 | 0 | `malloc_trim` after load and graph captures |
-| `TF_MUSE_MEMLOG` | 0 | 0 | memory ledger in the log |
-| `TF_COMM_BACKEND` | | `roce` | `roce` or `nccl` (`ZIG_COMM`) |
+Serve flags `start.sh` passes: `--parallel`, `--context`, `--max-tokens`, the sampling defaults, `--drafter /drafter`
+(or `--no-drafts`) and, only when asked, `--prompt-cache-gib`. Environment on both ranks: the `TF_TP_*` rank
+variables, `TF_COMM_BACKEND` (`ZIG_COMM`: `roce` or `nccl`), the NCCL interface variables, `ZIG_LEVERS` and anything
+in `ZIG_ENV`. v1.0's `TF_MUSE_*` switches are gone.
 
 Recipe switches for `./start.sh` (defaults in `scripts/config.sh`, overrides in `scripts/local.sh` or the
-environment): `PROFILE` (`long` or `multi`), `ZIG_CONTEXT`, `PARALLEL`, `CONTEXT_AUTO`, `KV8`, `PROMPT_CACHE`,
+environment): `PROFILE` (`long` or `multi`), `ZIG_CONTEXT`, `PARALLEL`, `CONTEXT_AUTO`, `PROMPT_CACHE`,
 `PROMPT_CACHE_GIB`, `DRAFTER`, `ZIG_LEVERS` (`" "` for none), `ZIG_ENV` (extra `-e` flags), `ZIG_BIN` (another
 build), `MEM_MIN_FREE_GIB`, `MEM_FIXED_GIB`, `MEM_CHECK=0` (skip the estimate), `GUARD_MIB`, `GUARD=0` (no in-run
 guard), `SAMPLING_ARGS` (the server's defaults when a request omits them: temperature 1.0, top_p 1.0, top_k 64).
 
 ## Correctness checks
 
-These checks were run during development and the numbers below come from those runs. The building blocks are generic; the wrapper scripts under
+These checks were run during development and the numbers below come from those runs (the exllamav3 parity on the v1.0
+engine; the v1.1 engine is tied to it byte for byte, below). The building blocks are generic; the wrapper scripts under
 `tools/g5`, `tools/g6` and `tools/pc` were written for the development cluster and assume its paths and a GPU lock
 file, so read them as worked examples.
 
@@ -339,12 +313,16 @@ The shipped 1.8 bpw pack at TP=2:
 Per-layer errors on a 2-layer pack (one sliding, one full layer) were flat along the 2,600-token text, through the
 point where the sliding window starts dropping keys and the ring wraps.
 
+v1.1 engine against v1.0 (same pack and inputs, TP=2, fp16 KV): eager decode rows 10 of 10 logits files
+byte-equal, drafted runs 10 of 10 byte-equal with the same acceptance (953 of 2,210), and the prompt path equal to
+decode rows on both builds. So the parity table above and the fp16-KV quality figures in the README hold for v1.1.
+
 Bit-identity checks (each must be byte-equal):
 
 - Graphs vs eager: `tf-muse m1` with `MUSE_GRAPHS=1` against an eager run of the same texts (9 of 9 cases).
 - Prompt path vs decode rows: `tf-muse prompt MODEL IN_DIR OUT_DIR`.
 - Drafter: `tf-muse dflash` (the fixed protocol, taps dumped, compared with `tools/g6/dflash_ref.py`) and
-  `tf-muse drafted` (drafted vs plain greedy) with `TF_MUSE_DRAFTER` set; on a serve,
+  `tf-muse drafted` (drafted vs plain greedy) with `TF_MUSE_DRAFTER` naming the drafter pack; on a serve,
   `python3 tools/g6/drafted_exact.py http://127.0.0.1:8888 Muse-Spark-Open out.json --sb <spark-bench checkout>`
   sends spark-bench's 12 decode prompts with and without drafting, serial and 4 at a time (12 of 12 identical).
 - Prompt cache: record on a cache-off serve, replay on a cache-on one (and with the drafter):
@@ -373,7 +351,7 @@ are in the README.
   1's slice.
 - The router reads the fp32 normed input. exllamav3 cast it to fp16 before `patches-exl3/` 0004; answer keys made
   with an older image do not match.
-- A NaN row from the head could leave the drafter's top-16 ids at their sentinel; patch 0049 skips NaN logits.
+- A NaN row from the head could leave the drafter's top-16 ids at their sentinel; the drafter skips NaN logits.
 - Prompt cache: with more live conversations than slots, states end when another conversation takes their slot and
   the hit rate falls. Ended states keep their budget charge until the store drops them, which can evict a live state
   early under heavy churn (fewer hits, never wrong replies). A rank-1 allocation failure while saving a state stops the

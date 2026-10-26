@@ -44,12 +44,12 @@ EXL3_PATCHED_TREE="d11926cec947ef5981a033397f1075c2b2a30131"  # git tree of EXL3
 HF_IMAGE="${HF_IMAGE:-mimo-tf:latest}"
 
 # --- Zig engine (scripts/zig_prepare.sh) -------------------------------------------------------------------------
-# TensorFold's Zig engine at this release plus patches-zig/ (generic CUDA infrastructure, tensor parallelism and the
-# muse_spark family). The build runs in ZIG_BUILD_IMAGE: BASE_IMAGE (local, never pulled) plus Zig.
+# TensorFold's Zig engine at an upstream main commit plus patches-zig/ (the muse_spark family and its build wiring,
+# the kernel-contract registrations, and the server's recipient-reply split). The build runs in ZIG_BUILD_IMAGE:
+# BASE_IMAGE (local, never pulled) plus Zig.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold}"
-ZIG_TF_TAG="v1.0.11"                          # .zig-version 0.17.0
-ZIG_TF_COMMIT="3a6d1f1410a4864df2516e6f977e63620b10a33d"
-ZIG_TREE="bf62c813ea0d445a133e2e09abe7306a1edd4d45"   # git tree of the tag with patches-zig/ applied (zig_prepare.sh checks)
+ZIG_TF_COMMIT="40c6406b3deb290aa3ec8ced310bc1c8896d160c"   # main, 26 Oct 2026 (no tag); .zig-version 0.17.0
+ZIG_TREE="71a9f224a5304a7af39c6652ed5b5e5e833d64af"   # git tree of ZIG_TF_COMMIT with patches-zig/ applied (zig_prepare.sh checks)
 ZIG_DIR="${ZIG_DIR:-$HOME/muse/tensorfold-zig}"      # the patched tree and its build (zig-out/), the same path on both nodes
 ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-muse-zig-build:0.17.0}"   # FROM BASE_IMAGE above (local, never pulled) + Zig
 ZIG_BUILD_MEM="${ZIG_BUILD_MEM:-8g}"          # the build container's memory cap (a serve may hold the rest)
@@ -74,11 +74,11 @@ SERVED_NAME="${SERVED_NAME:-Muse-Spark-Open}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"                          # API port
 ZIG_TP_PORT="${ZIG_TP_PORT:-29681}"           # rank rendezvous
-# Serve profiles (PROFILE=long|multi ./start.sh). Both: the 8-bit KV cache for the full layers, the prompt cache and
-# the drafter. The context per slot is what start.sh's memory estimate allows on the MemAvailable it reads at start:
-# with CONTEXT_AUTO=1 a request that does not fit is cut to the largest that does.
-#   long   1 slot; asks for 1,048,576 tokens, gets ~905K on two idle Sparks (3 GiB a rank kept free)
-#   multi  4 slots x 196,608 tokens (the estimate's largest at 4 slots is ~217K; 192K keeps ~1.5 GiB more margin)
+# Serve profiles (PROFILE=long|multi ./start.sh). Both: fp16 KV, the prompt cache and the drafter. The context per
+# slot is what start.sh's memory estimate allows on the MemAvailable it reads at start: with CONTEXT_AUTO=1 a request
+# that does not fit is cut to the largest that does.
+#   long   1 slot; asks for 1,048,576 tokens, gets ~450K-470K on two idle Sparks (3 GiB a rank kept free)
+#   multi  4 slots; asks for 196,608 tokens each, gets ~110K
 PROFILE="${PROFILE:-long}"
 case "$PROFILE" in
   long)  _ctx=1048576; _par=1 ;;
@@ -93,31 +93,20 @@ unset _ctx _par
 # MEM_MIN_FREE_GIB, where MEM_FIXED_GIB is the measured per-rank rest beyond weights, drafter and KV; while serving,
 # tools/mem/mem_guard.sh on each node removes both ranks under GUARD_MIB MemAvailable.
 MEM_MIN_FREE_GIB="${MEM_MIN_FREE_GIB:-3}"
-MEM_FIXED_GIB="${MEM_FIXED_GIB:-9.2}"         # measured: 6.0 at 32K x 4; a 1-slot long-context serve holds 2.2 more on
-                                              # the worker (P1.8s kv8 1M: est 4.1 GiB free, measured 1.97 idle), + 1.0 prompt-cache budget
+MEM_FIXED_GIB="${MEM_FIXED_GIB:-9.2}"         # measured, includes the 1 GiB prompt cache; at the chosen contexts both
+                                              # ranks idled at 5.0-6.7 GiB MemAvailable (long and multi)
 GUARD_MIB="${GUARD_MIB:-512}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 ZIG_COMM="${ZIG_COMM:-roce}"                  # roce (one-shot RoCE mailbox) or nccl: identical bytes
-# Engine levers, both ranks: the prompt path (bit-exact with decode rows) and the embedding read from the pack's file
-# mapping (3.3 GB a rank of GPU memory freed, byte-identical). In the engine by default: TF_MUSE_FAST (the exact
-# launch levers). TF_MUSE_OVERLAP=1 (router beside the latent gather) measured no gain.
-# 8-bit KV cache for the 16 full-attention layers (TF_MUSE_KV8=1): int8 values with an fp32 scale per token and KV
-# head (absmax / 127), half the bytes of fp16; quality-checked on P1.8s with GSM8K and MMLU-Pro. The engine's start-up
-# line "muse kv8: full layers' caches in e4m3" is stale: mode 1 is int8 (attention.cu q8_store), TF_MUSE_KV8=2 would
-# be e4m3 and is untested. The sliding-window layers keep fp16 rings.
-# Prompt cache (TF_MUSE_PROMPT_CACHE=1): kept prompt states let a follow-up turn skip the history it shares with an
-# earlier request (replies byte-identical to a cache-off serve on 115 of 115 test requests); states capped at
-# TF_MUSE_PROMPT_CACHE_GIB a rank (1 GiB is inside MEM_FIXED_GIB).
-# Memory levers, all byte-identical to the serve without them (36 of 36 replies): first-fit 64 MiB device arena blocks
-# (TF_LOAD_ARENA_MIB, -1.9 GiB a rank of block tails), the uploaded host matrices freed (TF_LOAD_FREE_HOST, -4.8 GB a
-# rank of host memory that sat in swap), the pack's pages dropped from the page cache as each layer uploads
-# (TF_MUSE_DROP_CACHE), one decode graph a width instead of one a width and key bucket (TF_MUSE_GRAPH_BUCKET, ~53 MiB
-# a graph, 32 graphs instead of up to 128 at 32K), and NCCL at 4 channels (1.2 GiB a rank of pinned host buffers ->
-# 78 MiB; prefill unchanged).
-ZIG_LEVERS="${ZIG_LEVERS:--e TF_MUSE_PROMPT=1 -e TF_MUSE_EMBED_HOST=1 -e TF_LOAD_ARENA_MIB=64 -e TF_LOAD_FREE_HOST=1 -e TF_MUSE_DROP_CACHE=1 -e TF_MUSE_GRAPH_BUCKET=1048576 -e NCCL_MAX_NCHANNELS=4}"
-KV8="${KV8:-1}"                               # 1: the 8-bit (int8) full-layer KV cache; 0: fp16 (about half the context)
-PROMPT_CACHE="${PROMPT_CACHE:-1}"             # 1: keep prompt states between turns; 0: off
-PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-1}"
+# Engine settings, both ranks. The family's speed and memory levers are built in on this engine (no switches); the
+# KV cache is fp16. NCCL at 4 channels: 1.2 GiB a rank of pinned host buffers -> 78 MiB, prompt reading unchanged.
+ZIG_LEVERS="${ZIG_LEVERS:--e NCCL_MAX_NCHANNELS=4}"
+# Prompt cache: kept prompt states let a follow-up turn skip the history it shares with an earlier request (replies
+# byte-identical to a cache-off serve on 115 of 115 test requests). On by default in the engine for this family:
+# 1 GiB a rank, inside MEM_FIXED_GIB, with the engine's 3 GiB reserve. PROMPT_CACHE=0 turns it off
+# (--prompt-cache-gib 0); PROMPT_CACHE_GIB=N passes another budget.
+PROMPT_CACHE="${PROMPT_CACHE:-1}"
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"
 ZIG_CONTAINER="${ZIG_CONTAINER:-muse-zig}"    # rank 1: $ZIG_CONTAINER-follow on the worker
 ZIG_RUN_IMAGE="${ZIG_RUN_IMAGE:-$ZIG_BUILD_IMAGE}"   # the CUDA runtime the binaries run in (present on both nodes)
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f0np0}"

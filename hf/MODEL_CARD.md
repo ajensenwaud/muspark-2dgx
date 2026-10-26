@@ -19,8 +19,8 @@ tags:
 
 Meta's [Muse Spark Open](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B) (816B parameters, MoE, about
 42B active per token) quantised to EXL3 at 1.8 bits per weight on average, sized to run across two NVIDIA DGX Sparks
-with a context of about 905K tokens. It is served by
-[Muspark](https://github.com/ajensenwaud/muspark-2dgx) on TensorFold (v1.0.11).
+with a context of about 460K tokens. It is served by
+[Muspark](https://github.com/ajensenwaud/muspark-2dgx) on TensorFold (main, with Muspark's Muse family).
 
 Currently text only, vision to be added in a future version.
 
@@ -39,8 +39,8 @@ At Meta's recommended sampling (temperature 1.0, top_p 1.0, top_k off, reasoning
 | | GSM8K | MMLU-Pro | Replies that looped to the cap |
 |---|---|---|---|
 | llama.cpp, Unsloth UD-IQ2_XXS | 193/200 | not measured | 0 |
-| This pack, fp16 KV cache | 195/200 | 167/200 | 0 |
-| **This pack, 8-bit KV cache (Muspark's default)** | **196/200** | **167/200** | 0 |
+| **This pack, fp16 KV cache (Muspark v1.1)** | **195/200** | **167/200** | 0 |
+| This pack, 8-bit KV cache (Muspark v1.0) | 196/200 | 167/200 | 0 |
 
 Differences are within noise at 200 items.
 
@@ -51,18 +51,21 @@ Use temperature 1.0; greedy decoding can loop on this model at these bit rates.
 Two DGX Sparks, Muspark's release serve, measured with
 [spark-bench](https://github.com/ajensenwaud/spark-bench):
 
-| | llama.cpp, UD-IQ2_XXS | Muspark |
-|---|---|---|
-| Decode, 1 stream, greedy (tok/s) | 7.4 | 31.6 |
-| Decode, 1 stream, temperature 1.0 (tok/s) | not measured | 23.2 |
-| Decode, 4 streams, total (tok/s) | 17.4 | 50.9 |
-| Prompt read, 4K tokens (tok/s) | 237.4 | 224.0 |
-| Context per conversation | 32K | ~905K (1 stream) or 192K (4 streams) |
+| | llama.cpp, UD-IQ2_XXS | Muspark v1.0 | Muspark v1.1 |
+|---|---|---|---|
+| Decode, 1 stream, greedy (tok/s) | 7.4 | 31.6 | 30.1 |
+| Decode, 1 stream, temperature 1.0 (tok/s) | not measured | 23.2 | not re-measured |
+| Decode, 4 streams, total (tok/s) | 17.4 | 50.9 | 43.1 |
+| Prompt read, 4K tokens (tok/s) | 237.4 | 224.0 | 209.0 |
+| Context per conversation | 32K | ~905K (1 stream) or 192K (4 streams) | ~460K (1 stream) or ~110K (4 streams) |
+
+v1.1 runs on TensorFold's main line, which takes no 8-bit KV cache: half the context of v1.0, the same logits as
+v1.0 with an fp16 KV cache.
 
 Don't expect this model to be fast. It is a highly capable frontier model running on bandwidth constrained hardware.
 
-Reading a new long prompt is slow: about 19 minutes before the first token at 122K tokens, 3.3 hours at 488K.
-Follow-up turns reuse the cached conversation and start in under a second. Faster prompt reading is coming in v1.1.
+Reading a new long prompt is slow: about 19 minutes before the first token at 122K tokens, around 3 hours at the
+full context. Follow-up turns reuse the cached conversation and start in under a second.
 
 ## Use
 
@@ -80,6 +83,6 @@ Built with Muse Spark Open.
 
 Thanks to Meta for Muse Spark Open; AMD for the MXFP4 export it was quantised from; RadixArk for the DFlash2 drafter;
 Ash Hart and TensorFold's contributors for [TensorFold](https://github.com/ashhart/TensorFold); Jay Leaton for the
-tensor-parallel work the engine port uses; turboderp for [exllamav3](https://github.com/turboderp-org/exllamav3);
+tensor-parallel work the engine uses; turboderp for [exllamav3](https://github.com/turboderp-org/exllamav3);
 Unsloth for the GGUF used as the baseline. Full list in Muspark's
 [CREDITS.md](https://github.com/ajensenwaud/muspark-2dgx/blob/main/CREDITS.md).

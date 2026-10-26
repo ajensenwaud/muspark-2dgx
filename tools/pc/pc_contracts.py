@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Prompt-cache contracts against a served Muse Spark endpoint (stdlib only; nothing to install on the host).
 
-The engine's prompt cache (TF_MUSE_PROMPT_CACHE=1) must give byte-identical replies whether a request resumes from a
-kept prompt state or runs fresh on a cold server (resumed == fresh), with or without the drafter (drafted == plain),
+The engine's prompt cache (on by default; --prompt-cache-gib 0 turns it off) must give byte-identical replies whether
+a request resumes from a kept prompt state or runs fresh on a cold server (resumed == fresh), with or without the
+drafter (drafted == plain),
 alone or beside other streams (concurrent == solo). Two modes:
 
   record  on a serve WITHOUT the cache (the cold reference): runs every scenario, builds the multi-turn transcripts
           from this serve's own replies, writes each request body and its reply's token sha to REF (JSON lines).
-  replay  on any other arm (cache on, drafter on, kv8 ...): sends the recorded bodies again in four phases (solo in
+  replay  on any other arm (cache on, drafter on, ...): sends the recorded bodies again in four phases (solo in
           order; four conversations at once; a burst of four requests sharing one prefix, which resumes the same
           kept state in four slots; more conversations than slots, round robin) plus the window-edge sweep, and
           compares every reply's token_sha with REF. Exit 1 on any difference.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Zig engine: TensorFold ZIG_TF_TAG plus patches-zig/, compiled in a build container (nothing is installed
+# Build the Zig engine: TensorFold at ZIG_TF_COMMIT plus patches-zig/, compiled in a build container (nothing is installed
 # on the hosts), then copied to the worker. Run on the head (rank 0); CPU only, safe beside a running serve (the build
 # container is capped at ZIG_BUILD_MEM). The engine base and its patches: docs/ZIG-MUSE.md.
 #   scripts/zig_prepare.sh            clone/patch, build image if missing, build, copy zig-out/ to $WORKER
@@ -10,16 +10,20 @@ RECIPE=$(pwd)
 source scripts/config.sh
 [[ -n "${NO_WORKER:-}" ]] || need_hosts WORKER
 
-# 1. the source: TensorFold at the pinned release, the patches on a fresh branch, the tree hash checked
+# 1. the source: TensorFold at the pinned commit, the patches on a fresh branch, the tree hash checked
 if [[ ! -d "$ZIG_DIR/.git" ]]; then
   log "cloning TensorFold into $ZIG_DIR"
   git clone -q "$TF_REPO" "$ZIG_DIR"
 fi
 cd "$ZIG_DIR"
-git fetch -q --tags origin
-[[ "$(git rev-parse "$ZIG_TF_TAG^{commit}")" == "$ZIG_TF_COMMIT" ]] || die "$ZIG_TF_TAG is not $ZIG_TF_COMMIT"
-git checkout -q -B muse-zig "$ZIG_TF_COMMIT"
-log "applying $(ls "$RECIPE"/patches-zig/*.patch | wc -l) patches to $ZIG_TF_TAG"
+[[ -d .git/rebase-apply ]] && git am --abort
+if ! git cat-file -e "$ZIG_TF_COMMIT^{commit}" 2>/dev/null; then
+  git fetch -q origin || die "could not fetch $TF_REPO"
+  git cat-file -e "$ZIG_TF_COMMIT^{commit}" 2>/dev/null || git fetch -q origin "$ZIG_TF_COMMIT" \
+    || die "$TF_REPO has no commit $ZIG_TF_COMMIT"
+fi
+git checkout -q -f -B muse-zig "$ZIG_TF_COMMIT"
+log "applying $(ls "$RECIPE"/patches-zig/*.patch | wc -l) patches to ${ZIG_TF_COMMIT:0:12}"
 GIT_COMMITTER_NAME=recipe GIT_COMMITTER_EMAIL=recipe@localhost git am -q --3way "$RECIPE"/patches-zig/*.patch \
   || { git am --abort; die "patches-zig/ did not apply"; }
 tree=$(git rev-parse HEAD^{tree})
@@ -48,7 +52,7 @@ docker run --rm --name muse-zig-build --user "$(id -u):$(id -g)" -e HOME=/tmp -e
     NVCC=\$(which nvcc)
     zig build -j$ZIG_BUILD_JOBS -Dnvcc=\$NVCC -Dtp-nvcc=\$NVCC -Dsm=121 --prefix /work/zig-out
     zig build native -j$ZIG_BUILD_JOBS -Dnvcc=\$NVCC -Dtp-nvcc=\$NVCC -Dsm=121 --prefix /work/zig-out"
-for f in bin/tf-tp-test bin/tf-cuda-test bin/tf-mimo bin/tf-muse bin/tensorfold native/bin/tensorfold-native; do
+for f in bin/tf-tp-test bin/tf-cuda-test bin/tf-muse bin/tensorfold native/bin/tensorfold-native; do
   [[ -x "$ZIG_DIR/zig-out/$f" ]] || die "build incomplete: no $f"
 done
 "$ZIG_DIR/zig-out/bin/tf-tp-test" kernel >/dev/null 2>&1 || die "tf-tp-test has no mailbox kernel (-Dtp-nvcc)"

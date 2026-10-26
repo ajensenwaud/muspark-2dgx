@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.1 (October 2026)
+
+Engine move: Muspark now runs on TensorFold's main line instead of a 60-patch v1.0.11. The pack does not change.
+
+- Engine: TensorFold main at `40c6406b` plus `patches-zig/` 0001-0005 (tree `71a9f224`, checked by
+  `scripts/zig_prepare.sh`, which now builds from a pinned commit): the Muse family on TensorFold's shared EXL3
+  operators and tensor parallelism with its kernel-contract registrations (upstream pull request #1295), and the
+  server's recipient-reply split (#1336). The sampler fix, the tensor-parallel and RoCE work and the other generic
+  patches v1.0 carried are in main.
+- Same replies: logits byte-equal to the v1.0 engine with an fp16 KV cache (decode rows, drafted windows, prompt
+  path); drafted == plain on 12 of 12 prompts; resumed == fresh on 115 of 115 requests (49 resumed).
+- KV cache fp16 only: main takes no lossy KV cache, so the 8-bit KV cache and `KV8` are gone. Context: `PROFILE=long`
+  ~450K-470K tokens for one stream (was ~905K), `PROFILE=multi` 4 x ~110K (was 4 x 192K).
+- Speed (two GB10s, greedy, 512-token replies): 1 stream 30.1 tok/s (v1.0: 31.6), 4 streams 43.1 tok/s total (v1.0:
+  50.9); cold prompt 209.0 tok/s at 3.9K tokens and 196.4 at 15.4K (v1.0: 224.0 and 200.4).
+- Settings: the drafter and the prompt cache are serve flags (`--drafter`, `--prompt-cache-gib`); the prompt cache is
+  on by default at 1 GiB a Spark with a 3 GiB reserve (`PROMPT_CACHE=0` turns it off, `PROMPT_CACHE_GIB=N` sets
+  another budget). The `TF_MUSE_*` switches are gone: the levers v1.0 switched on are built in. `ZIG_LEVERS` keeps
+  only `NCCL_MAX_NCHANNELS=4`.
+- `start.sh` prints the engine's start-up line (memory, streams, context, prompt cache).
+
+Known limits: as v1.0 (cold prompts slow at depth, greedy can loop, text only), plus the smaller context above.
+
 ## v1.0 (October 2026)
 
 First release.

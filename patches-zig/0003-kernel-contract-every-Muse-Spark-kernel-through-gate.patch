@@ -1,0 +1,3045 @@
+From 9b3349119b4ac8f23dce18a67415ebfbb9eb723f Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:05:16 +1100
+Subject: [PATCH 3/5] kernel contract: every Muse Spark kernel through gates
+ 1-4, its launches for gate 5
+
+Glue, attention and drafter kernels against float64 (rows and dense families where the formulas match) or their stated rules; the cluster norm forms and the EXL3 launch forms as bit-preserving replacements.
+---
+ zig/src/core/contract/muse_cuda_records.zig |  59 +++
+ zig/src/core/contract/registry.zig          |   2 +-
+ zig/tests/cuda/contract_limits.zig          |   2 +-
+ zig/tests/cuda/contract_muse.zig            | 247 ++++++++++
+ zig/tests/cuda/contract_muse_attn.zig       | 497 ++++++++++++++++++++
+ zig/tests/cuda/contract_muse_draft.zig      | 437 +++++++++++++++++
+ zig/tests/cuda/contract_muse_exl3.zig       | 233 +++++++++
+ zig/tests/cuda/contract_muse_grouped.zig    | 165 +++++++
+ zig/tests/cuda/contract_muse_norms.zig      | 363 ++++++++++++++
+ zig/tests/cuda/contract_muse_route.zig      | 344 ++++++++++++++
+ zig/tests/cuda/contract_muse_select.zig     | 472 +++++++++++++++++++
+ zig/tests/cuda/contract_muse_util.zig       |  83 ++++
+ zig/tests/cuda/contract_tests.zig           |   4 +-
+ 13 files changed, 2904 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/core/contract/muse_cuda_records.zig
+ create mode 100644 zig/tests/cuda/contract_muse.zig
+ create mode 100644 zig/tests/cuda/contract_muse_attn.zig
+ create mode 100644 zig/tests/cuda/contract_muse_draft.zig
+ create mode 100644 zig/tests/cuda/contract_muse_exl3.zig
+ create mode 100644 zig/tests/cuda/contract_muse_grouped.zig
+ create mode 100644 zig/tests/cuda/contract_muse_norms.zig
+ create mode 100644 zig/tests/cuda/contract_muse_route.zig
+ create mode 100644 zig/tests/cuda/contract_muse_select.zig
+ create mode 100644 zig/tests/cuda/contract_muse_util.zig
+
+diff --git a/zig/src/core/contract/muse_cuda_records.zig b/zig/src/core/contract/muse_cuda_records.zig
+new file mode 100644
+index 00000000..35101186
+--- /dev/null
++++ b/zig/src/core/contract/muse_cuda_records.zig
+@@ -0,0 +1,59 @@
++//! Muse Spark's CUDA launches for gate 5: the family is served on GB10, so its records start at sm_121.
++const registry = @import("registry.zig");
++const U = @import("limits.zig").Usage;
++
++const off: U = .{ .regs = 0, .static = 0 };
++
++fn rec(name: []const u8, symbol: []const u8, image: []const u8, threads: u32, dynamic: u32, cluster: u32, u: U) registry.CudaRecord {
++    return .{ .launch = .{ .name = name, .symbol = symbol, .image = image, .threads = threads, .dynamic = dynamic, .cluster = cluster, .min_sm = 121 }, .usage = .{ off, off, off, off, u } };
++}
++
++/// Each launch as the family makes it, with nvcc 13.3's sm_121 registers and static shared bytes.
++pub const cuda = [_]registry.CudaRecord{
++    rec("muse_glue muse_embed_norm", "muse_embed_norm", "muse_glue", 1024, 0, 1, .{ .regs = 17, .static = 132, .bound = 0 }),
++    rec("muse_glue muse_rms", "muse_rms", "muse_glue", 1024, 0, 1, .{ .regs = 21, .static = 132, .bound = 0 }),
++    rec("muse_glue muse_gate_norm", "muse_gate_norm", "muse_glue", 1024, 0, 1, .{ .regs = 26, .static = 132, .bound = 0 }),
++    rec("muse_glue muse_gate_norm_c", "muse_gate_norm_c", "muse_glue", 128, 0, 8, .{ .regs = 40, .static = 32, .bound = 128 }),
++    rec("muse_glue muse_router", "muse_router", "muse_glue", 64, 0, 1, .{ .regs = 40, .static = 0, .bound = 0 }),
++    rec("muse_glue muse_topk", "muse_topk", "muse_glue", 256, 0, 1, .{ .regs = 32, .static = 12416, .bound = 0 }),
++    rec("muse_glue muse_expert_sum", "muse_expert_sum", "muse_glue", 1024, 0, 1, .{ .regs = 29, .static = 132, .bound = 0 }),
++    rec("muse_glue muse_expert_sum_c", "muse_expert_sum_c", "muse_glue", 128, 0, 8, .{ .regs = 40, .static = 256, .bound = 128 }),
++    rec("muse_glue muse_softcap", "muse_softcap", "muse_glue", 256, 0, 1, .{ .regs = 29, .static = 0, .bound = 0 }),
++    rec("muse_glue muse_argmax", "muse_argmax", "muse_glue", 256, 0, 1, .{ .regs = 35, .static = 2048, .bound = 0 }),
++    rec("muse_glue muse_rope_tables", "muse_rope_tables", "muse_glue", 256, 0, 1, .{ .regs = 40, .static = 0, .bound = 0 }),
++    rec("muse_attention muse_qk_prep", "muse_qk_prep", "muse_attention", 32, 0, 1, .{ .regs = 20, .static = 0, .bound = 0 }),
++    rec("muse_attention muse_attn_rows", "muse_attn_rows", "muse_attention", 256, 0, 1, .{ .regs = 40, .static = 10368, .bound = 256 }),
++    rec("muse_attention muse_attn_merge", "muse_attn_merge", "muse_attention", 256, 0, 1, .{ .regs = 40, .static = 0, .bound = 0 }),
++    rec("muse_linear muse_linear_multi_k2", "muse_linear_multi_k2", "muse_linear", 128, 16384, 1, .{ .regs = 143, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k2_w4", "muse_linear2_k2_w4", "muse_linear", 128, 16384, 1, .{ .regs = 241, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k2_w8", "muse_linear2_k2_w8", "muse_linear", 256, 32768, 1, .{ .regs = 245, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_linear_multi_k3", "muse_linear_multi_k3", "muse_linear", 128, 16384, 1, .{ .regs = 159, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k3_w4", "muse_linear2_k3_w4", "muse_linear", 128, 16384, 1, .{ .regs = 255, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k3_w8", "muse_linear2_k3_w8", "muse_linear", 256, 32768, 1, .{ .regs = 255, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_linear_multi_k4", "muse_linear_multi_k4", "muse_linear", 128, 16384, 1, .{ .regs = 143, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k4_w4", "muse_linear2_k4_w4", "muse_linear", 128, 16384, 1, .{ .regs = 241, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k4_w8", "muse_linear2_k4_w8", "muse_linear", 256, 32768, 1, .{ .regs = 245, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_linear_multi_k5", "muse_linear_multi_k5", "muse_linear", 128, 16384, 1, .{ .regs = 160, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k5_w4", "muse_linear2_k5_w4", "muse_linear", 128, 16384, 1, .{ .regs = 251, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k5_w8", "muse_linear2_k5_w8", "muse_linear", 256, 32768, 1, .{ .regs = 251, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_linear_multi_k6", "muse_linear_multi_k6", "muse_linear", 128, 16384, 1, .{ .regs = 160, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k6_w4", "muse_linear2_k6_w4", "muse_linear", 128, 16384, 1, .{ .regs = 250, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k6_w8", "muse_linear2_k6_w8", "muse_linear", 256, 32768, 1, .{ .regs = 250, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_linear_multi_k8", "muse_linear_multi_k8", "muse_linear", 128, 16384, 1, .{ .regs = 143, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k8_w4", "muse_linear2_k8_w4", "muse_linear", 128, 16384, 1, .{ .regs = 243, .static = 16, .bound = 128 }),
++    rec("muse_linear muse_linear2_k8_w8", "muse_linear2_k8_w8", "muse_linear", 256, 32768, 1, .{ .regs = 255, .static = 16, .bound = 256 }),
++    rec("muse_linear muse_rot_multi", "muse_rot_multi", "muse_linear", 128, 0, 1, .{ .regs = 23, .static = 0, .bound = 128 }),
++    rec("muse_experts2 muse_grouped2", "muse_grouped2", "muse_experts2", 128, 0, 1, .{ .regs = 209, .static = 32896, .bound = 128 }),
++    rec("muse_dflash dr_block_embed", "dr_block_embed", "muse_dflash", 256, 0, 1, .{ .regs = 24, .static = 0, .bound = 0 }),
++    rec("muse_dflash dr_tap", "dr_tap", "muse_dflash", 256, 0, 1, .{ .regs = 18, .static = 0, .bound = 0 }),
++    rec("muse_dflash dr_norm_rope", "dr_norm_rope", "muse_dflash", 128, 0, 1, .{ .regs = 21, .static = 528, .bound = 0 }),
++    rec("muse_dflash dr_store", "dr_store", "muse_dflash", 256, 0, 1, .{ .regs = 16, .static = 0, .bound = 0 }),
++    rec("muse_dflash dr_attn", "dr_attn", "muse_dflash", 256, 0, 1, .{ .regs = 60, .static = 20608, .bound = 256 }),
++    rec("muse_dflash dr_take", "dr_take", "muse_dflash", 256, 0, 1, .{ .regs = 16, .static = 0, .bound = 0 }),
++    rec("muse_dflash2 dfl_dense", "dfl_dense", "muse_dflash2", 256, 0, 1, .{ .regs = 48, .static = 0, .bound = 0 }),
++    rec("muse_dflash2 dfl_conv_prep", "dfl_conv_prep", "muse_dflash2", 256, 0, 1, .{ .regs = 40, .static = 0, .bound = 0 }),
++    rec("muse_dflash2 dfl_conv_finish", "dfl_conv_finish", "muse_dflash2", 256, 0, 1, .{ .regs = 42, .static = 0, .bound = 0 }),
++    rec("muse_dflash2 dfl_silu_mul", "dfl_silu_mul", "muse_dflash2", 256, 0, 1, .{ .regs = 25, .static = 0, .bound = 0 }),
++    rec("muse_dflash2 dfl_topk", "dfl_topk", "muse_dflash2", 256, 0, 1, .{ .regs = 20, .static = 3072, .bound = 256 }),
++    rec("muse_dflash2 dfl_walk", "dfl_walk", "muse_dflash2", 512, 0, 1, .{ .regs = 40, .static = 196, .bound = 512 }),
++};
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 90f55618..a9d4bacf 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -571,7 +571,7 @@ const learning = @import("registry_learning.zig");
+ pub const gradient_pending = learning.gradient_pending;
+ pub const qwen_learning_pending = learning.qwen_learning_pending;
+ pub const glm_pending = @import("glm_sampling_pending.zig");
+-pub const landed_cuda = cuda ++ @import("dory_cuda_records.zig").cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("proposal_sampling_records.zig").records ++ @import("flashnext_pages_pending.zig").records ++ @import("glm_f32w_pending.zig").records;
++pub const landed_cuda = cuda ++ @import("muse_cuda_records.zig").cuda ++ @import("dory_cuda_records.zig").cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("proposal_sampling_records.zig").records ++ @import("flashnext_pages_pending.zig").records ++ @import("glm_f32w_pending.zig").records;
+ test {
+     _ = learning;
+ }
+diff --git a/zig/tests/cuda/contract_limits.zig b/zig/tests/cuda/contract_limits.zig
+index fda3f13f..d70f1057 100644
+--- a/zig/tests/cuda/contract_limits.zig
++++ b/zig/tests/cuda/contract_limits.zig
+@@ -23,7 +23,7 @@ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
+     if (std.mem.eql(u8, name, "window_rows")) return kk.window_rows;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "nvfp4_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "glm_ops", "nemotron_mamba", "sample", "qwen35", "qwen35_bf16_rows", "qwen35_keep", "qwen35_kv8", "w4a8_prefill", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "window_pages", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "nvfp4_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "glm_ops", "nemotron_mamba", "sample", "qwen35", "qwen35_bf16_rows", "qwen35_keep", "qwen35_kv8", "w4a8_prefill", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "window_pages", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows", "muse_glue", "muse_attention", "muse_linear", "muse_experts2", "muse_dflash", "muse_dflash2" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
+     return error.UnknownContractImage;
+diff --git a/zig/tests/cuda/contract_muse.zig b/zig/tests/cuda/contract_muse.zig
+new file mode 100644
+index 00000000..b5ecb6f9
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse.zig
+@@ -0,0 +1,247 @@
++//! Muse Spark's CUDA kernels under the contract: glue, attention and drafter against float64, EXL3 as replacements.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const rig_ = @import("contract_rig.zig");
++const x3 = @import("contract_muse_exl3.zig");
++const norms_k = @import("contract_muse_norms.zig");
++const route_k = @import("contract_muse_route.zig");
++const attn_k = @import("contract_muse_attn.zig");
++const draft_k = @import("contract_muse_draft.zig");
++const sel_k = @import("contract_muse_select.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const rows = contract.rows;
++
++/// A thread's 16 squares at most (kMaxPer), then 32 warps' sums of 32 lanes.
++fn rmsDepth(s: c.Shape) usize {
++    return (s.k + 1023) / 1024 + 12;
++}
++
++const rms_why = "an fp16 output follows the sum of squares as ss^-1/2: a bf16 sum's error is a few output ulps";
++
++/// muse_rms: the pre-attention norm on the fp32 residual, and the latent norm on fp16 rows.
++pub fn rmsSpec(half: bool) c.Spec {
++    return .{
++        .name = if (half) "cuda muse muse_rms (f16 in, the latent norm)" else "cuda muse muse_rms (f32 in, the residual's norm)",
++        .accum = .f32,
++        .depth = rmsDepth,
++        .ops = 8,
++        .out = .f16,
++        .tiles = .{ .{}, .{}, .{ .size = 1024 } },
++        .sums = .{ .bf16 = 0, .why = rms_why },
++        .served = if (half) &.{ .{ .rows = 8, .n = 4096, .k = 4096 }, .{ .rows = 1, .n = 4096, .k = 4096 } } else &.{ .{ .rows = 8, .n = 8192, .k = 8192 }, .{ .rows = 1, .n = 8192, .k = 8192 } },
++    };
++}
++
++pub const Rms = struct {
++    rig: rig_.Rig,
++    half: bool,
++    f: cuda.Function,
++    r: ?rows.Rows = null,
++    x: u64 = 0,
++    w: u64 = 0,
++    out: u64 = 0,
++
++    pub fn deinit(self: *Rms) void {
++        if (self.r) |r| r.deinit();
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Rms) g.Kernel {
++        return .{ .spec = rmsSpec(self.half), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Rms);
++
++    pub fn prepare(self: *Rms, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.n != shape.k or shape.k == 0 or shape.k > 16 * 1024) return false;
++        if (self.r) |r| r.deinit();
++        self.r = null;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        const r = try rows.Rows.init(a, .rms, shape);
++        self.r = r;
++        r.fill(fill, seed);
++        if (self.half) {
++            const h = try a.alloc(f16, r.x.len);
++            defer a.free(h);
++            for (h, r.x) |*o, b| o.* = @floatCast(c.fromBf16(b));
++            self.x = try self.rig.input(std.mem.sliceAsBytes(h));
++        } else {
++            const f = try a.alloc(f32, r.x.len);
++            defer a.free(f);
++            for (f, r.x) |*o, b| o.* = c.fromBf16(b);
++            self.x = try self.rig.input(std.mem.sliceAsBytes(f));
++        }
++        const wf = try a.alloc(f32, r.w.len);
++        defer a.free(wf);
++        for (wf, r.w) |*o, b| o.* = c.fromBf16(b);
++        self.w = try self.rig.input(std.mem.sliceAsBytes(wf));
++        self.out = try self.rig.output(r.outputs() * 2);
++        return true;
++    }
++
++    /// ops.norm's launch: a block of 1,024 threads a row, parts 0.
++    pub fn run(self: *Rms) !void {
++        const r = self.r.?;
++        var a: cuda.Args = .{};
++        a.add(self.x);
++        a.add(@as(c_int, @intFromBool(self.half)));
++        a.add(self.w);
++        a.add(self.out);
++        a.add(@as(c_int, @intCast(r.shape.k)));
++        a.add(@as(f32, r.eps));
++        a.add(@as(c_int, 0));
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(r.shape.rows), .y = 1, .z = 1 }, .block = .{ .x = 1024 } }, self.rig.s, &a);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Rms) usize {
++        return self.r.?.outputs();
++    }
++
++    pub fn reference(self: *Rms, want: []f64, mag: []f64) !void {
++        return self.r.?.reference(want, mag);
++    }
++
++    pub fn simulate(self: *Rms, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.r.?.simulate(acc, order, out);
++    }
++};
++
++/// The family's registrations, appended to the runner's list.
++pub const Group = struct {
++    mods: [6]?cuda.Module = @splat(null), // glue, linear, experts2, attention, dflash, dflash2
++    shared: ?cuda.exl3.Linear = null,
++    experts: ?cuda.exl3_experts.Experts = null,
++    rms: [2]Rms = undefined,
++    lins: [x3.lin_entries.len]x3.Lin = undefined,
++    grps: [x3.grp_entries.len]x3.Grp = undefined,
++    norms: [norm_list.len]norms_k.Norm = undefined,
++    routes: [std.enums.values(route_k.Kind).len]route_k.Route = undefined,
++    attns: [std.enums.values(attn_k.Kind).len]attn_k.Attn = undefined,
++    drafts: [std.enums.values(draft_k.Kind).len]draft_k.Draft = undefined,
++    sels: [std.enums.values(sel_k.Kind).len]sel_k.Sel = undefined,
++    made: [8]usize = @splat(0),
++
++    const NormEntry = struct { kind: norms_k.Kind, cluster: bool };
++    const norm_list = [_]NormEntry{
++        .{ .kind = .embed, .cluster = false },   .{ .kind = .gate_res, .cluster = false }, .{ .kind = .gate_x, .cluster = false },
++        .{ .kind = .gate_xf, .cluster = false }, .{ .kind = .esum, .cluster = false },     .{ .kind = .gate_res, .cluster = true },
++        .{ .kind = .gate_x, .cluster = true },   .{ .kind = .gate_xf, .cluster = true },   .{ .kind = .esum, .cluster = true },
++    };
++
++    fn fnName(comptime T: type, kind: T) [:0]const u8 {
++        return switch (T) {
++            route_k.Kind => switch (kind) {
++                .router => "muse_router",
++                .topk => "muse_topk",
++                .argmax => "muse_argmax",
++                .softcap => "muse_softcap",
++                .rope => "muse_rope_tables",
++            },
++            attn_k.Kind => switch (kind) {
++                .prep_rope, .prep_nope => "muse_qk_prep",
++                .rows_slide, .rows_full => "muse_attn_rows",
++                .merge_slide, .merge_full => "muse_attn_merge",
++            },
++            draft_k.Kind => switch (kind) {
++                .embed => "dr_block_embed",
++                .tap => "dr_tap",
++                .store => "dr_store",
++                .take => "dr_take",
++                .norm_q, .norm_k => "dr_norm_rope",
++                .attn => "dr_attn",
++            },
++            sel_k.Kind => switch (kind) {
++                .dense_f32, .dense_f16 => "dfl_dense",
++                .conv_prep => "dfl_conv_prep",
++                .conv_finish => "dfl_conv_finish",
++                .silu => "dfl_silu_mul",
++                .topk => "dfl_topk",
++                .walk => "dfl_walk",
++            },
++            else => unreachable,
++        };
++    }
++
++    fn many(group: *Group, comptime T: type, comptime K: type, list: []T, mod: cuda.Module, gpu: check.Gpu, s: cuda.Stream, made: *usize) !void {
++        inline for (comptime std.enums.values(K), 0..) |kind, i| {
++            list[i] = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = try mod.function(fnName(K, kind)), .arena = std.heap.ArenaAllocator.init(gpu.gpa) };
++            made.* += 1;
++        }
++        _ = group;
++    }
++
++    pub fn init(group: *Group, gpu: check.Gpu, s: cuda.Stream) !void {
++        errdefer group.deinit();
++        const kk = cuda.kernels;
++        for (&group.mods, [_][]const u8{ kk.muse_glue, kk.muse_linear, kk.muse_experts2, kk.muse_attention, kk.muse_dflash, kk.muse_dflash2 }) |*m, blob| m.* = try cuda.Module.load(gpu.d, blob);
++        const glue = group.mods[0].?;
++        group.shared = try cuda.exl3.Linear.load(gpu.d);
++        group.experts = try cuda.exl3_experts.Experts.load(gpu.d);
++        for (&group.rms, 0..) |*x, i| {
++            x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .half = i == 1, .f = try glue.function("muse_rms") };
++            group.made[0] += 1;
++        }
++        for (x3.lin_entries, &group.lins) |e, *x| {
++            x.* = try x3.Lin.init(.{ .gpu = gpu, .s = s }, e, group.mods[1].?, &group.shared.?);
++            group.made[1] += 1;
++        }
++        for (x3.grp_entries, &group.grps) |e, *x| {
++            x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .entry = e, .f = try group.mods[2].?.function("muse_grouped2"), .base = group.experts.?.grouped[2] };
++            group.made[2] += 1;
++        }
++        for (norm_list, &group.norms) |e, *x| {
++            const name = switch (e.kind) {
++                .embed => "muse_embed_norm",
++                .esum => if (e.cluster) "muse_expert_sum_c" else "muse_expert_sum",
++                else => if (e.cluster) "muse_gate_norm_c" else "muse_gate_norm",
++            };
++            const base: ?cuda.Function = if (!e.cluster) null else try glue.function(if (e.kind == .esum) "muse_expert_sum" else "muse_gate_norm");
++            x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = e.kind, .cluster = e.cluster, .f = try glue.function(name), .base = base, .arena = std.heap.ArenaAllocator.init(gpu.gpa) };
++            group.made[3] += 1;
++        }
++        try group.many(route_k.Route, route_k.Kind, &group.routes, glue, gpu, s, &group.made[4]);
++        try group.many(attn_k.Attn, attn_k.Kind, &group.attns, group.mods[3].?, gpu, s, &group.made[5]);
++        try group.many(draft_k.Draft, draft_k.Kind, &group.drafts, group.mods[4].?, gpu, s, &group.made[6]);
++        try group.many(sel_k.Sel, sel_k.Kind, &group.sels, group.mods[5].?, gpu, s, &group.made[7]);
++    }
++
++    pub fn append(group: *Group, a: std.mem.Allocator, kernels: *std.ArrayList(g.Kernel)) !void {
++        inline for (.{ &group.rms, &group.lins, &group.grps, &group.norms, &group.routes, &group.attns, &group.drafts, &group.sels }, 0..) |list, i| {
++            for (list[0..group.made[i]]) |*x| try kernels.append(a, x.kernel());
++        }
++    }
++
++    pub fn deinit(group: *Group) void {
++        inline for (.{ &group.rms, &group.lins, &group.grps, &group.norms, &group.routes, &group.attns, &group.drafts, &group.sels }, 0..) |list, i| {
++            for (list[0..group.made[i]]) |*x| x.deinit();
++        }
++        group.made = @splat(0);
++        if (group.experts) |*e| e.unload();
++        if (group.shared) |*l| l.unload();
++        for (&group.mods) |*m| if (m.*) |*x| x.unload();
++        group.* = .{};
++    }
++
++    /// A group on the heap, its kernels appended now; `destroy` releases both.
++    pub fn create(a: std.mem.Allocator, gpu: check.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
++        const group = try a.create(Group);
++        group.* = .{};
++        errdefer a.destroy(group);
++        try group.init(gpu, s);
++        errdefer group.deinit();
++        try group.append(a, kernels);
++        return group;
++    }
++
++    pub fn destroy(group: *Group, a: std.mem.Allocator) void {
++        group.deinit();
++        a.destroy(group);
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_attn.zig b/zig/tests/cuda/contract_muse_attn.zig
+new file mode 100644
+index 00000000..2ab68ce1
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_attn.zig
+@@ -0,0 +1,497 @@
++//! Muse Spark's decode attention under the contract: QK prep and cache write, chunked rows, merge, against float64.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++const attn_k = @import("contract_attn.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const rows = core.contract.rows;
++
++const HD = 64;
++const G = 8;
++const CK = 256; // forward.CK
++const eps: f32 = 1e-5;
++const scale: f32 = 0.6841258108; // qk_scale_factor * 64^-0.5
++const window = 2047; // sliding_window - 1
++
++/// The 64 squares a lane pairs, then the warp by halves.
++fn prepDepth(_: c.Shape) usize {
++    return 2 + 5 + 1;
++}
++
++/// A score's 64 products (and q times the scale), or a chunk's keys chained for l and o.
++fn rowsDepth(s: c.Shape) usize {
++    return @max(HD + 2, @min(s.k, 2048) + 1);
++}
++
++/// Up to 64 chunks chained, then o_norm's 64 squares by halves.
++fn mergeDepth(s: c.Shape) usize {
++    return s.k + 7;
++}
++
++pub const Kind = enum { prep_rope, prep_nope, rows_slide, rows_full, merge_slide, merge_full };
++
++const half_why = "fp16 outputs after ss^-1/2: a bf16 sum's error is a few output ulps";
++const rows_rule = "NaN and infinities in K and V reach the partials as float64's two-pass softmax gives them " ++
++    "(planted where no NaN enters the chunk maximum)";
++
++pub fn spec(kind: Kind) c.Spec {
++    const prep = &[_]c.Shape{ .{ .rows = 8, .n = 64, .k = HD }, .{ .rows = 1, .n = 64, .k = HD }, .{ .rows = 32, .n = 64, .k = HD } };
++    const slide = &[_]c.Shape{ .{ .rows = 4, .n = 64, .k = 100000 }, .{ .rows = 1, .n = 64, .k = 1500 } };
++    const full = &[_]c.Shape{ .{ .rows = 4, .n = 64, .k = 20000 }, .{ .rows = 2, .n = 64, .k = 3000 } };
++    const merge = &[_]c.Shape{ .{ .rows = 8, .n = 64, .k = 16 }, .{ .rows = 1, .n = 64, .k = 64 } };
++    const msum: c.Sums = .{ .bf16 = 0, .exact = false, .why = half_why };
++    return switch (kind) {
++        .prep_rope => .{ .name = "cuda muse muse_qk_prep (q / k norms, RoPE, the cache write)", .accum = .f32, .depth = prepDepth, .out = .f16, .tiles = .{ .{}, .{ .size = 8, .step = 8, .min = 8 }, .{} }, .served = prep, .sums = .{ .bf16 = 0, .why = half_why } },
++        .prep_nope => .{ .name = "cuda muse muse_qk_prep (q / k norms, no RoPE, the cache write)", .accum = .f32, .depth = prepDepth, .out = .f16, .tiles = .{ .{}, .{ .size = 8, .step = 8, .min = 8 }, .{} }, .served = prep, .sums = .{ .bf16 = 0, .why = half_why } },
++        .rows_slide => .{ .name = "cuda muse muse_attn_rows (sliding window over a ring, 256-key chunks)", .accum = .f32, .depth = rowsDepth, .out = .f32, .nan = .{ .stated = rows_rule }, .tiles = .{ .{}, .{}, .{ .size = 2048 } }, .served = slide },
++        .rows_full => .{ .name = "cuda muse muse_attn_rows (full layer, each row's own chunk width)", .accum = .f32, .depth = rowsDepth, .out = .f32, .nan = .{ .stated = rows_rule }, .tiles = .{ .{}, .{}, .{ .size = 4096 } }, .served = full },
++        .merge_slide => .{ .name = "cuda muse muse_attn_merge (sliding: fp16 sigmoid gate)", .accum = .f32, .depth = mergeDepth, .out = .f16, .served = merge, .sums = msum },
++        .merge_full => .{ .name = "cuda muse muse_attn_merge (full: fp32 sigmoid gate)", .accum = .f32, .depth = mergeDepth, .out = .f16, .served = merge, .sums = msum },
++    };
++}
++
++/// forward.zig's muse_chunk_keys: a full layer's chunk for a row at p.
++fn chunkKeys(p: usize, full: usize) usize {
++    var b: usize = 4096;
++    while (b < p + 1) b <<= 1;
++    b = @min(full, b);
++    return @max(256, ((b + 63) / 64 + 255) / 256 * 256);
++}
++
++pub const Attn = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    f: cuda.Function,
++    arena: std.heap.ArenaAllocator,
++    shape: c.Shape = undefined,
++    stress: bool = false,
++    hk: usize = 0,
++    len: usize = 0, // cache rows a slot
++    nch: usize = 0,
++    full: usize = 0, // the full layer's context (CK-rounded)
++    pos: []i32 = &.{},
++    q: []f64 = &.{},
++    k: []f64 = &.{}, // prep: k rows; attention: the caches [slots, len, hk, 64]
++    v: []f64 = &.{},
++    tab: [2][]f64 = .{ &.{}, &.{} },
++    part: [3][]f64 = .{ &.{}, &.{}, &.{} }, // merge: po, pm, pl
++    gate: []f64 = &.{},
++    dev: [10]u64 = @splat(0),
++
++    pub fn deinit(self: *Attn) void {
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt = blk: {
++        var v = g.hooks(Attn);
++        v.check = null;
++        break :blk v;
++    };
++
++    pub fn kernel(self: *Attn) g.Kernel {
++        return .{ .spec = spec(self.kind), .ctx = self, .vt = &vt };
++    }
++
++    fn isRows(self: *const Attn) bool {
++        return self.kind == .rows_slide or self.kind == .rows_full;
++    }
++
++    /// Keys [start, end) of row r's chunk ch.
++    fn chunk(self: *const Attn, r: usize, ch: usize) [2]usize {
++        const p: usize = @intCast(self.pos[r]);
++        const lo = if (self.kind == .rows_slide) p -| window else 0;
++        const ck = if (self.kind == .rows_slide) CK else chunkKeys(p, self.full);
++        const start = lo + ch * ck;
++        return .{ start, @max(start, @min(start + ck, p + 1)) };
++    }
++
++    pub fn prepare(self: *Attn, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.n % G != 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        self.shape = shape;
++        self.stress = fill == .stress;
++        self.hk = shape.n / G;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const n = shape.rows;
++        const H = shape.n;
++        const nf = fill == .nonfinite;
++        switch (self.kind) {
++            .prep_rope, .prep_nope => {
++                if (shape.k != HD) return false;
++                self.len = n;
++                self.pos = try a.alloc(i32, n);
++                const base = rng.uintLessThan(u32, 4096);
++                for (self.pos, 0..) |*p, r| p.* = @intCast(base + r);
++                self.q = try a.alloc(f64, n * H * HD);
++                self.k = try a.alloc(f64, n * self.hk * HD);
++                self.v = try a.alloc(f64, n * self.hk * HD);
++                for ([_][]f64{ self.q, self.k, self.v }) |x| for (x) |*o| {
++                    o.* = if (self.stress) mu.int(rng, -200, 200) else mu.uni(rng, f16, -3, 3);
++                };
++                if (nf) {
++                    self.q[3] = std.math.nan(f64);
++                    self.k[HD + 7] = std.math.inf(f64);
++                    self.k[2 * HD + 1] = -std.math.inf(f64);
++                    self.v[5] = std.math.nan(f64);
++                }
++                const tl = (base + n) * HD / 2;
++                for (&self.tab, 0..) |*t, i| {
++                    t.* = try a.alloc(f64, tl);
++                    for (t.*, 0..) |*o, j| {
++                        const ang = @as(f64, @floatFromInt(j / 32)) / std.math.pow(f64, 500000, @as(f64, @floatFromInt(j % 32)) / 32);
++                        o.* = mu.f32r(if (i == 0) @cos(ang) else @sin(ang));
++                    }
++                }
++                inline for (.{ self.q, self.k, self.v }, 0..) |x, i| self.dev[i] = try mu.put(&self.rig, ga, f16, x);
++                for (0..2) |i| self.dev[3 + i] = try mu.put(&self.rig, ga, f32, self.tab[i]);
++                const slot = try a.alloc(i32, n);
++                @memset(slot, 0);
++                self.dev[5] = try mu.ints(&self.rig, i32, self.pos);
++                self.dev[6] = try mu.ints(&self.rig, i32, slot);
++                self.dev[7] = try self.rig.output(n * H * HD * 2);
++                self.dev[8] = try self.rig.output(n * self.hk * HD * 2);
++                self.dev[9] = try self.rig.output(n * self.hk * HD * 2);
++            },
++            .rows_slide, .rows_full => {
++                if (shape.k < n) return false;
++                self.pos = try a.alloc(i32, n);
++                for (self.pos, 0..) |*p, r| p.* = @intCast(shape.k - 1 - r); // row r sees keys up to k - 1 - r
++                self.full = (shape.k + 4096 + CK - 1) / CK * CK;
++                self.len = if (self.kind == .rows_slide) window + 1 + 64 else shape.k; // a ring past the window
++                self.nch = if (self.kind == .rows_slide) (window + 1 + CK - 1) / CK else blk: {
++                    var most: usize = 0;
++                    for (0..n) |r| {
++                        const p: usize = @intCast(self.pos[r]);
++                        most = @max(most, (p + 1 + chunkKeys(p, self.full) - 1) / chunkKeys(p, self.full));
++                    }
++                    break :blk most + 1; // one chunk past the row's keys: empty
++                };
++                const kv = n * self.len * self.hk * HD;
++                self.q = try a.alloc(f64, n * H * HD);
++                self.k = try a.alloc(f64, kv);
++                self.v = try a.alloc(f64, kv);
++                for (self.q) |*o| o.* = if (self.stress) 0 else mu.uni(rng, f16, -1, 1);
++                for (self.k) |*o| o.* = mu.uni(rng, f16, -1, 1);
++                for (self.v) |*o| o.* = mu.uni(rng, f16, -2, 2);
++                if (self.stress) try self.mirrorV(rng);
++                if (nf) {
++                    const at = [_][4]usize{ .{ 0, 5, 0, 3 }, .{ 1, 7, 0, 10 }, .{ 2, 2, 0, 0 } };
++                    const put = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
++                    for (at, put) |p, x| if (p[0] < n) {
++                        self.v[self.cacheAt(p[0], self.keyOf(p[0], p[1]), p[2]) + p[3]] = x;
++                    };
++                    if (n > 3) self.k[self.cacheAt(3, self.keyOf(3, 1), 0) + 4] = std.math.inf(f64);
++                }
++                const slot = try a.alloc(i32, n);
++                for (slot, 0..) |*s, r| s.* = @intCast(r);
++                self.dev[0] = try mu.put(&self.rig, ga, f16, self.q);
++                self.dev[1] = try mu.put(&self.rig, ga, f16, self.k);
++                self.dev[2] = try mu.put(&self.rig, ga, f16, self.v);
++                self.dev[3] = try mu.ints(&self.rig, i32, self.pos);
++                self.dev[4] = try mu.ints(&self.rig, i32, slot);
++                const pr = n * H * self.nch;
++                self.dev[5] = try self.rig.output(pr * HD * 4);
++                self.dev[6] = try self.rig.output(pr * 4);
++                self.dev[7] = try self.rig.output(pr * 4);
++            },
++            .merge_slide, .merge_full => {
++                if (shape.k == 0 or shape.k > 64) return false;
++                const nch = shape.k;
++                self.nch = nch;
++                const pr = n * H * nch;
++                for (&self.part, [_]usize{ pr * HD, pr, pr }) |*x, l| x.* = try a.alloc(f64, l);
++                for (0..pr) |i| {
++                    const empty = !self.stress and i % nch == nch - 1 and nch > 1; // a chunk past the row's keys
++                    self.part[1][i] = if (empty) -std.math.inf(f64) else if (self.stress) 0 else mu.uni(rng, f32, -4, 4);
++                    self.part[2][i] = if (empty) 0 else if (self.stress) mu.int(rng, 1, 256) else mu.uni(rng, f32, 1, 64);
++                    const o = self.part[0][i * HD ..][0..HD];
++                    for (o) |*x| x.* = if (empty) 0 else mu.uni(rng, f32, -16, 16);
++                }
++                if (self.stress) for (0..n * H) |hh| {
++                    const terms = try a.alloc(f32, nch);
++                    for (0..HD) |e| {
++                        attn_k.mirrored(rng, terms); // then halves' quarters interleaved: no order meets a term's mirror early
++                        const h = nch / 2;
++                        const q = h / 2;
++                        for (0..nch) |ch| {
++                            const src = if (ch < q) ch else if (ch < 2 * q) h + ch - q else if (ch < 3 * q) ch - q else ch;
++                            self.part[0][(hh * nch + ch) * HD + e] = terms[src];
++                        }
++                    }
++                };
++                self.gate = try a.alloc(f64, n * H * HD);
++                for (self.gate) |*x| x.* = mu.uni(rng, f16, -4, 4);
++                if (nf) {
++                    self.part[0][3] = std.math.nan(f64); // head 0's output
++                    if (H > 1) self.part[0][nch * HD + 9] = std.math.inf(f64); // head 1: inf / L, then inf * 0
++                    if (H > 2) self.gate[2 * HD + 5] = -std.math.inf(f64); // head 2: sigmoid 0 at one element
++                }
++                for (0..3) |i| self.dev[i] = try mu.put(&self.rig, ga, f32, self.part[i]);
++                self.dev[3] = try mu.put(&self.rig, ga, f16, self.gate);
++                self.dev[4] = try self.rig.output(n * H * HD * 2);
++            },
++        }
++        return true;
++    }
++
++    /// The cache key row of row r's j-th visible key, and its element offset in the caches.
++    fn keyOf(self: *const Attn, r: usize, j: usize) usize {
++        return self.chunk(r, 0)[0] + j;
++    }
++
++    fn cacheAt(self: *const Attn, r: usize, key: usize, kh: usize) usize {
++        return ((r * self.len + key % self.len) * self.hk + kh) * HD;
++    }
++
++    /// Gate 4's V: each chunk's values mirrored (integer sums near 2^20, a small result), every score 0 (q = 0).
++    fn mirrorV(self: *Attn, rng: std.Random) !void {
++        const a = self.arena.allocator();
++        const terms = try a.alloc(f32, 4096);
++        for (0..self.shape.rows) |r| for (0..self.nch) |ch| {
++            const se = self.chunk(r, ch);
++            const nk = se[1] - se[0];
++            if (nk == 0) continue;
++            for (0..self.hk) |kh| for (0..HD) |e| {
++                attn_k.mirrored(rng, terms[0..nk]);
++                for (0..nk) |j| self.v[self.cacheAt(r, se[0] + j, kh) + e] = mu.h16(terms[j]); // as the fp16 cache holds it
++            };
++        };
++    }
++
++    /// ops.attentionIo's three launches, one at a time.
++    pub fn run(self: *Attn) !void {
++        const s = self.rig.s;
++        const n = self.shape.rows;
++        const H = self.shape.n;
++        var a: cuda.Args = .{};
++        const d = self.dev;
++        switch (self.kind) {
++            .prep_rope, .prep_nope => {
++                inline for (.{ d[0], d[1], d[2], d[3], d[4] }) |p| a.add(p);
++                a.add(@as(c_int, @intFromBool(self.kind == .prep_rope)));
++                inline for (.{ d[5], d[6], d[7], d[8], d[9] }) |p| a.add(p);
++                inline for (.{ self.len, H, self.hk }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(eps);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(n), .y = @intCast(H + self.hk), .z = 1 }, .block = .{ .x = 32 } }, s, &a);
++            },
++            .rows_slide, .rows_full => {
++                inline for (.{ d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7] }) |p| a.add(p);
++                a.add(@as(c_int, @intCast(self.len)));
++                a.add(@as(c_int, @intCast(self.nch)));
++                a.add(if (self.kind == .rows_slide) @as(c_int, CK) else -@as(c_int, @intCast(self.full)));
++                a.add(@as(c_int, if (self.kind == .rows_slide) window else 0));
++                inline for (.{ H, self.hk }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(scale);
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(n), .y = @intCast(self.hk), .z = @intCast(self.nch) }, .block = .{ .x = 256 } }, s, &a);
++            },
++            .merge_slide, .merge_full => {
++                inline for (.{ d[0], d[1], d[2] }) |p| a.add(p);
++                a.add(@as(c_int, @intCast(self.nch)));
++                inline for (.{ d[3], d[4] }) |p| a.add(p);
++                a.add(@as(c_int, @intCast(H)));
++                a.add(eps);
++                a.add(@as(c_int, @intFromBool(self.kind == .merge_full)));
++                try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(n), .y = @intCast(H / 8), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++            },
++        }
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Attn) usize {
++        const n = self.shape.rows;
++        const H = self.shape.n;
++        return switch (self.kind) {
++            .prep_rope, .prep_nope => n * (H + 2 * self.hk) * HD,
++            .rows_slide, .rows_full => n * H * self.nch * (HD + 2),
++            .merge_slide, .merge_full => n * H * HD,
++        };
++    }
++
++    pub fn reference(self: *Attn, want: []f64, mag: []f64) !void {
++        @memset(mag, 0);
++        return self.eval(.none, .sequential, want, null);
++    }
++
++    pub fn simulate(self: *Attn, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.eval(acc, order, out, null);
++    }
++
++    /// First-order propagation of fp32 roundings and 2-ulp exp / rsqrt, doubled; gate 4's rows (scores 0) stay exact.
++    pub fn bounds(self: *Attn, want: []const f64, mag: []const f64, allow: []f64) !void {
++        _ = mag;
++        if (self.stress and self.isRows()) { // exact: the bound as registered, an empty chunk's -inf maximum aside
++            for (allow, want) |*l, w| if (!std.math.isFinite(w)) {
++                l.* = mu.allow(.f32, 0, 0);
++            };
++            return;
++        }
++        const tmp = try self.arena.allocator().alloc(f64, want.len);
++        try self.eval(.none, .sequential, tmp, allow);
++    }
++
++    fn sum(acc: c.Accum, order: g.Order, t: []const f64) f64 {
++        if (acc != .none) return rows.sumIn(acc, order, t);
++        var s: f64 = 0;
++        for (t) |x| s += x;
++        return s;
++    }
++
++    fn eval(self: *Attn, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        return switch (self.kind) {
++            .prep_rope, .prep_nope => self.evalPrep(acc, order, out, err),
++            .rows_slide, .rows_full => self.evalRows(acc, order, out, err),
++            .merge_slide, .merge_full => self.evalMerge(acc, order, out, err),
++        };
++    }
++
++    fn evalPrep(self: *Attn, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const n = self.shape.rows;
++        const H = self.shape.n;
++        const e_rs = 0.5 * mu.gamma(@floatFromInt(prepDepth(self.shape))) + 3 * mu.u + mu.fast;
++        var sq: [HD]f64 = undefined;
++        for (0..n) |r| for (0..H + self.hk) |hh| {
++            const is_q = hh < H;
++            const src = if (is_q) self.q[(r * H + hh) * HD ..][0..HD] else self.k[(r * self.hk + hh - H) * HD ..][0..HD];
++            for (&sq, src) |*o, x| o.* = x * x;
++            const rs = 1 / @sqrt(sum(acc, order, &sq) / HD + eps);
++            const p: usize = @intCast(self.pos[r]);
++            const at = if (is_q) (r * H + hh) * HD else n * H * HD + ((p % n) * self.hk + hh - H) * HD; // kc: slot 0, row p % n
++            for (0..32) |l| {
++                const x0 = src[l] * rs;
++                const x1 = src[l + 32] * rs;
++                var y = [2]f64{ x0, x1 };
++                var e = [2]f64{ @abs(x0) * (e_rs + mu.u), @abs(x1) * (e_rs + mu.u) };
++                if (self.kind == .prep_rope) {
++                    const cs = self.tab[0][p * 32 + l];
++                    const sn = self.tab[1][p * 32 + l];
++                    y = .{ x0 * cs - x1 * sn, x1 * cs + x0 * sn };
++                    const m = [2]f64{ @abs(x0 * cs) + @abs(x1 * sn), @abs(x1 * cs) + @abs(x0 * sn) };
++                    e = .{ m[0] * (e_rs + 3 * mu.u), m[1] * (e_rs + 3 * mu.u) };
++                }
++                for (0..2) |j| {
++                    out[at + l + 32 * j] = y[j];
++                    if (err) |el| el[at + l + 32 * j] = mu.allow(.f16, y[j], 2 * e[j]);
++                }
++            }
++        };
++        const vat = n * (H + self.hk) * HD;
++        for (0..n) |r| {
++            const at = vat + @as(usize, @intCast(self.pos[r])) % n * self.hk * HD;
++            for (self.v[r * self.hk * HD ..][0 .. self.hk * HD], 0..) |x, i| {
++                out[at + i] = x;
++                if (err) |el| el[at + i] = mu.allow(.f16, x, 0);
++            }
++        }
++    }
++
++    fn evalRows(self: *Attn, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const a = self.rig.gpu.gpa;
++        const n = self.shape.rows;
++        const H = self.shape.n;
++        const most = 4096 * 4;
++        const buf = try a.alloc(f64, 3 * most);
++        defer a.free(buf);
++        const sc = buf[0..most];
++        const p = buf[most .. 2 * most];
++        const t = buf[2 * most ..];
++        const pr = n * H * self.nch;
++        for (0..n) |r| for (0..H) |h| for (0..self.nch) |ch| {
++            const se = self.chunk(r, ch);
++            const nk = se[1] - se[0];
++            const o = (r * H + h) * self.nch + ch;
++            const q = self.q[(r * H + h) * HD ..][0..HD];
++            var m: f64 = -std.math.inf(f64);
++            var e_s: f64 = 0;
++            for (0..nk) |j| {
++                const kr = self.k[self.cacheAt(r, se[0] + j, h / G)..][0..HD];
++                var s: f64 = 0;
++                var mag: f64 = 0;
++                for (q, kr) |x, y| {
++                    s += mu.f32r(x * scale) * y;
++                    mag += @abs(x * scale * y);
++                }
++                sc[j] = s;
++                m = @max(m, s);
++                e_s = @max(e_s, mu.gamma(HD + 2) * mag);
++            }
++            for (p[0..nk], sc[0..nk]) |*x, s| x.* = @exp(s - m);
++            for (t[0..nk]) |*x| x.* = 1;
++            const l = if (acc == .none) sum(.none, order, p[0..nk]) else sum(acc, order, t[0..nk]) * @as(f64, if (nk > 0) 1 else 0);
++            const tiles: f64 = @floatFromInt((nk + 31) / 32);
++            const rel = 2 * e_s + tiles * (2 * mu.fast + 3 * mu.u);
++            out[pr * HD + o] = if (nk == 0) -std.math.inf(f64) else m;
++            out[pr * HD + pr + o] = l;
++            if (err) |el| {
++                el[pr * HD + o] = if (nk == 0) mu.allow(.f32, 0, 0) else mu.allow(.f32, m, 2 * e_s);
++                el[pr * HD + pr + o] = mu.allow(.f32, l, 2 * l * (rel + mu.gamma(tiles + 6)));
++            }
++            for (0..HD) |e| {
++                var abs: f64 = 0;
++                for (t[0..nk], p[0..nk], 0..) |*x, pj, j| {
++                    const vv = self.v[self.cacheAt(r, se[0] + j, h / G) + e];
++                    x.* = if (acc == .none) pj * vv else vv;
++                    abs += pj * @abs(vv);
++                }
++                const y = sum(acc, order, t[0..nk]);
++                out[o * HD + e] = y;
++                if (err) |el| el[o * HD + e] = mu.allow(.f32, y, 2 * abs * (rel + mu.gamma(@floatFromInt(nk + 1))));
++            }
++        };
++    }
++
++    fn evalMerge(self: *Attn, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const n = self.shape.rows;
++        const H = self.shape.n;
++        const nch = self.nch;
++        const g1 = mu.gamma(@floatFromInt(nch + 1));
++        const lo: f64 = 0x1p-11;
++        var tt: [64]f64 = undefined;
++        var av: [HD]f64 = undefined;
++        var ae: [HD]f64 = undefined;
++        for (0..n * H) |hh| {
++            const pm = self.part[1][hh * nch ..][0..nch];
++            const pl = self.part[2][hh * nch ..][0..nch];
++            var M: f64 = -std.math.inf(f64);
++            for (pm) |x| M = @max(M, x);
++            for (tt[0..nch], pm, pl) |*x, m, l| x.* = if (l == 0) 0 else l * @exp(m - M);
++            const L = sum(acc, order, tt[0..nch]);
++            for (0..HD) |e| {
++                var abs: f64 = 0;
++                for (tt[0..nch], 0..) |*x, ch| {
++                    const f = if (pl[ch] == 0) 0 else @exp(pm[ch] - M);
++                    x.* = self.part[0][(hh * nch + ch) * HD + e] * f;
++                    abs += @abs(x.*);
++                }
++                av[e] = sum(acc, order, tt[0..nch]) / L;
++                ae[e] = (abs / L + @abs(av[e])) * (g1 + mu.fast + 2 * mu.u) + @abs(av[e]) * lo;
++            }
++            var ss: f64 = 0;
++            var se: f64 = 0;
++            for (av, ae) |x, e| {
++                ss += x * x;
++                se += 2 * @abs(x) * e;
++            }
++            const rs = 1 / @sqrt(ss / HD + eps);
++            const e_rs = 0.5 * (mu.gamma(7) + if (ss > 0) se / ss else 0) + 3 * mu.u + mu.fast;
++            for (0..HD) |e| {
++                const nv = av[e] * rs;
++                const en = rs * ae[e] + @abs(nv) * (e_rs + mu.u + lo);
++                const gv = self.gate[hh * HD + e];
++                const s = 1 / (1 + @exp(-gv));
++                const es = s * (mu.fast + 3 * mu.u + @as(f64, if (self.kind == .merge_slide) lo else 0));
++                const y = nv * s;
++                out[hh * HD + e] = y;
++                if (err) |el| el[hh * HD + e] = mu.allow(.f16, y, 2 * (s * en + @abs(nv) * es + @abs(y) * mu.u));
++            }
++        }
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_draft.zig b/zig/tests/cuda/contract_muse_draft.zig
+new file mode 100644
+index 00000000..394fae91
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_draft.zig
+@@ -0,0 +1,437 @@
++//! Muse Spark's DFlash2 drafter glue under the contract (dflash.cu): exact moves, head norms + RoPE, window attention.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++const attn_k = @import("contract_attn.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const rows = core.contract.rows;
++
++const HD = 128;
++const B = 8; // block_size
++const W = 2048; // sliding_window
++const eps: f32 = 1e-5;
++const scale: f32 = 0.08838834764831845; // 128^-0.5
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++/// A head's 128 squares: 32 lanes by halves, then 4 warps in order.
++fn normDepth(_: c.Shape) usize {
++    return 1 + 5 + 4;
++}
++
++/// A score's 128 products times the scale, or a query's visible keys chained for l and o.
++fn attnDepth(_: c.Shape) usize {
++    return W + B;
++}
++
++pub const Kind = enum { embed, tap, store, take, norm_q, norm_k, attn };
++
++const half_why = "fp16 outputs after ss^-1/2: a bf16 sum's error is a few output ulps";
++const attn_rule = "NaN and infinities in K and V reach the outputs as float64's two-pass softmax gives them " ++
++    "(planted where no NaN enters a tile's maximum)";
++
++pub fn spec(kind: Kind) c.Spec {
++    const moves = &[_]c.Shape{ .{ .rows = 4, .n = 8192, .k = B }, .{ .rows = 1, .n = 8192, .k = B } };
++    const heads = &[_]c.Shape{ .{ .rows = 32, .n = 32, .k = HD }, .{ .rows = 8, .n = 4, .k = HD } };
++    return switch (kind) {
++        .embed => .{ .name = "cuda muse dr_block_embed (anchor rows bf16, mask rows fp32)", .accum = .none, .depth = noSums, .out = .f32, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = moves },
++        .tap => .{ .name = "cuda muse dr_tap (fp32 residuals to fp16 tap blocks)", .accum = .none, .depth = noSums, .out = .f16, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = &.{ .{ .rows = 32, .n = 8192, .k = 5 }, .{ .rows = 1, .n = 8192, .k = 5 } } },
++        .store => .{ .name = "cuda muse dr_store (v rows into the ring)", .accum = .none, .depth = noSums, .out = .f16, .tiles = .{ .{}, .{ .size = 2, .min = 1 }, .{} }, .served = &.{ .{ .rows = 32, .n = 4, .k = HD }, .{ .rows = 8, .n = 4, .k = HD } } },
++        .take => .{ .name = "cuda muse dr_take (a block's mask rows)", .accum = .none, .depth = noSums, .out = .f16, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = moves },
++        .norm_q => .{ .name = "cuda muse dr_norm_rope (q heads, fp32 out)", .accum = .f32, .depth = normDepth, .out = .f32, .served = heads },
++        .norm_k => .{ .name = "cuda muse dr_norm_rope (k heads into the ring, fp16)", .accum = .f32, .depth = normDepth, .out = .f16, .served = heads, .sums = .{ .bf16 = 0, .why = half_why } },
++        .attn => .{ .name = "cuda muse dr_attn (a block's queries over the window, no sinks)", .accum = .f32, .depth = attnDepth, .out = .f16, .nan = .{ .stated = attn_rule }, .tiles = .{ .{}, .{ .size = 8, .step = 8, .min = 8 }, .{} }, .served = &.{ .{ .rows = 2, .n = 32, .k = 6000 }, .{ .rows = 1, .n = 32, .k = 700 } } },
++    };
++}
++
++pub const Draft = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    f: cuda.Function,
++    arena: std.heap.ArenaAllocator,
++    shape: c.Shape = undefined,
++    stress: bool = false,
++    in: [3][]f64 = .{ &.{}, &.{}, &.{} },
++    tab: [2][]f64 = .{ &.{}, &.{} },
++    w: []f64 = &.{},
++    pos: []i32 = &.{},
++    ring: usize = 0,
++    kv: usize = 0,
++    dev: [8]u64 = @splat(0),
++
++    pub fn deinit(self: *Draft) void {
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt = blk: {
++        var v = g.hooks(Draft);
++        v.check = null;
++        break :blk v;
++    };
++
++    pub fn kernel(self: *Draft) g.Kernel {
++        return .{ .spec = spec(self.kind), .ctx = self, .vt = &vt };
++    }
++
++    fn rnd(self: *Draft, rng: std.Random, comptime T: type, n: usize, lo: f64, hi: f64) ![]f64 {
++        const x = try self.arena.allocator().alloc(f64, n);
++        for (x) |*v| v.* = mu.uni(rng, T, lo, hi);
++        return x;
++    }
++
++    pub fn prepare(self: *Draft, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        self.shape = shape;
++        self.stress = fill == .stress;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const n = shape.rows;
++        const D = shape.n;
++        const nan = std.math.nan(f64);
++        const inf = std.math.inf(f64);
++        const nf = fill == .nonfinite;
++        switch (self.kind) {
++            .embed => {
++                self.in[0] = try self.rnd(rng, u16, n * D, -2, 2); // the anchors' embedding rows
++                self.in[1] = try self.rnd(rng, f32, D, -1, 1); // mask_emb
++                if (nf) {
++                    self.in[0][1] = nan;
++                    self.in[0][D + 2] = inf;
++                    self.in[1][3] = -inf;
++                }
++                const toks = try a.alloc(i64, n);
++                for (toks, 0..) |*t, s| t.* = @intCast(n - 1 - s);
++                self.dev[0] = try mu.put(&self.rig, ga, u16, self.in[0]);
++                self.dev[1] = try mu.put(&self.rig, ga, f32, self.in[1]);
++                self.dev[2] = try mu.ints(&self.rig, i64, toks);
++                self.dev[3] = try self.rig.output(n * shape.k * D * 4);
++            },
++            .tap => {
++                self.in[0] = try self.rnd(rng, f32, shape.k * n * D, -1000, 1000); // each tap's residual rows
++                if (nf) {
++                    self.in[0][0] = nan;
++                    self.in[0][D + 1] = inf;
++                    self.in[0][n * D + 2] = -inf;
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f32, self.in[0]);
++                self.dev[1] = try self.rig.output(shape.k * n * D * 2);
++            },
++            .store, .take => {
++                if (self.kind == .store and shape.k != HD) return false;
++                const len = if (self.kind == .store) n * shape.n * shape.k else n * B * D;
++                self.in[0] = try self.rnd(rng, f16, len, -8, 8);
++                if (nf) {
++                    self.in[0][0] = nan;
++                    self.in[0][len / 2 + 1] = inf;
++                    self.in[0][len - 1] = -inf;
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f16, self.in[0]);
++                if (self.kind == .store) {
++                    self.pos = try a.alloc(i32, n);
++                    const base = rng.uintLessThan(u32, 1 << 20);
++                    for (self.pos, 0..) |*p, r| p.* = @intCast(base + r);
++                    const slot = try a.alloc(i32, n);
++                    @memset(slot, 0);
++                    self.dev[1] = try mu.ints(&self.rig, i32, self.pos);
++                    self.dev[2] = try mu.ints(&self.rig, i32, slot);
++                    self.dev[3] = try self.rig.output(len * 2);
++                } else self.dev[1] = try self.rig.output(n * (B - 1) * D * 2);
++            },
++            .norm_q, .norm_k => {
++                if (shape.k != HD) return false;
++                const nh = shape.n;
++                self.in[0] = try a.alloc(f64, n * nh * HD);
++                for (self.in[0]) |*v| v.* = if (self.stress) mu.int(rng, -200, 200) else mu.uni(rng, f16, -3, 3);
++                self.w = try self.rnd(rng, f32, HD, 0.5, 1.5);
++                if (nf) {
++                    self.in[0][3] = nan;
++                    self.in[0][HD + 7] = inf;
++                    self.in[0][2 * HD + 70] = -inf;
++                }
++                self.pos = try a.alloc(i32, n);
++                const base = rng.uintLessThan(u32, 8192);
++                for (self.pos, 0..) |*p, r| p.* = @intCast(base + r);
++                const tl = (base + n) * 64;
++                for (&self.tab, 0..) |*t, i| {
++                    t.* = try a.alloc(f64, tl);
++                    for (t.*, 0..) |*o, j| {
++                        const ang = @as(f64, @floatFromInt(j / 64)) / std.math.pow(f64, 500000, @as(f64, @floatFromInt(j % 64)) / 64);
++                        o.* = mu.f32r(if (i == 0) @cos(ang) else @sin(ang));
++                    }
++                }
++                const slot = try a.alloc(i32, n);
++                @memset(slot, 0);
++                self.ring = n;
++                self.dev[0] = try mu.put(&self.rig, ga, f16, self.in[0]);
++                self.dev[1] = try mu.put(&self.rig, ga, f32, self.w);
++                for (0..2) |i| self.dev[2 + i] = try mu.put(&self.rig, ga, f32, self.tab[i]);
++                self.dev[4] = try mu.ints(&self.rig, i32, self.pos);
++                self.dev[5] = try mu.ints(&self.rig, i32, slot);
++                self.dev[6] = try self.rig.output(n * nh * HD * (if (self.kind == .norm_q) @as(usize, 4) else 2));
++            },
++            .attn => return self.prepareAttn(fill, rng),
++        }
++        return true;
++    }
++
++    /// Streams (rows) of B queries at positions p0 .. p0 + B - 1, p0 = k; n query heads over n / 8 KV heads.
++    fn prepareAttn(self: *Draft, fill: g.Fill, rng: std.Random) !bool {
++        const sh = self.shape;
++        if (sh.n % 8 != 0) return false;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        const S = sh.rows;
++        self.kv = sh.n / 8;
++        self.ring = W + 2 * B;
++        self.pos = try a.alloc(i32, S);
++        for (self.pos, 0..) |*p, s| p.* = @intCast(sh.k - s * 3); // p0 per stream
++        const cache = S * self.ring * self.kv * HD;
++        self.in[0] = try a.alloc(f64, S * B * sh.n * HD);
++        for (self.in[0]) |*v| v.* = if (self.stress) 0 else mu.uni(rng, f32, -1, 1);
++        self.in[1] = try self.rnd(rng, f16, cache, -1, 1);
++        self.in[2] = try self.rnd(rng, f16, cache, -2, 2);
++        if (self.stress) try self.mirrorV(rng);
++        if (fill == .nonfinite) {
++            const p0: usize = @intCast(self.pos[0]);
++            self.in[2][self.cacheAt(0, p0, 0) + 3] = std.math.nan(f64);
++            self.in[2][self.cacheAt(0, p0 + 2, 0) + 9] = std.math.inf(f64);
++            self.in[2][self.cacheAt(0, p0 + 4, 1) + 1] = -std.math.inf(f64);
++            if (S > 1) self.in[1][self.cacheAt(1, @as(usize, @intCast(self.pos[1])) + 1, 0) + 4] = std.math.inf(f64);
++        }
++        const slot = try a.alloc(i32, S);
++        for (slot, 0..) |*s, i| s.* = @intCast(i);
++        self.dev[0] = try mu.put(&self.rig, ga, f32, self.in[0]);
++        self.dev[1] = try mu.put(&self.rig, ga, f16, self.in[1]);
++        self.dev[2] = try mu.put(&self.rig, ga, f16, self.in[2]);
++        self.dev[3] = try mu.ints(&self.rig, i32, self.pos);
++        self.dev[4] = try mu.ints(&self.rig, i32, slot);
++        self.dev[5] = try self.rig.output(S * B * sh.n * HD * 2);
++        return true;
++    }
++
++    fn cacheAt(self: *const Draft, s: usize, kp: usize, kh: usize) usize {
++        return ((s * self.ring + kp % self.ring) * self.kv + kh) * HD;
++    }
++
++    /// Keys [lo, hi] query b of stream s sees.
++    fn keys(self: *const Draft, s: usize, b: usize) [2]usize {
++        const p0: usize = @intCast(self.pos[s]);
++        return .{ (p0 + b + 1) -| W, p0 + B - 1 };
++    }
++
++    /// Gate 4's V: zero where only some of a block's queries look, mirrored over the keys all of them see.
++    fn mirrorV(self: *Draft, rng: std.Random) !void {
++        const terms = try self.arena.allocator().alloc(f32, W + B);
++        for (0..self.shape.rows) |s| {
++            const all = self.keys(s, B - 1);
++            const first = self.keys(s, 0)[0];
++            for (0..self.kv) |kh| for (0..HD) |e| {
++                const n = all[1] + 1 - all[0];
++                attn_k.mirrored(rng, terms[0..n]);
++                for (first..all[1] + 1) |kp| self.in[2][self.cacheAt(s, kp, kh) + e] = if (kp < all[0]) 0 else mu.h16(terms[kp - all[0]]);
++            };
++        }
++    }
++
++    /// dflash2.zig's launches.
++    pub fn run(self: *Draft) !void {
++        const s = self.rig.s;
++        const sh = self.shape;
++        const n = sh.rows;
++        const d = self.dev;
++        var a: cuda.Args = .{};
++        var grid: [2]u32 = .{ @intCast(n), 1 };
++        var block: u32 = 256;
++        switch (self.kind) {
++            .embed => {
++                inline for (.{ d[0], d[1], d[2], d[3] }) |p| a.add(p);
++                inline for (.{ sh.k, sh.n }) |v| a.add(@as(c_int, @intCast(v)));
++                grid[0] = @intCast(n * sh.k);
++            },
++            .tap => {
++                for (0..sh.k) |j| {
++                    var t: cuda.Args = .{};
++                    t.add(d[0] + j * n * sh.n * 4);
++                    t.add(d[1]);
++                    inline for (.{ sh.n, sh.k, j }) |v| t.add(@as(c_int, @intCast(v)));
++                    try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(n), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &t);
++                }
++                return s.synchronize();
++            },
++            .store => {
++                inline for (.{ d[0], d[1], d[2], d[3] }) |p| a.add(p);
++                inline for (.{ sh.n, n }) |v| a.add(@as(c_int, @intCast(v)));
++            },
++            .take => {
++                inline for (.{ d[0], d[1] }) |p| a.add(p);
++                inline for (.{ B, sh.n }) |v| a.add(@as(c_int, @intCast(v)));
++                grid[0] = @intCast(n * (B - 1));
++            },
++            .norm_q, .norm_k => {
++                inline for (.{ d[0], d[1], d[2], d[3], d[4], d[5] }) |p| a.add(p);
++                a.add(if (self.kind == .norm_q) d[6] else @as(u64, 0));
++                a.add(if (self.kind == .norm_k) d[6] else @as(u64, 0));
++                inline for (.{ sh.n, HD, self.ring }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(eps);
++                grid[1] = @intCast(sh.n);
++                block = HD;
++            },
++            .attn => {
++                inline for (.{ d[0], d[1], d[2] }) |p| a.add(p);
++                a.add(@as(u64, 0)); // no sinks, as the drafter's layers
++                inline for (.{ d[3], d[4], d[5] }) |p| a.add(p);
++                inline for (.{ B, W, self.ring, sh.n, self.kv }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(scale);
++                grid = .{ @intCast(n * B), @intCast(self.kv) };
++            },
++        }
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid[0], .y = grid[1], .z = 1 }, .block = .{ .x = block } }, s, &a);
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Draft) usize {
++        const sh = self.shape;
++        return switch (self.kind) {
++            .embed => sh.rows * sh.k * sh.n,
++            .tap => sh.k * sh.rows * sh.n,
++            .store => sh.rows * sh.n * sh.k,
++            .take => sh.rows * (B - 1) * sh.n,
++            .norm_q, .norm_k => sh.rows * sh.n * HD,
++            .attn => sh.rows * B * sh.n * HD,
++        };
++    }
++
++    pub fn reference(self: *Draft, want: []f64, mag: []f64) !void {
++        @memset(mag, 0);
++        return self.eval(.none, .sequential, want, null);
++    }
++
++    pub fn simulate(self: *Draft, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.eval(acc, order, out, null);
++    }
++
++    /// Moves are exact; norms and attention by first-order propagation, doubled; gate 4's rows (scores 0) stay exact.
++    pub fn bounds(self: *Draft, want: []const f64, mag: []const f64, allow: []f64) !void {
++        _ = mag;
++        if (self.kind != .norm_q and self.kind != .norm_k and self.kind != .attn) return;
++        if (self.stress and self.kind == .attn) return;
++        const tmp = try self.arena.allocator().alloc(f64, want.len);
++        try self.eval(.none, .sequential, tmp, allow);
++    }
++
++    fn sum(acc: c.Accum, order: g.Order, t: []const f64) f64 {
++        if (acc != .none) return rows.sumIn(acc, order, t);
++        var s: f64 = 0;
++        for (t) |x| s += x;
++        return s;
++    }
++
++    fn eval(self: *Draft, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const sh = self.shape;
++        const n = sh.rows;
++        const D = sh.n;
++        switch (self.kind) {
++            .embed => for (0..n) |s| for (0..sh.k) |b| for (0..D) |i| {
++                out[(s * sh.k + b) * D + i] = if (b == 0) self.in[0][(n - 1 - s) * D + i] else self.in[1][i];
++            },
++            .tap => for (0..n) |r| for (0..sh.k) |j| for (0..D) |i| {
++                out[(r * sh.k + j) * D + i] = self.in[0][(j * n + r) * D + i];
++            },
++            .store => for (0..n) |r| {
++                const row = sh.n * sh.k;
++                const p: usize = @intCast(self.pos[r]);
++                @memcpy(out[(p % n) * row ..][0..row], self.in[0][r * row ..][0..row]);
++            },
++            .take => for (0..n) |s| for (1..B) |b| {
++                @memcpy(out[(s * (B - 1) + b - 1) * D ..][0..D], self.in[0][(s * B + b) * D ..][0..D]);
++            },
++            .norm_q, .norm_k => self.evalNorm(acc, order, out, err),
++            .attn => try self.evalAttn(acc, order, out, err),
++        }
++    }
++
++    fn evalNorm(self: *Draft, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) void {
++        const n = self.shape.rows;
++        const nh = self.shape.n;
++        const e_rs = 0.5 * mu.gamma(@floatFromInt(normDepth(self.shape))) + 3 * mu.u + mu.fast;
++        var sq: [HD]f64 = undefined;
++        var y: [HD]f64 = undefined;
++        const e: c.Elem = if (self.kind == .norm_q) .f32 else .f16;
++        for (0..n) |r| for (0..nh) |h| {
++            const x = self.in[0][(r * nh + h) * HD ..][0..HD];
++            for (&sq, x) |*o, v| o.* = v * v;
++            const rs = 1 / @sqrt(sum(acc, order, &sq) / HD + eps);
++            for (&y, x, self.w) |*o, v, w| o.* = v * rs * w;
++            const p: usize = @intCast(self.pos[r]);
++            const row = if (self.kind == .norm_q) r else p % self.ring;
++            for (0..HD) |d| {
++                const j = d % 64;
++                const cs = self.tab[0][p * 64 + j];
++                const sn = self.tab[1][p * 64 + j];
++                const other = if (d < 64) -y[d + 64] else y[d - 64];
++                const v = y[d] * cs + other * sn;
++                const at = (row * nh + h) * HD + d;
++                out[at] = v;
++                if (err) |el| el[at] = mu.allow(e, v, 2 * (@abs(y[d] * cs) + @abs(other * sn)) * (e_rs + 4 * mu.u));
++            }
++        };
++    }
++
++    fn evalAttn(self: *Draft, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const a = self.rig.gpu.gpa;
++        const H = self.shape.n;
++        const most = W + B;
++        const buf = try a.alloc(f64, 3 * most);
++        defer a.free(buf);
++        const sc = buf[0..most];
++        const p = buf[most .. 2 * most];
++        const t = buf[2 * most ..];
++        for (0..self.shape.rows) |s| for (0..B) |b| for (0..H) |h| {
++            const ks = self.keys(s, b);
++            const nk = ks[1] + 1 - ks[0];
++            const q = self.in[0][((s * B + b) * H + h) * HD ..][0..HD];
++            var m: f64 = -std.math.inf(f64);
++            var e_s: f64 = 0;
++            for (0..nk) |j| {
++                const kr = self.in[1][self.cacheAt(s, ks[0] + j, h / (H / self.kv))..][0..HD];
++                var dot: f64 = 0;
++                var mag: f64 = 0;
++                for (q, kr) |x, y| {
++                    dot += x * y;
++                    mag += @abs(x * y);
++                }
++                sc[j] = dot * scale;
++                m = @max(m, sc[j]);
++                e_s = @max(e_s, mu.gamma(HD + 1) * mag * scale);
++            }
++            for (p[0..nk], sc[0..nk]) |*x, v| x.* = @exp(v - m);
++            for (t[0..nk]) |*x| x.* = 1;
++            const l = if (acc == .none) sum(.none, order, p[0..nk]) else sum(acc, order, t[0..nk]);
++            const tiles: f64 = @floatFromInt((nk + 31) / 32 + 1);
++            const rel = 2 * e_s + tiles * (2 * mu.fast + 3 * mu.u) + mu.gamma(tiles + 5);
++            for (0..HD) |e| {
++                var abs: f64 = 0;
++                for (t[0..nk], p[0..nk], 0..) |*x, pj, j| {
++                    const vv = self.in[2][self.cacheAt(s, ks[0] + j, h / (H / self.kv)) + e];
++                    x.* = if (acc == .none) pj * vv else vv;
++                    abs += pj * @abs(vv);
++                }
++                const y = sum(acc, order, t[0..nk]) / l;
++                const o = ((s * B + b) * H + h) * HD + e;
++                out[o] = y;
++                if (err) |el| el[o] = mu.allow(.f16, y, 2 * (abs / l) * (2 * rel + mu.gamma(@floatFromInt(nk + 2))));
++            }
++        };
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_exl3.zig b/zig/tests/cuda/contract_muse_exl3.zig
+new file mode 100644
+index 00000000..e5723040
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_exl3.zig
+@@ -0,0 +1,233 @@
++//! Muse Spark's EXL3 launch forms as replacements of the shared kernels: each must equal their bytes on any input.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const shared = cuda.exl3;
++
++const rule = "as the shared kernel it replaces gives them: a non-finite input reaches its row through the rotation";
++
++fn noDepth(_: c.Shape) usize {
++    return 0;
++}
++
++/// muse_linear2_k{K2}_w{WK} (32-row passes) for tf_exl3_linear_{K2}_2_{WK}; muse_linear_multi_k{K2} for 4 of them.
++pub const LinEntry = struct { k2: u32, wk: u32, multi: bool };
++pub const lin_entries = [_]LinEntry{
++    .{ .k2 = 4, .wk = 8, .multi = false }, .{ .k2 = 4, .wk = 4, .multi = false }, .{ .k2 = 6, .wk = 4, .multi = false },
++    .{ .k2 = 3, .wk = 8, .multi = false }, .{ .k2 = 4, .wk = 4, .multi = true },  .{ .k2 = 6, .wk = 4, .multi = true },
++};
++
++fn linName(e: LinEntry) []const u8 {
++    inline for (lin_entries) |x| if (x.k2 == e.k2 and x.wk == e.wk and x.multi == e.multi) {
++        return if (x.multi) std.fmt.comptimePrint("cuda muse muse_linear_multi_k{d} (q, k, v, gate in one launch)", .{x.k2}) else std.fmt.comptimePrint("cuda muse muse_linear2_k{d}_w{d} (32-row passes)", .{ x.k2, x.wk });
++    };
++    unreachable;
++}
++
++/// No sums declared (gate 4 N/A): bit-equal to the replaced kernel's sums; rotated inputs cannot hold stress integers.
++pub fn linSpec(e: LinEntry) c.Spec {
++    // the served shapes that plan to this entry's warps (exl3.plan): Muse Spark's o, pre / post and the head slice
++    const wide = &[_]c.Shape{ .{ .rows = 32, .n = 8192, .k = 8192 }, .{ .rows = 17, .n = 8192, .k = 4096 }, .{ .rows = 128, .n = 16384, .k = 8192 } };
++    const narrow = &[_]c.Shape{ .{ .rows = 32, .n = 2048, .k = 8192 }, .{ .rows = 24, .n = 4096, .k = 8192 }, .{ .rows = 128, .n = 512, .k = 8192 } };
++    const qkvg = &[_]c.Shape{ .{ .rows = 8, .n = 512, .k = 8192 }, .{ .rows = 1, .n = 512, .k = 8192 }, .{ .rows = 16, .n = 1024, .k = 8192 } };
++    return .{
++        .name = linName(e),
++        .accum = .none,
++        .depth = noDepth,
++        .out = if (e.multi) .f16 else .f32,
++        .replaces = if (e.multi) "tf_exl3_linear on each of the four" else "tf_exl3_linear",
++        .nan = .{ .stated = rule },
++        .tiles = .{ .{ .size = if (e.multi) 16 else 32, .step = 1, .min = 1 }, .{ .size = 128, .step = 128, .min = 128 }, .{} },
++        .served = if (e.multi) qkvg else if (e.wk == 8) wide else narrow,
++    };
++}
++
++/// Random EXL3 weights for one layer: trellis words (any bits decode to a finite fp16), scales near 1.
++fn layer(rig: *rig_.Rig, a: std.mem.Allocator, rng: std.Random, k: usize, n: usize, k2: u32) !shared.Weight {
++    const tw = 4 * @as(usize, k2);
++    const words = try a.alloc(u32, (k / 16) * (n / 16) * tw);
++    defer a.free(words);
++    for (words) |*w| w.* = rng.int(u32);
++    const sc = try a.alloc(f16, k + n);
++    defer a.free(sc);
++    for (sc) |*v| v.* = @floatCast(0.5 + rng.float(f32));
++    const st = shared.strides(k, n, k2, true);
++    return .{ .trellis = try rig.input(std.mem.sliceAsBytes(words)), .suh = try rig.input(std.mem.sliceAsBytes(sc[0..k])), .svh = try rig.input(std.mem.sliceAsBytes(sc[k..])), .k = @intCast(k), .n = @intCast(n), .halves = k2, .codebook = .mul1, .stride_k = st.k, .stride_nb = st.nb };
++}
++
++pub const Lin = struct {
++    rig: rig_.Rig,
++    entry: LinEntry,
++    lin: *const shared.Linear,
++    f: cuda.Function,
++    rot: cuda.Function,
++    w: [4]shared.Weight = undefined,
++    jobs: usize = 1,
++    m: usize = 0,
++    x: u64 = 0,
++    xh: u64 = 0,
++    z: u64 = 0,
++    counters: u64 = 0,
++    y: u64 = 0,
++    base: std.ArrayList(u8) = .empty,
++    msg: [160]u8 = undefined,
++
++    pub fn init(rig: rig_.Rig, e: LinEntry, mod: cuda.Module, lin: *const shared.Linear) !Lin {
++        const f = if (e.multi) switch (e.k2) {
++            inline 3, 4, 6 => |k2| try mod.function(std.fmt.comptimePrint("muse_linear_multi_k{d}", .{k2})),
++            else => return error.Unregistered,
++        } else switch (e.k2 * 16 + e.wk) {
++            inline 3 * 16 + 8, 4 * 16 + 8, 4 * 16 + 4, 6 * 16 + 4 => |v| try mod.function(std.fmt.comptimePrint("muse_linear2_k{d}_w{d}", .{ v / 16, v % 16 })),
++            else => return error.Unregistered,
++        };
++        return .{ .rig = rig, .entry = e, .lin = lin, .f = f, .rot = try mod.function("muse_rot_multi") };
++    }
++
++    pub fn deinit(self: *Lin) void {
++        self.base.deinit(self.rig.gpu.gpa);
++        self.rig.deinit();
++    }
++
++    const vt = g.hooks(Lin);
++
++    pub fn kernel(self: *Lin) g.Kernel {
++        return .{ .spec = linSpec(self.entry), .ctx = self, .vt = &vt };
++    }
++
++    fn ysize(self: *const Lin) usize {
++        return self.m * self.w[0].n * (if (self.entry.multi) @as(usize, 2) else 4);
++    }
++
++    pub fn prepare(self: *Lin, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows < 1 or shape.rows > 128 or shape.k % 128 != 0 or shape.n % 128 != 0 or shape.k == 0 or shape.n == 0) return false;
++        const p = shared.plan(shape.k, shape.n, 192, 8);
++        if (p.wk != self.entry.wk or (shape.k / 16) % (p.sk * p.wk) != 0) return false;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.jobs = if (self.entry.multi) 4 else 1;
++        self.m = shape.rows;
++        for (0..self.jobs) |j| self.w[j] = try layer(&self.rig, a, rng, shape.k, shape.n, self.entry.k2);
++        const x = try a.alloc(f16, shape.rows * shape.k);
++        defer a.free(x);
++        for (x) |*v| v.* = @floatCast(rng.float(f32) * 2 - 1);
++        if (fill == .nonfinite) {
++            x[0] = std.math.nan(f16);
++            if (shape.rows > 2) x[2 * shape.k + 5] = std.math.inf(f16);
++            if (shape.rows > 3) x[3 * shape.k + shape.k - 1] = -std.math.inf(f16);
++        }
++        self.x = try self.rig.input(std.mem.sliceAsBytes(x));
++        self.xh = try self.rig.scratch(4 * shape.rows * shape.k * 2);
++        self.z = try self.rig.scratch(@max(4 * @as(usize, p.sk) * shape.rows * shape.n * 4, 4));
++        self.counters = try self.rig.scratch(4 * shared.Linear.counterBytes(self.w[0]));
++        self.y = try self.rig.output(self.jobs * self.ysize());
++        return true;
++    }
++
++    /// The family's launches: ops.qkvg's rot_multi + linear_multi, or ops.proj's rot_in + linear2.
++    pub fn run(self: *Lin) !void {
++        const s = self.rig.s;
++        const w0 = self.w[0];
++        const p = shared.plan(w0.k, w0.n, 192, 8);
++        const smem: u32 = @intCast(p.wk * @min(self.m, 8) * 128 * 4);
++        if (self.entry.multi) {
++            const Job = extern struct { xh: u64, t: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, z: u64, counters: u64, y_dtype: c_int, k: c_int, n: c_int, sk: c_int, b0: c_int, pad: c_int = 0 };
++            const Batch = extern struct { j: [4]Job, n: c_int, m: c_int, pad: [2]c_int = .{ 0, 0 } };
++            const Rot = extern struct { suh: [4]u64, xh: [4]u64 };
++            var rot: Rot = undefined;
++            var bt: Batch = .{ .j = undefined, .n = 4, .m = @intCast(self.m) };
++            const zr = @as(usize, p.sk) * self.m * w0.n * 4;
++            const cr = shared.Linear.counterBytes(w0);
++            for (0..4) |j| {
++                const w = self.w[j];
++                rot.suh[j] = w.suh;
++                rot.xh[j] = self.xh + j * self.m * w.k * 2;
++                bt.j[j] = .{ .xh = rot.xh[j], .t = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .bias = 0, .y = self.y + j * self.ysize(), .z = if (p.sk > 1) self.z + j * zr else 0, .counters = self.counters + j * cr, .y_dtype = 0, .k = @intCast(w.k), .n = @intCast(w.n), .sk = @intCast(p.sk), .b0 = @intCast(j * (w.n / 128) * p.sk) };
++            }
++            var ra: cuda.Args = .{};
++            ra.add(self.x);
++            ra.add(@as(c_int, 0));
++            ra.add(rot);
++            ra.add(@as(c_int, @intCast(w0.k)));
++            try cuda.launch.launch(self.rot, .{ .grid = .{ .x = @intCast((w0.k / 128 + 3) / 4), .y = @intCast(self.m), .z = 4 }, .block = .{ .x = 128 } }, s, &ra);
++            var la: cuda.Args = .{};
++            la.add(bt);
++            try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(4 * (w0.n / 128) * p.sk), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = smem }, s, &la);
++        } else {
++            var ra: cuda.Args = .{};
++            inline for (.{ self.x, w0.suh, self.xh }) |v| ra.add(v);
++            inline for (.{ 0, self.m, w0.k }) |v| ra.add(@as(i32, @intCast(v)));
++            try cuda.launch.launch(self.lin.rot_in, .{ .grid = .{ .x = @intCast((w0.k / 128 + 3) / 4), .y = @intCast(self.m), .z = 1 }, .block = .{ .x = 128 } }, s, &ra);
++            var la: cuda.Args = .{};
++            inline for (.{ self.xh, w0.trellis }) |v| la.add(v);
++            la.add(@as(i64, @intCast(w0.stride_k)));
++            la.add(@as(i64, @intCast(w0.stride_nb)));
++            inline for (.{ w0.svh, @as(u64, 0), self.y }) |v| la.add(v);
++            la.add(@as(c_int, 2));
++            la.add(if (p.sk > 1) self.z else @as(u64, 0));
++            la.add(self.counters);
++            inline for (.{ self.m, w0.k, w0.n, p.sk }) |v| la.add(@as(c_int, @intCast(v)));
++            try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(w0.n / 128), .y = p.sk, .z = 1 }, .block = .{ .x = p.wk * 32 }, .shared = smem }, s, &la);
++        }
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Lin) usize {
++        return self.jobs * self.m * self.w[0].n;
++    }
++
++    /// Never asked: a replacement's gates 1 and 3 compare bytes (check, replaced), and it declares no sums for gate 4.
++    pub fn reference(_: *Lin, _: []f64, _: []f64) !void {
++        return error.ReplacementHasNoFloat64Reference;
++    }
++
++    /// The shared Linear.matmul on the same inputs, each job into its region.
++    pub fn replaced(self: *Lin) ![]const u8 {
++        const a = self.rig.gpu.gpa;
++        const bytes = self.jobs * self.ysize();
++        var tmp = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, bytes);
++        defer tmp.free();
++        var z = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, @as(usize, shared.plan(self.w[0].k, self.w[0].n, 192, 8).sk) * self.m * self.w[0].n * 4 + 4);
++        defer z.free();
++        var cn = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, shared.Linear.counterBytes(self.w[0]));
++        defer cn.free();
++        try cn.fill8(0, self.rig.s.handle);
++        var xh = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, self.m * self.w[0].k * 2);
++        defer xh.free();
++        for (0..self.jobs) |j| try self.lin.matmul(self.rig.s, self.w[j], self.x, .f16, self.m, tmp.ptr + j * self.ysize(), if (self.entry.multi) .f16 else .f32, xh.ptr, z.ptr, cn.ptr);
++        try self.rig.s.synchronize();
++        try self.base.resize(a, bytes);
++        try tmp.download(0, self.base.items);
++        return self.base.items;
++    }
++
++    /// Gate 1: tf_exl3_linear's bytes on the planted inputs, some of them non-finite.
++    pub fn check(self: *Lin, at: g.Gate) !?[]const u8 {
++        const a = self.rig.gpu.gpa;
++        const got = try a.dupe(u8, try self.rig.outputBytes());
++        defer a.free(got);
++        return mu.sameBytes(&self.msg, got, try self.replaced(), "tf_exl3_linear", linSpec(self.entry).out, at);
++    }
++};
++
++/// muse_grouped2 (32-member tiles) for tf_exl3_grouped_2: gate / up (2 matrices, sk 4) and down (1, sk 1).
++pub const GrpEntry = struct { mats: u32, k2s: [2]u32 };
++pub const grp_entries = [_]GrpEntry{ .{ .mats = 2, .k2s = .{ 4, 4 } }, .{ .mats = 1, .k2s = .{ 3, 4 } }, .{ .mats = 2, .k2s = .{ 6, 3 } } };
++
++pub fn grpSpec(e: GrpEntry) c.Spec {
++    const names = [_][]const u8{ "cuda muse muse_grouped2 (gate / up, 2 bits)", "cuda muse muse_grouped2 (down, 1.5 and 2 bits)", "cuda muse muse_grouped2 (gate / up, 3 and 1.5 bits)" };
++    const i = for (grp_entries, 0..) |x, j| {
++        if (x.mats == e.mats and x.k2s[0] == e.k2s[0] and x.k2s[1] == e.k2s[1]) break j;
++    } else unreachable;
++    const gu = &[_]c.Shape{ .{ .rows = 64, .n = 2048, .k = 4096 }, .{ .rows = 17, .n = 2048, .k = 4096 } };
++    const dn = &[_]c.Shape{ .{ .rows = 64, .n = 4096, .k = 2048 }, .{ .rows = 33, .n = 4096, .k = 2048 } };
++    return .{ .name = names[i], .accum = .none, .depth = noDepth, .out = .f32, .replaces = "tf_exl3_grouped_2", .nan = .{ .stated = rule }, .tiles = .{ .{ .size = 32, .step = 1, .min = 1 }, .{}, .{} }, .served = if (e.mats == 2) gu else dn };
++}
++
++pub const Grp = @import("contract_muse_grouped.zig").Grp;
+diff --git a/zig/tests/cuda/contract_muse_grouped.zig b/zig/tests/cuda/contract_muse_grouped.zig
+new file mode 100644
+index 00000000..a0657732
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_grouped.zig
+@@ -0,0 +1,165 @@
++//! muse_grouped2 under the contract: tf_exl3_grouped_2's bytes on random routings, widths and members.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const x3 = @import("contract_muse_exl3.zig");
++const mu = @import("contract_muse_util.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const sx = cuda.exl3_experts;
++
++const E = 16; // experts in the fixture
++const slots = 8; // Muse Spark's top 8
++
++pub const Grp = struct {
++    rig: rig_.Rig,
++    entry: x3.GrpEntry,
++    f: cuda.Function,
++    base: cuda.Function,
++    p: usize = 0,
++    rows: usize = 0,
++    k: usize = 0,
++    n: usize = 0,
++    sk: usize = 1,
++    maxu: usize = 0,
++    dev: [10]u64 = @splat(0), // x0, x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z
++    host: std.ArrayList(u8) = .empty,
++    msg: [160]u8 = undefined,
++
++    pub fn deinit(self: *Grp) void {
++        self.host.deinit(self.rig.gpu.gpa);
++        self.rig.deinit();
++    }
++
++    const vt = g.hooks(Grp);
++
++    pub fn kernel(self: *Grp) g.Kernel {
++        return .{ .spec = x3.grpSpec(self.entry), .ctx = self, .vt = &vt };
++    }
++
++    fn zBytes(self: *const Grp) usize {
++        return self.entry.mats * self.sk * self.p * self.n * 4;
++    }
++
++    pub fn prepare(self: *Grp, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.k % 128 != 0 or shape.n % 128 != 0 or shape.k == 0 or shape.n == 0) return false;
++        self.sk = sx.plan(shape.k, shape.n, self.entry.mats == 2) catch return false;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.rows = shape.rows;
++        self.k = shape.k;
++        self.n = shape.n;
++        self.p = shape.rows * slots;
++        // routing: 8 distinct experts a row; members row * 32 + slot in row order, -1 after the last
++        const pick = try a.alloc(i32, self.p);
++        defer a.free(pick);
++        for (0..self.rows) |r| {
++            var ids: [E]i32 = undefined;
++            for (&ids, 0..) |*v, i| v.* = @intCast(i);
++            rng.shuffle(i32, &ids);
++            @memcpy(pick[r * slots ..][0..slots], ids[0..slots]);
++        }
++        var uids: std.ArrayList(i32) = .empty;
++        defer uids.deinit(a);
++        for (0..E) |e| if (std.mem.indexOfScalar(i32, pick, @intCast(e)) != null) try uids.append(a, @intCast(e));
++        self.maxu = uids.items.len;
++        const members = try a.alloc(i32, self.maxu * self.rows);
++        defer a.free(members);
++        @memset(members, -1);
++        for (uids.items, 0..) |e, u| {
++            var j: usize = 0;
++            for (pick, 0..) |pe, i| if (pe == e) {
++                members[u * self.rows + j] = @intCast((i / slots) * 32 + i % slots);
++                j += 1;
++            };
++        }
++        // inputs: rotated fp16 rows, one trellis a (matrix, expert) in the stored layout, widths per expert
++        const xs = try a.alloc(f16, self.p * self.k);
++        defer a.free(xs);
++        var ptrs: [2][E]i64 = undefined;
++        var k2s: [2][E]i32 = undefined;
++        for (0..2) |m| {
++            for (xs) |*v| v.* = @floatCast(rng.float(f32) * 2 - 1);
++            if (fill == .nonfinite) {
++                xs[m * 3] = if (m == 0) std.math.nan(f16) else std.math.inf(f16);
++                if (self.p > 2) xs[2 * self.k + 7] = -std.math.inf(f16);
++            }
++            self.dev[m] = try self.rig.input(std.mem.sliceAsBytes(xs));
++            for (0..E) |e| {
++                const k2 = self.entry.k2s[e % 2];
++                k2s[m][e] = @intCast(k2);
++                const words = try a.alloc(u32, (self.k / 16) * (self.n / 16) * 4 * k2);
++                defer a.free(words);
++                for (words) |*w| w.* = rng.int(u32);
++                ptrs[m][e] = @intCast(try self.rig.input(std.mem.sliceAsBytes(words)));
++            }
++        }
++        if (self.entry.mats == 1) {
++            self.dev[1] = self.dev[0];
++            ptrs[1] = ptrs[0];
++            k2s[1] = k2s[0];
++        }
++        for (0..2) |m| {
++            self.dev[2 + m] = try self.rig.input(std.mem.sliceAsBytes(&ptrs[m]));
++            self.dev[4 + m] = try self.rig.input(std.mem.sliceAsBytes(&k2s[m]));
++        }
++        self.dev[6] = try self.rig.input(std.mem.sliceAsBytes(uids.items));
++        const cnt = [1]i32{@intCast(self.maxu)};
++        self.dev[7] = try self.rig.input(std.mem.sliceAsBytes(&cnt));
++        self.dev[8] = try self.rig.input(std.mem.sliceAsBytes(members));
++        self.dev[9] = try self.rig.output(self.zBytes());
++        return true;
++    }
++
++    /// exl3.zig grouped2's launch: grid (experts, N / 128, mats * sk * member tiles of 32).
++    pub fn run(self: *Grp) !void {
++        var a: cuda.Args = .{};
++        inline for (0..10) |i| a.add(self.dev[i]);
++        inline for (.{ self.k, self.n, self.p, self.sk, self.rows, slots }) |v| a.add(@as(i32, @intCast(v)));
++        const z: u32 = @intCast(self.entry.mats * self.sk * ((self.rows + 31) / 32));
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.maxu), .y = @intCast(self.n / 128), .z = z }, .block = .{ .x = 128 } }, self.rig.s, &a);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Grp) usize {
++        return self.zBytes() / 4;
++    }
++
++    /// Never asked: a replacement's gates 1 and 3 compare bytes (check, replaced), and it declares no sums for gate 4.
++    pub fn reference(_: *Grp, _: []f64, _: []f64) !void {
++        return error.ReplacementHasNoFloat64Reference;
++    }
++
++    /// tf_exl3_grouped_2 as exl3_experts.run launches it, into a buffer poisoned as the rig's output is.
++    pub fn replaced(self: *Grp) ![]const u8 {
++        const bytes = self.zBytes();
++        var tmp = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, bytes);
++        defer tmp.free();
++        try tmp.fill8(0xff, self.rig.s.handle);
++        var a: cuda.Args = .{};
++        inline for (0..9) |i| a.add(self.dev[i]);
++        a.add(tmp.ptr);
++        inline for (.{ self.k, self.n, self.p, self.sk, self.rows, slots, self.maxu, self.entry.mats }) |v| a.add(@as(i32, @intCast(v)));
++        a.add(@as(i32, 0));
++        a.add(@as(i32, 0));
++        a.add(@as(i32, -1));
++        const z: u32 = @intCast(self.entry.mats * self.sk * ((self.rows + 15) / 16));
++        try cuda.launch.launch(self.base, .{ .grid = .{ .x = @intCast(self.maxu), .y = @intCast(self.n / 128), .z = z }, .block = .{ .x = 128 } }, self.rig.s, &a);
++        try self.rig.s.synchronize();
++        try self.host.resize(self.rig.gpu.gpa, bytes);
++        try tmp.download(0, self.host.items);
++        return self.host.items;
++    }
++
++    /// Gate 1: tf_exl3_grouped_2's bytes on the planted inputs, some of them non-finite.
++    pub fn check(self: *Grp, at: g.Gate) !?[]const u8 {
++        const a = self.rig.gpu.gpa;
++        const got = try a.dupe(u8, try self.rig.outputBytes());
++        defer a.free(got);
++        return mu.sameBytes(&self.msg, got, try self.replaced(), "tf_exl3_grouped_2", .f32, at);
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_norms.zig b/zig/tests/cuda/contract_muse_norms.zig
+new file mode 100644
+index 00000000..38e23818
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_norms.zig
+@@ -0,0 +1,363 @@
++//! Muse Spark's norm glue under the contract against float64; the 8-block cluster forms bit-equal to the block forms.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const rows = core.contract.rows;
++
++/// A thread's ceil(D / 1024) squares, then 32 lanes and 32 warps (or 8 blocks' 4 warps) by halves.
++fn rmsDepth(s: c.Shape) usize {
++    return (s.k + 1023) / 1024 + 12;
++}
++
++const tiles: [3]c.Tile = .{ .{}, .{}, .{ .size = 1024 } };
++const half_why = "an fp16 output follows the sum of squares as ss^-1/2: a bf16 sum's error is a few output ulps";
++const point = "bf16(fp32(y + y2) * scale) is exllamav3's rounding point, replayed on the host from the kernel's two IEEE fp32 " ++
++    "steps (an add, then a multiply: nothing to contract); float64 from there";
++
++pub const Kind = enum { embed, gate_res, gate_x, gate_xf, esum };
++
++pub fn spec(kind: Kind, cluster: bool) c.Spec {
++    const hidden = &[_]c.Shape{ .{ .rows = 8, .n = 8192, .k = 8192 }, .{ .rows = 1, .n = 8192, .k = 8192 } };
++    const latent = &[_]c.Shape{ .{ .rows = 8, .n = 2048, .k = 4096 }, .{ .rows = 1, .n = 2048, .k = 4096 } };
++    const gate_sums: c.Sums = .{ .exact = false, .why = point };
++    var s: c.Spec = switch (kind) {
++        .embed => .{ .name = "cuda muse muse_embed_norm (bf16 rows, fp32 out)", .accum = .f32, .depth = rmsDepth, .ops = 8, .out = .f32, .tiles = tiles, .served = hidden },
++        .gate_res => .{ .name = "cuda muse muse_gate_norm (the residual, in place)", .accum = .f32, .depth = rmsDepth, .out = .f32, .in_place = true, .tiles = tiles, .served = hidden, .sums = gate_sums },
++        .gate_x => .{ .name = "cuda muse muse_gate_norm (the next norm's fp16 x)", .accum = .f32, .depth = rmsDepth, .out = .f16, .tiles = tiles, .served = hidden, .sums = .{ .bf16 = 0, .exact = false, .why = half_why } },
++        .gate_xf => .{ .name = "cuda muse muse_gate_norm (the next norm's fp32 xf)", .accum = .f32, .depth = rmsDepth, .out = .f32, .tiles = tiles, .served = hidden, .sums = gate_sums },
++        .esum => .{ .name = "cuda muse muse_expert_sum (8 slots, a rank's fp16 columns)", .accum = .f32, .depth = rmsDepth, .out = .f16, .tiles = tiles, .served = latent, .sums = .{ .bf16 = 0, .exact = false, .why = half_why } },
++    };
++    if (cluster) {
++        s.name = switch (kind) {
++            .embed => unreachable,
++            .gate_res => "cuda muse muse_gate_norm_c (8 blocks a row: the residual)",
++            .gate_x => "cuda muse muse_gate_norm_c (8 blocks a row: fp16 x)",
++            .gate_xf => "cuda muse muse_gate_norm_c (8 blocks a row: fp32 xf)",
++            .esum => "cuda muse muse_expert_sum_c (8 blocks a row)",
++        };
++        s.replaces = if (kind == .esum) "muse_expert_sum" else "muse_gate_norm";
++        s.nan = .{ .stated = "the bytes of the 1,024-thread form, non-finite inputs included" };
++    }
++    return s;
++}
++
++const slots = 8; // Muse Spark's top 8
++const post_eps: f32 = 1e-8;
++const next_eps: f32 = 1e-5;
++
++pub const Norm = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    cluster: bool = false,
++    f: cuda.Function,
++    base: ?cuda.Function = null,
++    arena: std.heap.ArenaAllocator,
++    r: ?rows.Rows = null,
++    shape: c.Shape = undefined,
++    // host values as the kernel reads them: gate (res, y, y2, scale, ab, w); esum (y, y2, wts, scale)
++    v: [6][]f64 = undefined,
++    t: []f64 = &.{}, // the rounding point bf16(fp32(y + y2) * scale)
++    dev: [8]u64 = @splat(0),
++    lo: usize = 0,
++    host: std.ArrayList(u8) = .empty,
++    msg: [160]u8 = undefined,
++
++    pub fn deinit(self: *Norm) void {
++        if (self.r) |r| r.deinit();
++        self.host.deinit(self.rig.gpu.gpa);
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt_ref = blk: {
++        var v = g.hooks(Norm);
++        v.check = null;
++        v.replaced = null;
++        break :blk v;
++    };
++    const vt_rep = g.hooks(Norm);
++
++    pub fn kernel(self: *Norm) g.Kernel {
++        return .{ .spec = spec(self.kind, self.cluster), .ctx = self, .vt = if (self.cluster) &vt_rep else &vt_ref };
++    }
++
++    fn D(self: *const Norm) usize {
++        return self.shape.k;
++    }
++
++    fn outW(self: *const Norm) usize {
++        return if (self.kind == .esum) @min(self.shape.n, self.shape.k) else self.shape.k;
++    }
++
++    pub fn prepare(self: *Norm, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.k == 0 or shape.k > 16 * 1024 or shape.rows == 0) return false;
++        if (self.kind == .esum and shape.n == 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        if (self.r) |r| r.deinit();
++        self.r = null;
++        self.shape = shape;
++        const ga = self.rig.gpu.gpa;
++        if (self.kind == .embed) return self.prepareEmbed(fill, seed);
++        const a = self.arena.allocator();
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const d = self.D();
++        const n = if (self.kind == .esum) shape.rows * slots else shape.rows; // rows of y
++        const lens = if (self.kind == .esum) [6]usize{ n * d, n * d, n, d, 0, 0 } else [6]usize{ n * d, n * d, n * d, d, 2 * d, d };
++        for (&self.v, lens) |*x, l| x.* = try a.alloc(f64, l);
++        const v = &self.v;
++        const ys = if (self.kind == .esum) [2]usize{ 0, 1 } else [2]usize{ 1, 2 };
++        for (ys) |i| for (v[i]) |*x| {
++            x.* = if (fill == .stress) mu.int(rng, -16, 16) else mu.uni(rng, f32, -2, 2);
++        };
++        if (self.kind == .esum) {
++            for (v[2]) |*x| x.* = if (fill == .stress) 1 else mu.uni(rng, f32, 0, 0.5);
++            for (v[3]) |*x| x.* = if (fill == .stress) 1 else mu.uni(rng, u16, 0.5, 1.5);
++            self.lo = if (self.outW() < d and seed % 2 == 1) d - self.outW() else 0; // either rank's columns
++        } else {
++            for (v[0]) |*x| x.* = if (fill == .stress) mu.int(rng, -64, 64) else mu.uni(rng, f32, -4, 4);
++            for (v[3]) |*x| x.* = if (fill == .stress) 1 else mu.uni(rng, f32, 0.25, 2);
++            for (v[4]) |*x| x.* = if (fill == .stress) 1 else mu.uni(rng, f32, 0.5, 1.5);
++            for (v[5]) |*x| x.* = mu.uni(rng, f32, 0.5, 1.5);
++        }
++        if (fill == .nonfinite) {
++            const y = v[ys[0]];
++            y[0] = std.math.nan(f64); // row (or slot) 0: every output NaN
++            const second: usize = if (self.kind == .esum) slots + 2 else 2; // row 1's third slot, or row 2
++            if (n > second) v[ys[1]][second * d + 5] = std.math.inf(f64); // inf * 0 at one column, the rest 0 * finite
++            if (self.kind == .esum) {
++                if (n > slots + 1) v[2][slots + 1] = -std.math.inf(f64); // row 1's second slot weight
++            } else if (shape.rows > 3) v[0][3 * d + d - 1] = -std.math.inf(f64); // res: the next norm's row 3
++        }
++        self.t = try a.alloc(f64, n * d);
++        for (self.t, 0..) |*o, i| {
++            const sum: f32 = @as(f32, @floatCast(v[ys[0]][i])) + @as(f32, @floatCast(v[ys[1]][i]));
++            o.* = mu.bf16r(sum * @as(f32, @floatCast(v[3][i % d])));
++        }
++        for (0..6) |i| {
++            if (lens[i] == 0) continue;
++            self.dev[i] = try mu.put(&self.rig, ga, f32, v[i]);
++        }
++        const ob = shape.rows * self.outW();
++        switch (self.kind) {
++            .gate_res => {
++                self.dev[6] = try self.rig.output(ob * 4);
++                self.dev[7] = try self.rig.scratch(ob * 2 + ob * 4);
++            },
++            .gate_x => {
++                self.dev[6] = try self.rig.output(ob * 2);
++                self.dev[7] = try self.rig.scratch(ob * 8);
++            },
++            .gate_xf => {
++                self.dev[6] = try self.rig.output(ob * 4);
++                self.dev[7] = try self.rig.scratch(ob * 4 + ob * 2);
++            },
++            .esum => self.dev[6] = try self.rig.output(ob * 2),
++            .embed => unreachable,
++        }
++        return true;
++    }
++
++    fn prepareEmbed(self: *Norm, fill: g.Fill, seed: u64) !bool {
++        const ga = self.rig.gpu.gpa;
++        var r = try rows.Rows.init(ga, .rms, self.shape);
++        r.eps = next_eps;
++        self.r = r;
++        r.fill(fill, seed);
++        @memset(r.w, c.toBf16(1)); // the weightless embed_norm
++        const n = self.shape.rows;
++        const k = self.shape.k;
++        const table = try self.arena.allocator().alloc(u16, r.x.len); // row i of x at table row n - 1 - i
++        for (0..n) |i| @memcpy(table[(n - 1 - i) * k ..][0..k], r.x[i * k ..][0..k]);
++        self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(table));
++        const ids = try self.arena.allocator().alloc(i64, n);
++        for (ids, 0..) |*o, i| o.* = @intCast(n - 1 - i);
++        self.dev[1] = try mu.ints(&self.rig, i64, ids);
++        self.dev[2] = try self.rig.output(r.outputs() * 4);
++        return true;
++    }
++
++    /// Where the view's buffers sit in a call: res, x, xf (gate) from the output and scratch slots.
++    fn gateOuts(self: *const Norm, out: u64, extra: u64) [3]u64 {
++        const ob = self.shape.rows * self.D();
++        return switch (self.kind) {
++            .gate_res => .{ out, extra, extra + ob * 2 },
++            .gate_x => .{ extra, out, extra + ob * 4 },
++            else => .{ extra, extra + ob * 4, out },
++        };
++    }
++
++    fn launch(self: *Norm, f: cuda.Function, cluster: bool, out: u64, extra: u64) !void {
++        const s = self.rig.s;
++        const n = self.shape.rows;
++        var a: cuda.Args = .{};
++        switch (self.kind) {
++            .embed => {
++                inline for (.{ self.dev[0], self.dev[1], self.dev[2] }) |p| a.add(p);
++                a.add(@as(c_int, @intCast(self.D())));
++                a.add(next_eps);
++            },
++            .esum => {
++                inline for (.{ self.dev[0], self.dev[1], self.dev[2], self.dev[3] }) |p| a.add(p);
++                a.add(post_eps);
++                a.add(out);
++                inline for (.{ self.D(), slots, self.lo, self.outW() }) |v| a.add(@as(c_int, @intCast(v)));
++            },
++            else => {
++                const o = self.gateOuts(out, extra);
++                try mu.copy(&self.rig, o[0], self.dev[0], n * self.D() * 4);
++                inline for (.{ o[0], self.dev[1], self.dev[2], self.dev[3] }) |p| a.add(p);
++                a.add(@as(c_int, 1));
++                a.add(post_eps);
++                inline for (.{ self.dev[4], self.dev[5] }) |p| a.add(p);
++                a.add(next_eps);
++                inline for (.{ o[1], o[2] }) |p| a.add(p);
++                a.add(@as(c_int, @intCast(self.D())));
++            },
++        }
++        const grid: u32 = @intCast(if (cluster) n * 8 else n);
++        try cuda.launch.launch(f, .{ .grid = .{ .x = grid, .y = 1, .z = 1 }, .block = .{ .x = if (cluster) 128 else 1024 } }, s, &a);
++        try s.synchronize();
++    }
++
++    /// The family's launch: ops.gateNormAt / moe's expert sum (rowLaunch), forward's embed.
++    pub fn run(self: *Norm) !void {
++        return self.launch(self.f, self.cluster, self.dev[6], self.dev[7]);
++    }
++
++    pub fn count(self: *Norm) usize {
++        return self.shape.rows * self.outW();
++    }
++
++    /// Float64 outputs from the rounding point on; mag unused (bounds derives each allowance).
++    pub fn reference(self: *Norm, want: []f64, mag: []f64) !void {
++        if (self.kind == .embed) return self.r.?.reference(want, mag);
++        @memset(mag, 0);
++        return self.eval(.none, .sequential, want, null);
++    }
++
++    pub fn simulate(self: *Norm, acc: c.Accum, order: g.Order, out: []f64) !void {
++        if (self.kind == .embed) return self.r.?.simulate(acc, order, out);
++        return self.eval(acc, order, out, null);
++    }
++
++    /// Each output's allowance from first-order propagation of its fp32 roundings (doubled for the second order).
++    pub fn bounds(self: *Norm, want: []const f64, mag: []const f64, allow: []f64) !void {
++        _ = mag;
++        if (self.kind == .embed) return; // the rows family's bound, as registered
++        const tmp = try self.arena.allocator().alloc(f64, want.len);
++        try self.eval(.none, .sequential, tmp, allow);
++    }
++
++    fn sq(acc: c.Accum, order: g.Order, a: std.mem.Allocator, x: []const f64) !f64 {
++        const t = try a.alloc(f64, x.len);
++        defer a.free(t);
++        for (t, x) |*o, v| o.* = v * v;
++        return if (acc == .none) blk: {
++            var s: f64 = 0;
++            for (t) |v| s += v;
++            break :blk s;
++        } else rows.sumIn(acc, order, t);
++    }
++
++    /// Outputs with the sums in `acc` (none: float64), or (err non-null) each output's allowance.
++    fn eval(self: *Norm, acc: c.Accum, order: g.Order, out: []f64, err: ?[]f64) !void {
++        const a = self.rig.gpu.gpa;
++        const d = self.D();
++        const df: f64 = @floatFromInt(d);
++        const g1 = mu.gamma(@floatFromInt(rmsDepth(self.shape)));
++        const e_rs = 0.5 * g1 + 3 * mu.u + mu.fast; // ss / D, + eps, rsqrtf
++        const v = self.v;
++        if (self.kind == .esum) {
++            const accs = try a.alloc(f64, 2 * d);
++            defer a.free(accs);
++            const acc_v = accs[0..d];
++            const acc_e = accs[d..];
++            for (0..self.shape.rows) |r| {
++                @memset(accs, 0);
++                for (0..slots) |k| {
++                    const p = r * slots + k;
++                    const t = self.t[p * d ..][0..d];
++                    const rs = 1 / @sqrt(try sq(acc, order, a, t) / df + post_eps);
++                    for (acc_v, acc_e, t) |*o, *e, x| {
++                        o.* += x * rs * v[2][p];
++                        e.* += @abs(x * rs * v[2][p]) * (e_rs + 2 * mu.u + mu.gamma(slots));
++                    }
++                }
++                const w = self.outW();
++                for (0..w) |j| {
++                    out[r * w + j] = acc_v[self.lo + j];
++                    if (err) |e| e[r * w + j] = mu.allow(.f16, acc_v[self.lo + j], 2 * acc_e[self.lo + j]);
++                }
++            }
++            return;
++        }
++        const buf = try a.alloc(f64, 2 * d);
++        defer a.free(buf);
++        const hv = buf[0..d];
++        const he = buf[d..];
++        for (0..self.shape.rows) |r| {
++            const t = self.t[r * d ..][0..d];
++            const rs1 = 1 / @sqrt(try sq(acc, order, a, t) / df + post_eps);
++            var sh: f64 = 0;
++            for (hv, he, t, 0..) |*o, *e, x, i| {
++                const ra = v[0][r * d + i] * v[4][i];
++                const yb = x * rs1 * v[4][d + i];
++                o.* = ra + yb;
++                e.* = @abs(yb) * (e_rs + mu.u) + 3 * mu.u * (@abs(ra) + @abs(yb));
++                sh += 2 * @abs(o.*) * e.*;
++            }
++            const ss2 = try sq(acc, order, a, hv);
++            const rs2 = 1 / @sqrt(ss2 / df + next_eps);
++            const e_rs2 = 0.5 * (g1 + if (ss2 > 0) sh / ss2 else 0) + 3 * mu.u + mu.fast;
++            for (hv, he, 0..) |x, e, i| {
++                const o = x * rs2 * v[5][i];
++                const eo = @abs(rs2 * v[5][i]) * e + @abs(o) * (e_rs2 + 2 * mu.u);
++                const at = r * d + i;
++                switch (self.kind) {
++                    .gate_res => {
++                        out[at] = x;
++                        if (err) |el| el[at] = mu.allow(.f32, x, 2 * e);
++                    },
++                    .gate_x, .gate_xf => {
++                        out[at] = o;
++                        if (err) |el| el[at] = mu.allow(if (self.kind == .gate_x) .f16 else .f32, o, 2 * eo);
++                    },
++                    else => unreachable,
++                }
++            }
++        }
++    }
++
++    /// The 1,024-thread form on the same inputs, into fresh buffers poisoned as the rig's outputs are.
++    pub fn replaced(self: *Norm) ![]const u8 {
++        const d = self.rig.gpu.d;
++        const ob = self.count() * (if (spec(self.kind, false).out == .f16) @as(usize, 2) else 4);
++        var out = try cuda.DeviceBuffer.alloc(d, ob);
++        defer out.free();
++        try out.fill8(0xff, self.rig.s.handle);
++        var extra = try cuda.DeviceBuffer.alloc(d, self.shape.rows * self.D() * 8 + 4);
++        defer extra.free();
++        try self.launch(self.base.?, false, out.ptr, extra.ptr);
++        try self.host.resize(self.rig.gpu.gpa, ob);
++        try out.download(0, self.host.items);
++        return self.host.items;
++    }
++
++    pub fn check(self: *Norm, at: g.Gate) !?[]const u8 {
++        const a = self.rig.gpu.gpa;
++        const got = try a.dupe(u8, try self.rig.outputBytes());
++        defer a.free(got);
++        return mu.sameBytes(&self.msg, got, try self.replaced(), self.baseName(), spec(self.kind, false).out, at);
++    }
++
++    fn baseName(self: *const Norm) []const u8 {
++        return if (self.kind == .esum) "muse_expert_sum" else "muse_gate_norm";
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_route.zig b/zig/tests/cuda/contract_muse_route.zig
+new file mode 100644
+index 00000000..0f07c99b
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_route.zig
+@@ -0,0 +1,344 @@
++//! Muse Spark's router and head glue under the contract: router, top 8, argmax, soft cap and the RoPE tables.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const dense = core.contract.dense;
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++/// A lane's k / 32 products in order, then the warp's 32 lanes by halves.
++fn laneChain(s: c.Shape) usize {
++    return (s.k + 31) / 32 + 5;
++}
++
++pub const Kind = enum { router, topk, argmax, softcap, rope };
++
++const topk_rule = "the top 8 of sigmoid(logit * mult) + bias, ties to the lower expert, in expert order; weights " ++
++    "s / (sum s + 1e-15) * scale within 2^-20 of float64; a NaN score at expert e never leaves its tree node: e = 0 is " ++
++    "picked first (every weight NaN), any other e is never picked and hides the experts j = e mod 2^ceil(log2(e + 1))";
++const argmax_rule = "the first NaN, else the first maximum, over both ranks' slices up to the vocabulary";
++
++const top = 8;
++const mult: f32 = 0.17677669529663687; // output_multiplier
++const cap: f32 = 20; // final_logit_softcapping
++const theta: f64 = 500000;
++
++pub fn spec(kind: Kind) c.Spec {
++    return switch (kind) {
++        .router => .{ .name = "cuda muse muse_router (fp32 rows times bf16 weights)", .accum = .f32, .depth = laneChain, .out = .f32, .tiles = .{ .{}, .{ .size = 2 }, .{ .size = 256 } }, .served = &.{ .{ .rows = 8, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 256, .k = 8192 } } },
++        .topk => .{ .name = "cuda muse muse_topk (sigmoid top 8 of 256)", .accum = .none, .depth = noSums, .out = .raw, .nan = .{ .stated = topk_rule }, .tiles = .{ .{}, .{ .size = 256, .step = 32, .min = 32 }, .{} }, .served = &.{ .{ .rows = 8, .n = 256, .k = top }, .{ .rows = 128, .n = 256, .k = top } } },
++        .argmax => .{ .name = "cuda muse muse_argmax (two ranks' head slices)", .accum = .none, .depth = noSums, .out = .raw, .nan = .{ .stated = argmax_rule }, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = &.{ .{ .rows = 8, .n = 202048, .k = 101120 }, .{ .rows = 1, .n = 202048, .k = 101120 } } },
++        .softcap => .{ .name = "cuda muse muse_softcap (in place)", .accum = .none, .depth = noSums, .ops = 8, .out = .f32, .in_place = true, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = &.{ .{ .rows = 8, .n = 101120, .k = 1 }, .{ .rows = 1, .n = 101120, .k = 1 } } },
++        .rope => .{ .name = "cuda muse muse_rope_tables (fp64 then fp32)", .accum = .none, .depth = noSums, .out = .f32, .tiles = .{ .{ .size = 65536 }, .{}, .{} }, .served = &.{ .{ .rows = 471040, .n = 64, .k = 1 }, .{ .rows = 8192, .n = 128, .k = 1 } } },
++    };
++}
++
++pub const Route = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    f: cuda.Function,
++    arena: std.heap.ArenaAllocator,
++    shape: c.Shape = undefined,
++    d: ?dense.Dense = null,
++    x: []f64 = &.{}, // logits, head slices or soft-cap inputs
++    bias: []f64 = &.{},
++    th: f64 = theta,
++    dev: [4]u64 = @splat(0),
++    msg: [200]u8 = undefined,
++
++    pub fn deinit(self: *Route) void {
++        if (self.d) |d| d.deinit();
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt_ref = blk: {
++        var v = g.hooks(Route);
++        v.check = null;
++        break :blk v;
++    };
++    const vt_rule = g.hooks(Route);
++
++    pub fn kernel(self: *Route) g.Kernel {
++        const ruled = self.kind == .topk or self.kind == .argmax;
++        return .{ .spec = spec(self.kind), .ctx = self, .vt = if (ruled) &vt_rule else &vt_ref };
++    }
++
++    pub fn prepare(self: *Route, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        if (self.d) |d| d.deinit();
++        self.d = null;
++        self.shape = shape;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const nf = fill == .nonfinite;
++        switch (self.kind) {
++            .router => {
++                const d = try dense.Dense.init(ga, shape, 1);
++                self.d = d;
++                d.fillX(fill, seed, 1);
++                const k = shape.k;
++                for (0..shape.n) |j| for (0..k) |i| {
++                    d.w[j * k + i] = if (fill != .stress) mu.uni(rng, u16, -1, 1) else if (i < k / 2) mu.int(rng, 1, 6) else -d.w[j * k + i - k / 2];
++                };
++                if (fill == .stress and k % 2 == 1) for (0..shape.n) |j| {
++                    d.w[j * k + k - 1] = 0;
++                };
++                const xs = try a.alloc(f64, d.x.len);
++                for (xs, d.x) |*o, b| o.* = c.fromBf16(b);
++                self.dev[0] = try mu.put(&self.rig, ga, f32, xs);
++                self.dev[1] = try mu.put(&self.rig, ga, u16, d.w);
++                self.dev[2] = try self.rig.output(shape.rows * shape.n * 4);
++            },
++            .topk => {
++                if (shape.n > 1024 or shape.k != top) return false;
++                self.x = try a.alloc(f64, shape.rows * shape.n);
++                self.bias = try a.alloc(f64, shape.n);
++                for (self.x) |*v| v.* = mu.int(rng, -64, 64) / 8; // eighths: some ties
++                for (self.bias) |*v| v.* = mu.int(rng, 0, 7) / 64;
++                if (nf) {
++                    self.x[3] = std.math.nan(f64); // never picked
++                    if (shape.rows > 1) self.x[shape.n] = std.math.nan(f64); // expert 0: the root keeps it
++                    if (shape.rows > 2) self.x[2 * shape.n + 5] = std.math.inf(f64);
++                    if (shape.rows > 3) self.x[3 * shape.n + 1] = -std.math.inf(f64);
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f32, self.x);
++                self.dev[1] = try mu.put(&self.rig, ga, f32, self.bias);
++                self.dev[2] = try self.rig.output(shape.rows * top * 4);
++                self.dev[3] = try self.rig.output(shape.rows * top * 4);
++            },
++            .argmax => {
++                const w0 = shape.k;
++                if (shape.n > 2 * w0) return false;
++                const w1: usize = if (shape.n > w0) w0 else 0; // rank 1's slice, padded as rank 0's
++                self.x = try a.alloc(f64, shape.rows * shape.n);
++                for (self.x) |*v| v.* = mu.int(rng, -1024, 1024) / 16; // sixteenths: ties
++                if (nf) {
++                    const n = shape.n;
++                    self.x[n / 2] = std.math.nan(f64);
++                    self.x[n - 1] = std.math.nan(f64); // the first NaN wins
++                    if (shape.rows > 1) self.x[n + n / 3] = std.math.inf(f64);
++                    if (shape.rows > 2) self.x[2 * n + 7] = -std.math.inf(f64);
++                }
++                // device layout: rank 0's [rows, w0], then rank 1's [rows, w1]; NaN past the vocabulary (never read)
++                const lay = try a.alloc(f64, shape.rows * (w0 + w1));
++                @memset(lay, std.math.nan(f64));
++                for (0..shape.rows) |r| for (0..shape.n) |col| {
++                    const at = if (col < w0) r * w0 + col else shape.rows * w0 + r * w1 + col - w0;
++                    lay[at] = self.x[r * shape.n + col];
++                };
++                self.dev[0] = try mu.put(&self.rig, ga, f32, lay);
++                self.dev[1] = try self.rig.output(shape.rows * 4);
++            },
++            .softcap => {
++                self.x = try a.alloc(f64, shape.rows * shape.n);
++                for (self.x) |*v| v.* = mu.uni(rng, f32, -400, 400);
++                if (nf) {
++                    self.x[1] = std.math.nan(f64);
++                    self.x[2] = std.math.inf(f64);
++                    self.x[3] = -std.math.inf(f64);
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f32, self.x);
++                self.dev[1] = try self.rig.output(self.x.len * 4);
++            },
++            .rope => {
++                if (shape.n % 2 != 0) return false;
++                self.th = if (nf) std.math.nan(f64) else theta; // column 0 stays finite: theta^0 = 1
++                const half = shape.rows * shape.n / 2;
++                self.dev[0] = try self.rig.output(2 * half * 4);
++            },
++        }
++        return true;
++    }
++
++    /// The family's launches (ops.moe, forward's head and tables).
++    pub fn run(self: *Route) !void {
++        const s = self.rig.s;
++        const sh = self.shape;
++        var a: cuda.Args = .{};
++        var grid: [2]u32 = .{ @intCast(sh.rows), 1 };
++        var block: u32 = 256;
++        switch (self.kind) {
++            .router => {
++                inline for (.{ self.dev[0], self.dev[1] }) |p| a.add(p);
++                a.add(@as(c_int, 1));
++                a.add(self.dev[2]);
++                inline for (.{ sh.k, sh.n }) |v| a.add(@as(c_int, @intCast(v)));
++                grid = .{ @intCast((sh.n + 1) / 2), @intCast(sh.rows) };
++                block = 64;
++            },
++            .topk => {
++                inline for (.{ self.dev[0], self.dev[1] }) |p| a.add(p);
++                inline for (.{ sh.n, top }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(mult);
++                a.add(@as(f32, 1));
++                inline for (.{ self.dev[2], self.dev[3] }) |p| a.add(p);
++                block = @intCast(std.math.ceilPowerOfTwo(usize, @max(sh.n, 32)) catch unreachable);
++            },
++            .argmax => {
++                inline for (.{ self.dev[0], self.dev[1] }) |p| a.add(p);
++                const w1: usize = if (sh.n > sh.k) sh.k else 0;
++                inline for (.{ sh.k, w1 }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(@as(i64, @intCast(sh.rows * sh.k)));
++                a.add(@as(c_int, @intCast(sh.n)));
++            },
++            .softcap => {
++                const n = sh.rows * sh.n;
++                try mu.copy(&self.rig, self.dev[1], self.dev[0], n * 4);
++                a.add(self.dev[1]);
++                a.add(@as(i64, @intCast(n)));
++                a.add(mult);
++                a.add(cap);
++                grid = .{ @intCast(@min((n + 255) / 256, 4096)), 1 };
++            },
++            .rope => {
++                const half = sh.rows * sh.n / 2;
++                a.add(self.dev[0]);
++                a.add(self.dev[0] + half * 4);
++                a.add(@as(c_int, @intCast(sh.rows)));
++                a.add(self.th);
++                a.add(@as(c_int, @intCast(sh.n)));
++                grid = .{ 256, 1 };
++            },
++        }
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid[0], .y = grid[1], .z = 1 }, .block = .{ .x = block } }, s, &a);
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Route) usize {
++        const sh = self.shape;
++        return switch (self.kind) {
++            .router, .softcap, .rope => sh.rows * sh.n,
++            .topk => sh.rows * top * 8,
++            .argmax => sh.rows * 4,
++        };
++    }
++
++    pub fn reference(self: *Route, want: []f64, mag: []f64) !void {
++        switch (self.kind) {
++            .router => return self.d.?.reference(want, mag),
++            .softcap => for (want, mag, self.x) |*w, *m, x| {
++                const v = x * mult;
++                w.* = std.math.tanh(v / cap) * cap;
++                m.* = 0;
++            },
++            .rope => {
++                const half = self.shape.n / 2;
++                const nh = self.shape.rows * half;
++                for (0..nh) |i| {
++                    const ang = self.angle(i);
++                    want[i] = @cos(ang);
++                    want[nh + i] = @sin(ang);
++                    mag[i] = 0;
++                    mag[nh + i] = 0;
++                }
++            },
++            .topk, .argmax => return error.StatedRule, // gates 1 and 3 run check; no sums for gate 4
++        }
++    }
++
++    fn angle(self: *const Route, i: usize) f64 {
++        const half = self.shape.n / 2;
++        const j: f64 = @floatFromInt(i % half);
++        const p: f64 = @floatFromInt(i / half);
++        return p * (1 / std.math.pow(f64, self.th, 2 * j / @as(f64, @floatFromInt(self.shape.n))));
++    }
++
++    /// The tables: fp64 pow / cos / sin within a few double ulps of the angle; the soft cap's x / cap and tanhf.
++    pub fn bounds(self: *Route, want: []const f64, mag: []const f64, allow: []f64) !void {
++        _ = mag;
++        if (self.kind != .rope) return;
++        const nh = want.len / 2;
++        for (allow, want, 0..) |*l, w, i| l.* = mu.allow(.f32, w, 0x1p-50 * (@abs(self.angle(i % nh)) + 1));
++    }
++
++    pub fn simulate(self: *Route, acc: c.Accum, order: g.Order, out: []f64) !void {
++        if (self.kind != .router) return error.NoSums;
++        return self.d.?.simulate(acc, order, out);
++    }
++
++    /// Expert e's sigmoid and rank score under the stated NaN rule (expert 0 first; a NaN node hides its leaves).
++    fn score(self: *const Route, r: usize, e: usize) [2]f64 {
++        const row = self.x[r * self.shape.n ..][0..self.shape.n];
++        const s = 1 / (1 + @exp(-(row[e] * mult)));
++        const v = s + self.bias[e];
++        if (std.math.isNan(v)) return .{ s, if (e == 0) std.math.inf(f64) else -std.math.inf(f64) };
++        for (row[1..], 1..) |x, j| if (std.math.isNan(x) and j != e) {
++            const span = std.math.ceilPowerOfTwo(usize, j + 1) catch unreachable;
++            if (e % span == j % span) return .{ s, -std.math.inf(f64) };
++        };
++        return .{ s, v };
++    }
++
++    pub fn check(self: *Route, _: g.Gate) !?[]const u8 {
++        return if (self.kind == .topk) self.checkTopk() else self.checkArgmax();
++    }
++
++    fn checkTopk(self: *Route) !?[]const u8 {
++        const a = self.rig.gpu.gpa;
++        const n = self.shape.n;
++        const ids = try a.dupe(u8, try self.rig.bytes(self.dev[2], self.shape.rows * top * 4));
++        defer a.free(ids);
++        const wts = try self.rig.bytes(self.dev[3], self.shape.rows * top * 4);
++        for (0..self.shape.rows) |r| {
++            var taken = std.StaticBitSet(1024).empty;
++            var pick: [top]usize = undefined;
++            var prev: i64 = -1;
++            for (&pick, 0..) |*p, k| {
++                const id = std.mem.readInt(i32, ids[(r * top + k) * 4 ..][0..4], .little);
++                if (id < 0 or id >= n or id <= prev) return try std.fmt.bufPrint(&self.msg, "row {d} pick {d}: expert {d} out of range or out of order", .{ r, k, id });
++                prev = id;
++                p.* = @intCast(id);
++                taken.set(p.*);
++            }
++            var lowest: f64 = std.math.inf(f64);
++            var sum: f64 = 0;
++            for (pick) |p| {
++                lowest = @min(lowest, self.score(r, p)[1]);
++                sum += self.score(r, p)[0];
++            }
++            for (0..n) |e| if (!taken.isSet(e)) {
++                const v = self.score(r, e)[1];
++                const tol = 0x1p-20 * (@abs(lowest) + 1);
++                if (v > lowest + tol) return try std.fmt.bufPrint(&self.msg, "row {d}: expert {d} scores {d:.6} over a pick's {d:.6}", .{ r, e, v, lowest });
++                if (v == lowest) for (pick) |p| if (p > e and self.score(r, p)[1] == v)
++                    return try std.fmt.bufPrint(&self.msg, "row {d}: expert {d} picked over tied expert {d}", .{ r, p, e });
++            };
++            for (pick, 0..) |p, k| {
++                const w: f64 = @as(f32, @bitCast(std.mem.readInt(u32, wts[(r * top + k) * 4 ..][0..4], .little)));
++                const want = self.score(r, p)[0] / (sum + 1e-15);
++                const ok = if (std.math.isFinite(want)) @abs(w - want) <= 0x1p-20 * @abs(want) + 1e-30 else c.classOf(w) == c.classOf(want);
++                if (!ok) return try std.fmt.bufPrint(&self.msg, "row {d} slot {d}: weight {d:.7} where float64 gives {d:.7}", .{ r, k, w, want });
++            }
++        }
++        return null;
++    }
++
++    fn checkArgmax(self: *Route) !?[]const u8 {
++        const got = try self.rig.bytes(self.dev[1], self.shape.rows * 4);
++        const n = self.shape.n;
++        for (0..self.shape.rows) |r| {
++            const row = self.x[r * n ..][0..n];
++            var best: usize = 0;
++            for (row, 0..) |v, i| {
++                const b = row[best];
++                if (std.math.isNan(b)) break;
++                if (std.math.isNan(v) or v > b) best = i;
++            }
++            const id = std.mem.readInt(i32, got[r * 4 ..][0..4], .little);
++            if (id != @as(i32, @intCast(best))) return try std.fmt.bufPrint(&self.msg, "row {d}: column {d} where the rule gives {d}", .{ r, id, best });
++        }
++        return null;
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_select.zig b/zig/tests/cuda/contract_muse_select.zig
+new file mode 100644
+index 00000000..b1b92db2
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_select.zig
+@@ -0,0 +1,472 @@
++//! Muse Spark's DFlash2 ops under the contract (dflash2.cu): dense rows, causal convs, SiLU-mul, top 16, the walk.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const mu = @import("contract_muse_util.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const rows = core.contract.rows;
++const dense = core.contract.dense;
++
++const B = 8; // block_size
++const KT = 2; // conv_kernel_size
++const GS = 16; // conv_group_size
++const TOPK = 16;
++const P = B - 1; // drafted rows a stream
++const V = 512; // the fixture's vocabulary (codebook rows)
++const none_id: i32 = 0x7fffffff;
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++/// A lane's K / 32 products in order, then the warp by halves.
++fn laneChain(s: c.Shape) usize {
++    return (s.k + 31) / 32 + 5;
++}
++
++/// KT products chained, after w = base + dyn (and y = y0 + y1, then the residual's add).
++fn prepDepth(_: c.Shape) usize {
++    return KT + 1;
++}
++
++fn finishDepth(_: c.Shape) usize {
++    return KT + 3;
++}
++
++pub const Kind = enum { dense_f32, dense_f16, conv_prep, conv_finish, silu, topk, walk };
++
++const topk_rule = "a row's top 16 valid columns by value, ties to the lower global id, a NaN never a candidate; missing " ++
++    "places -inf with id 0x7fffffff; values and ids exact";
++const walk_rule = "per stream, each row's 16 best of the ranks' merged lists (valid ids only, ties to the lower id), " ++
++    "scored v + sum_k pcb[prev, k] g[k] scb[c, k]; the first maximum is within fp32's sum bound of float64's first maximum " ++
++    "(a NaN score never displaces candidate 0); no valid candidate repeats the previous token";
++
++pub fn spec(kind: Kind) c.Spec {
++    const dn = &[_]c.Shape{ .{ .rows = 56, .n = 2048, .k = 8192 }, .{ .rows = 7, .n = 256, .k = 8192 } };
++    const conv = &[_]c.Shape{ .{ .rows = 4, .n = 8192, .k = KT }, .{ .rows = 1, .n = 8192, .k = KT } };
++    return switch (kind) {
++        .dense_f32 => .{ .name = "cuda muse dfl_dense (bf16 weights, fp32 out)", .accum = .f32, .depth = laneChain, .out = .f32, .tiles = .{ .{ .size = 8 }, .{ .size = 8 }, .{ .size = 32 } }, .served = dn },
++        .dense_f16 => .{ .name = "cuda muse dfl_dense (bf16 weights, fp16 out)", .accum = .f32, .depth = laneChain, .out = .f16, .tiles = .{ .{ .size = 8 }, .{ .size = 8 }, .{ .size = 32 } }, .served = dn },
++        .conv_prep => .{ .name = "cuda muse dfl_conv_prep (grouped dynamic causal conv in, fp16)", .accum = .f32, .depth = prepDepth, .out = .f16, .tiles = .{ .{}, .{ .size = 256, .step = GS, .min = GS }, .{} }, .served = conv },
++        .conv_finish => .{ .name = "cuda muse dfl_conv_finish (into the residual, in place)", .accum = .f32, .depth = finishDepth, .out = .f32, .in_place = true, .tiles = .{ .{}, .{ .size = 256, .step = GS, .min = GS }, .{} }, .served = conv },
++        .silu => .{ .name = "cuda muse dfl_silu_mul (fp16 interm)", .accum = .none, .depth = noSums, .ops = 8, .out = .f16, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = &.{ .{ .rows = 56, .n = 14336, .k = 1 }, .{ .rows = 7, .n = 14336, .k = 1 } } },
++        .topk => .{ .name = "cuda muse dfl_topk (a rank's top 16 of its head slice)", .accum = .none, .depth = noSums, .out = .raw, .nan = .{ .stated = topk_rule }, .tiles = .{ .{}, .{ .size = 256 }, .{} }, .served = &.{ .{ .rows = 28, .n = 101120, .k = 101120 }, .{ .rows = 7, .n = 101120, .k = 100928 } } },
++        .walk => .{ .name = "cuda muse dfl_walk (the candidate selector, greedy)", .accum = .none, .depth = noSums, .out = .raw, .nan = .{ .stated = walk_rule }, .tiles = .{ .{}, .{}, .{ .size = 32, .step = 32, .min = 32 } }, .served = &.{ .{ .rows = 4, .n = 2, .k = 256 }, .{ .rows = 1, .n = 2, .k = 256 } } },
++    };
++}
++
++pub const Sel = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    f: cuda.Function,
++    arena: std.heap.ArenaAllocator,
++    shape: c.Shape = undefined,
++    d: ?dense.Dense = null,
++    in: [6][]f64 = @splat(&.{}),
++    ids: []i32 = &.{},
++    anchors: []i64 = &.{},
++    dev: [9]u64 = @splat(0),
++    msg: [200]u8 = undefined,
++
++    pub fn deinit(self: *Sel) void {
++        if (self.d) |d| d.deinit();
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt_ref = blk: {
++        var v = g.hooks(Sel);
++        v.check = null;
++        break :blk v;
++    };
++    const vt_rule = g.hooks(Sel);
++
++    pub fn kernel(self: *Sel) g.Kernel {
++        const ruled = self.kind == .topk or self.kind == .walk;
++        return .{ .spec = spec(self.kind), .ctx = self, .vt = if (ruled) &vt_rule else &vt_ref };
++    }
++
++    fn rnd(self: *Sel, rng: std.Random, comptime T: type, n: usize, lo: f64, hi: f64) ![]f64 {
++        const x = try self.arena.allocator().alloc(f64, n);
++        for (x) |*v| v.* = mu.uni(rng, T, lo, hi);
++        return x;
++    }
++
++    fn convRows(self: *const Sel) usize {
++        return self.shape.rows * B;
++    }
++
++    pub fn prepare(self: *Sel, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        if (self.d) |d| d.deinit();
++        self.d = null;
++        self.shape = shape;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const nf = fill == .nonfinite;
++        const st = fill == .stress;
++        const nan = std.math.nan(f64);
++        const inf = std.math.inf(f64);
++        switch (self.kind) {
++            .dense_f32, .dense_f16 => {
++                const d = try dense.Dense.init(ga, shape, 1);
++                self.d = d;
++                d.fillX(fill, seed, 1);
++                for (d.x) |*b| if (@abs(c.fromBf16(b.*)) < 0x1p-14) { // fp16 holds the rest exactly
++                    b.* = 0;
++                };
++                const k = shape.k;
++                for (0..shape.n) |j| for (0..k) |i| {
++                    d.w[j * k + i] = if (!st) mu.uni(rng, u16, -1, 1) else if (i < k / 2) mu.int(rng, 1, 6) else -d.w[j * k + i - k / 2];
++                };
++                if (st and k % 2 == 1) for (0..shape.n) |j| {
++                    d.w[j * k + k - 1] = 0;
++                };
++                const xs = try a.alloc(f64, d.x.len);
++                for (xs, d.x) |*o, b| o.* = c.fromBf16(b);
++                self.dev[0] = try mu.put(&self.rig, ga, f16, xs);
++                self.dev[1] = try mu.put(&self.rig, ga, u16, d.w);
++                self.dev[2] = try self.rig.output(shape.rows * shape.n * (if (self.kind == .dense_f32) @as(usize, 4) else 2));
++            },
++            .conv_prep, .conv_finish => {
++                if (shape.k != KT or shape.n % GS != 0) return false;
++                const R = self.convRows();
++                const D = shape.n;
++                const G = D / GS;
++                self.in[0] = try a.alloc(f64, 2 * KT * D); // base (prep), then base1 (finish)
++                self.in[1] = try a.alloc(f64, R * 2 * KT * G); // dyn
++                for (self.in[0], 0..) |*v, i| v.* = if (st) 512 + @as(f64, @floatFromInt(i / D % KT)) else mu.uni(rng, f32, -1, 1);
++                for (self.in[1], 0..) |*v, i| v.* = if (!st) mu.uni(rng, f16, -0.5, 0.5) else if (i / G % KT == 0) mu.int(rng, 0, 3) else self.in[1][i - G];
++                const h0 = try a.alloc(f64, D);
++                for (h0) |*v| v.* = mu.int(rng, 33, 63);
++                // h (prep, fp16) or y0, y1 (finish, fp32) and res: gate 4's rows alternate sign within a block
++                self.in[2] = if (self.kind == .conv_prep) try self.rnd(rng, f16, R * D, -4, 4) else try self.rnd(rng, f32, R * D, -4, 4);
++                self.in[3] = try self.rnd(rng, f32, R * D, -4, 4);
++                self.in[4] = try self.rnd(rng, f32, R * D, -64, 64);
++                if (st) for (0..R) |r| for (0..D) |i| {
++                    const y = if (r % B % 2 == 0) h0[i] else -h0[i];
++                    self.in[3][r * D + i] = mu.int(rng, -8, 8);
++                    self.in[2][r * D + i] = if (self.kind == .conv_prep) y else y - self.in[3][r * D + i];
++                    self.in[4][r * D + i] = mu.int(rng, -64, 64);
++                };
++                if (nf) {
++                    self.in[2][3] = nan; // rows 0 and 1, column 3
++                    self.in[1][2 * 2 * KT * G + 1] = inf; // row 2's first tap, group 1
++                    self.in[0][(if (self.kind == .conv_prep) 0 else KT * D) + D + 7] = -inf; // the second tap, column 7
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f32, self.in[0]);
++                self.dev[1] = try mu.put(&self.rig, ga, f16, self.in[1]);
++                if (self.kind == .conv_prep) {
++                    self.dev[2] = try mu.put(&self.rig, ga, f16, self.in[2]);
++                    self.dev[3] = try self.rig.output(R * D * 2);
++                } else {
++                    for (2..5) |i| self.dev[i] = try mu.put(&self.rig, ga, f32, self.in[i]);
++                    self.dev[5] = try self.rig.output(R * D * 4);
++                }
++            },
++            .silu => {
++                const n = shape.rows * shape.n;
++                self.in[0] = try self.rnd(rng, f16, n, -8, 8);
++                self.in[1] = try self.rnd(rng, f16, n, -4, 4);
++                if (nf) {
++                    self.in[0][1] = nan;
++                    self.in[0][2] = inf;
++                    self.in[0][3] = -inf; // -inf / (1 + inf): NaN, as float64 gives it
++                    self.in[1][4] = inf;
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f16, self.in[0]);
++                self.dev[1] = try mu.put(&self.rig, ga, f16, self.in[1]);
++                self.dev[2] = try self.rig.output(n * 2);
++            },
++            .topk => {
++                self.in[0] = try a.alloc(f64, shape.rows * shape.n);
++                for (self.in[0]) |*v| v.* = mu.int(rng, -2048, 2048) / 32; // ties
++                if (nf) {
++                    self.in[0][0] = nan;
++                    if (shape.rows > 1) self.in[0][shape.n + 3] = inf;
++                    if (shape.rows > 2) for (self.in[0][2 * shape.n ..][0..shape.n]) |*v| {
++                        v.* = if (rng.boolean()) nan else -inf; // fewer than 16 numbers: -inf ids, then the empty places
++                    };
++                }
++                self.dev[0] = try mu.put(&self.rig, ga, f32, self.in[0]);
++                self.dev[1] = try self.rig.output(shape.rows * 2 * TOPK * 4);
++            },
++            .walk => return self.prepareWalk(fill, rng),
++        }
++        return true;
++    }
++
++    /// recv [ranks][rows][32] (each rank's top 16 values, then ids as bits), gate [rows, R], codebooks [V, R].
++    fn prepareWalk(self: *Sel, fill: g.Fill, rng: std.Random) !bool {
++        const sh = self.shape;
++        if (sh.k % 32 != 0 or sh.k > 1024 or sh.n == 0 or sh.n > 4) return false;
++        const a = self.arena.allocator();
++        const ga = self.rig.gpu.gpa;
++        const n1 = sh.rows * P;
++        const R = sh.k;
++        self.in[0] = try a.alloc(f64, sh.n * n1 * TOPK);
++        self.ids = try a.alloc(i32, sh.n * n1 * TOPK);
++        const span = V / sh.n;
++        for (0..sh.n) |q| for (0..n1) |r| {
++            var top: f64 = mu.int(rng, 0, 64) / 4;
++            for (0..TOPK) |j| {
++                const at = (q * n1 + r) * TOPK + j;
++                self.in[0][at] = top;
++                top -= mu.int(rng, 0, 4) / 8; // descending, some ties
++                self.ids[at] = @intCast(q * span + (r * 37 + j * 11) % span); // each rank's own slice of ids
++            }
++        };
++        self.in[1] = try self.rnd(rng, f16, n1 * R, -1, 1);
++        self.in[2] = try self.rnd(rng, u16, V * R, -1, 1);
++        self.in[3] = try self.rnd(rng, u16, V * R, -1, 1);
++        if (fill == .nonfinite) {
++            self.in[1][5] = std.math.nan(f64); // row 0: every score NaN, candidate 0 kept
++            if (n1 > 1) self.in[0][(sh.n - 1) * n1 * TOPK + TOPK + 3] = std.math.inf(f64); // row 1: one candidate +inf
++            if (n1 > 2) for (0..sh.n) |q| for (0..TOPK) |j| {
++                self.ids[(q * n1 + 2) * TOPK + j] = none_id; // row 2: no candidate
++            };
++        }
++        self.anchors = try a.alloc(i64, sh.rows);
++        for (self.anchors) |*x| x.* = rng.uintLessThan(u32, V);
++        const recv = try a.alloc(f32, sh.n * n1 * 2 * TOPK);
++        for (0..sh.n * n1) |r| for (0..TOPK) |j| {
++            recv[r * 2 * TOPK + j] = @floatCast(self.in[0][r * TOPK + j]);
++            recv[r * 2 * TOPK + TOPK + j] = @bitCast(self.ids[r * TOPK + j]);
++        };
++        self.dev[0] = try mu.ints(&self.rig, f32, recv);
++        self.dev[1] = try mu.put(&self.rig, ga, f16, self.in[1]);
++        self.dev[2] = try mu.put(&self.rig, ga, u16, self.in[2]);
++        self.dev[3] = try mu.put(&self.rig, ga, u16, self.in[3]);
++        self.dev[4] = try mu.ints(&self.rig, i64, self.anchors);
++        self.dev[5] = try self.rig.output(n1 * 4);
++        return true;
++    }
++
++    /// dflash2.zig's launches.
++    pub fn run(self: *Sel) !void {
++        const s = self.rig.s;
++        const sh = self.shape;
++        const d = self.dev;
++        var a: cuda.Args = .{};
++        var grid: [2]u32 = .{ @intCast(sh.rows), 1 };
++        var block: u32 = 256;
++        switch (self.kind) {
++            .dense_f32, .dense_f16 => {
++                inline for (.{ d[0], d[1] }) |p| a.add(p);
++                a.add(@as(c_int, 1));
++                a.add(d[2]);
++                a.add(@as(c_int, @intFromBool(self.kind == .dense_f32)));
++                inline for (.{ sh.rows, sh.k, sh.n }) |v| a.add(@as(c_int, @intCast(v)));
++                grid = .{ @intCast((sh.n + 7) / 8), @intCast((sh.rows + 7) / 8) };
++            },
++            .conv_prep => {
++                inline for (.{ d[2], d[1], d[0], d[3] }) |p| a.add(p);
++                inline for (.{ B, sh.n, KT, GS }) |v| a.add(@as(c_int, @intCast(v)));
++                grid[0] = @intCast(self.convRows());
++            },
++            .conv_finish => {
++                try mu.copy(&self.rig, d[5], d[4], self.convRows() * sh.n * 4);
++                inline for (.{ d[5], d[2], d[3], d[1], d[0] + KT * sh.n * 4 }) |p| a.add(p);
++                inline for (.{ B, sh.n, KT, GS }) |v| a.add(@as(c_int, @intCast(v)));
++                grid[0] = @intCast(self.convRows());
++            },
++            .silu => {
++                const n = sh.rows * sh.n;
++                inline for (.{ d[0], d[1], d[2] }) |p| a.add(p);
++                a.add(@as(i64, @intCast(n)));
++                grid[0] = @intCast(@min((n + 255) / 256, 4096));
++            },
++            .topk => {
++                a.add(d[0]);
++                const lo: usize = if (sh.k < sh.n) sh.n else 0; // rank 1's slice: its global ids from lo
++                inline for (.{ sh.n, @min(sh.k, sh.n), lo }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(d[1]);
++            },
++            .walk => {
++                a.add(d[0]);
++                inline for (.{ sh.n, sh.rows * P }) |v| a.add(@as(c_int, @intCast(v)));
++                a.add(d[1]);
++                a.add(@as(c_int, @intCast(sh.k)));
++                inline for (.{ d[2], d[3] }) |p| a.add(p);
++                a.add(@as(c_int, 1));
++                a.add(d[4]);
++                a.add(@as(c_int, P));
++                a.add(d[5]);
++                block = 512;
++            },
++        }
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = grid[0], .y = grid[1], .z = 1 }, .block = .{ .x = block } }, s, &a);
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Sel) usize {
++        const sh = self.shape;
++        return switch (self.kind) {
++            .dense_f32, .dense_f16, .silu => sh.rows * sh.n,
++            .conv_prep, .conv_finish => self.convRows() * sh.n,
++            .topk => sh.rows * 2 * TOPK * 4,
++            .walk => sh.rows * P * 4,
++        };
++    }
++
++    pub fn reference(self: *Sel, want: []f64, mag: []f64) !void {
++        switch (self.kind) {
++            .dense_f32, .dense_f16 => return self.d.?.reference(want, mag),
++            .conv_prep, .conv_finish => return self.conv(.none, .sequential, want, mag),
++            .silu => for (want, mag, self.in[0], self.in[1]) |*w, *m, x, uu| {
++                w.* = x / (1 + @exp(-x)) * uu;
++                m.* = 0;
++            },
++            .topk, .walk => return error.StatedRule, // gates 1 and 3 run check; no sums for gate 4
++        }
++    }
++
++    pub fn simulate(self: *Sel, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return switch (self.kind) {
++            .dense_f32, .dense_f16 => self.d.?.simulate(acc, order, out),
++            .conv_prep, .conv_finish => self.conv(acc, order, out, null),
++            else => error.NoSums,
++        };
++    }
++
++    /// Each output's KT terms (and the residual, finish) summed in `acc`; their magnitude into mag.
++    fn conv(self: *Sel, acc: c.Accum, order: g.Order, out: []f64, mag: ?[]f64) !void {
++        const D = self.shape.n;
++        const G = D / GS;
++        const fin = self.kind == .conv_finish;
++        const base = self.in[0][if (fin) KT * D else 0..];
++        var t: [KT + 1]f64 = undefined;
++        for (0..self.convRows()) |r| for (0..D) |col| {
++            const b = r % B;
++            var n: usize = 0;
++            for (0..@min(KT, b + 1)) |tt| {
++                const w = base[tt * D + col] + self.in[1][r * 2 * KT * G + (if (fin) KT * G else 0) + tt * G + col / GS];
++                const at = (r - tt) * D + col;
++                const y = if (fin) self.in[2][at] + self.in[3][at] else self.in[2][at];
++                t[n] = w * y;
++                n += 1;
++            }
++            const at = r * D + col;
++            var s = if (acc == .none) blk: {
++                var x: f64 = 0;
++                for (t[0..n]) |v| x += v;
++                break :blk x;
++            } else rows.sumIn(acc, order, t[0..n]);
++            var m: f64 = 0;
++            for (t[0..n]) |v| m += @abs(v);
++            if (fin) {
++                s += self.in[4][at];
++                m += @abs(self.in[4][at]);
++            }
++            out[at] = s;
++            if (mag) |x| x[at] = m;
++        };
++    }
++
++    pub fn check(self: *Sel, _: g.Gate) !?[]const u8 {
++        return if (self.kind == .topk) self.checkTopk() else self.checkWalk();
++    }
++
++    fn beats(va: f64, ia: i64, vb: f64, ib: i64) bool {
++        return va > vb or (va == vb and ia < ib);
++    }
++
++    fn checkTopk(self: *Sel) !?[]const u8 {
++        const sh = self.shape;
++        const got = try self.rig.bytes(self.dev[1], sh.rows * 2 * TOPK * 4);
++        const lo: i64 = if (sh.k < sh.n) @intCast(sh.n) else 0;
++        for (0..sh.rows) |r| {
++            var v: [TOPK]f64 = @splat(-std.math.inf(f64));
++            var id: [TOPK]i64 = @splat(none_id);
++            for (self.in[0][r * sh.n ..][0..@min(sh.k, sh.n)], 0..) |x, col| {
++                const gid = lo + @as(i64, @intCast(col));
++                if (std.math.isNan(x) or !beats(x, gid, v[TOPK - 1], id[TOPK - 1])) continue;
++                var k: usize = TOPK - 1;
++                while (k > 0 and beats(x, gid, v[k - 1], id[k - 1])) : (k -= 1) {
++                    v[k] = v[k - 1];
++                    id[k] = id[k - 1];
++                }
++                v[k] = x;
++                id[k] = gid;
++            }
++            for (0..TOPK) |k| {
++                const gv: f64 = @as(f32, @bitCast(std.mem.readInt(u32, got[(r * 2 * TOPK + k) * 4 ..][0..4], .little)));
++                const gi = std.mem.readInt(i32, got[(r * 2 * TOPK + TOPK + k) * 4 ..][0..4], .little);
++                if (gv != v[k] or gi != id[k]) return try std.fmt.bufPrint(&self.msg, "row {d} place {d}: ({d}, {d}) where the rule gives ({d}, {d})", .{ r, k, gv, gi, v[k], id[k] });
++            }
++        }
++        return null;
++    }
++
++    fn checkWalk(self: *Sel) !?[]const u8 {
++        const sh = self.shape;
++        const n1 = sh.rows * P;
++        const R = sh.k;
++        const got = try self.rig.bytes(self.dev[5], n1 * 4);
++        for (0..sh.rows) |s| {
++            var pred: i64 = self.anchors[s];
++            for (0..P) |i| {
++                const row = s * P + i;
++                var cv: [TOPK]f64 = undefined;
++                var cid: [TOPK]i64 = @splat(-1);
++                var used = std.StaticBitSet(64).empty;
++                for (0..TOPK) |k| {
++                    var best: ?usize = null;
++                    for (0..sh.n * TOPK) |j| {
++                        const at = ((j / TOPK) * n1 + row) * TOPK + j % TOPK;
++                        const id = self.ids[at];
++                        if (used.isSet(j) or id < 0 or id == none_id) continue;
++                        if (best == null) best = j else {
++                            const bt = ((best.? / TOPK) * n1 + row) * TOPK + best.? % TOPK;
++                            if (beats(self.in[0][at], id, self.in[0][bt], self.ids[bt])) best = j;
++                        }
++                    }
++                    cv[k] = -std.math.inf(f64);
++                    if (best) |j| {
++                        const at = ((j / TOPK) * n1 + row) * TOPK + j % TOPK;
++                        used.set(j);
++                        cv[k] = self.in[0][at];
++                        cid[k] = self.ids[at];
++                    }
++                }
++                var sc: [TOPK]f64 = undefined;
++                var tol: [TOPK]f64 = undefined;
++                for (0..TOPK) |k| {
++                    sc[k] = -std.math.inf(f64);
++                    tol[k] = 0;
++                    if (cid[k] < 0) continue;
++                    var acc: f64 = 0;
++                    var mag: f64 = 0;
++                    for (0..R) |j| {
++                        const t = self.in[2][@as(usize, @intCast(pred)) * R + j] * self.in[1][row * R + j] * self.in[3][@as(usize, @intCast(cid[k])) * R + j];
++                        acc += t;
++                        mag += @abs(t);
++                    }
++                    sc[k] = cv[k] + acc;
++                    tol[k] = mu.gamma(@floatFromInt(R / 32 + 8)) * mag + mu.u * @abs(cv[k]);
++                }
++                var best: usize = 0;
++                for (1..TOPK) |k| if (sc[k] > sc[best]) {
++                    best = k;
++                };
++                const out: i64 = std.mem.readInt(i32, got[row * 4 ..][0..4], .little);
++                const want = if (cid[best] >= 0) cid[best] else pred;
++                if (out != want) {
++                    const k = for (0..TOPK) |x| {
++                        if (cid[x] == out) break x;
++                    } else return try std.fmt.bufPrint(&self.msg, "stream {d} row {d}: {d} is no candidate (rule: {d})", .{ s, i, out, want });
++                    if (!(sc[k] >= sc[best] - tol[k] - tol[best])) return try std.fmt.bufPrint(&self.msg, "stream {d} row {d}: {d} scores {d:.6} under the best {d:.6}", .{ s, i, out, sc[k], sc[best] });
++                }
++                pred = out;
++            }
++        }
++        return null;
++    }
++};
+diff --git a/zig/tests/cuda/contract_muse_util.zig b/zig/tests/cuda/contract_muse_util.zig
+new file mode 100644
+index 00000000..ee8e367f
+--- /dev/null
++++ b/zig/tests/cuda/contract_muse_util.zig
+@@ -0,0 +1,83 @@
++//! Shared pieces of Muse Spark's contract tests: host values in the kernels' types, uploads, derived allowances.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++
++const c = core.contract.spec;
++
++/// fp32's unit roundoff, and the relative error of rsqrtf, expf and tanhf (2 ulps).
++pub const u = 0x1p-24;
++pub const fast = 0x1p-22;
++
++pub fn gamma(d: f64) f64 {
++    return c.gamma(d, u);
++}
++
++pub fn h16(v: f64) f64 {
++    return @as(f16, @floatCast(v));
++}
++
++pub fn f32r(v: f64) f64 {
++    return @as(f32, @floatCast(v));
++}
++
++pub fn bf16r(v: f64) f64 {
++    return c.fromBf16(c.toBf16(@floatCast(v)));
++}
++
++/// The allowance of an output stored as `e` whose value before the store is within `err` of `want`.
++pub fn allow(e: c.Elem, want: f64, err: f64) f64 {
++    const unit: f64, const floor: f64 = switch (e) {
++        .f32 => .{ 0x1p-24, 0x1p-149 },
++        .f16 => .{ 0x1p-11, 0x1p-24 },
++        .bf16 => .{ 0x1p-8, 0x1p-133 },
++        .raw => .{ 0, 0 },
++    };
++    return err + unit * (@abs(want) + err) + floor;
++}
++
++/// Uploads values as the kernel reads them (each must be exact in that type).
++pub fn put(rig: *rig_.Rig, a: std.mem.Allocator, comptime T: type, vals: []const f64) !u64 {
++    const buf = try a.alloc(T, vals.len);
++    defer a.free(buf);
++    for (buf, vals) |*o, v| o.* = switch (T) {
++        u16 => c.toBf16(@floatCast(v)),
++        i32, i64 => @intFromFloat(v),
++        else => @floatCast(v),
++    };
++    return rig.input(std.mem.sliceAsBytes(buf));
++}
++
++pub fn ints(rig: *rig_.Rig, comptime T: type, vals: []const T) !u64 {
++    return rig.input(std.mem.sliceAsBytes(vals));
++}
++
++/// Copies `len` bytes between device buffers on the rig's stream (a kernel's in-place state, set before a run).
++pub fn copy(rig: *rig_.Rig, dst: u64, src: u64, len: usize) !void {
++    const b: cuda.DeviceBuffer = .{ .d = rig.gpu.d, .ptr = dst, .len = len };
++    try b.copyFrom(0, src, len, rig.s.handle);
++}
++
++/// Integers in [lo, hi] as f64 (gate 4's terms).
++pub fn int(rng: std.Random, lo: i32, hi: i32) f64 {
++    return @floatFromInt(rng.intRangeAtMost(i32, lo, hi));
++}
++
++/// Uniform in [lo, hi) rounded to T's values.
++pub fn uni(rng: std.Random, comptime T: type, lo: f64, hi: f64) f64 {
++    const v = lo + (hi - lo) * rng.float(f64);
++    return switch (T) {
++        f16 => h16(v),
++        u16 => bf16r(v),
++        else => f32r(v),
++    };
++}
++
++/// The outputs equal another launch's bytes (a replacement's gates 1 and 3); at gate 1 some must be non-finite.
++pub fn sameBytes(msg: []u8, got: []const u8, want: []const u8, what: []const u8, e: c.Elem, at: core.contract.gates.Gate) !?[]const u8 {
++    if (std.mem.indexOfDiff(u8, got, want)) |i| return try std.fmt.bufPrint(msg, "byte {d} of {d} differs from {s}'s", .{ i, got.len, what });
++    if (at != .nonfinite) return null;
++    for (0..got.len / c.size(e)) |i| if (c.classOf(c.read(e, got, i)) != .finite) return null;
++    return try std.fmt.bufPrint(msg, "no output is non-finite: the planted values prove nothing", .{});
++}
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index 4f487d24..715b263d 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -34,9 +34,7 @@ const latent_k = @import("contract_latent.zig");
+ const vit_k = @import("contract_vit_glue.zig");
+ const act_round_k = @import("contract_act_round.zig");
+ const f32w_k = @import("contract_glm_f32w.zig");
+-
+ const w4a8_k = @import("contract_w4a8.zig");
+-
+ const round_k = @import("contract_tree_round.zig");
+ 
+ const act_k = @import("contract_act.zig");
+@@ -367,6 +365,8 @@ pub fn run(gpu: check.Gpu) !void {
+     defer gemma_ops.deinit();
+     try gemma_ops.init(gpu, s, &act_rows, &vit, &round_fns, mods[5]);
+     try gemma_ops.append(a, &kernels);
++    const muse = try @import("contract_muse.zig").Group.create(a, gpu, s, &kernels);
++    defer muse.destroy(a);
+     var vit_g4 = try vit_g4_group.Group.init(gpu, s, &vit, mods[5]);
+     defer vit_g4.deinit();
+     try vit_g4.append(a, &kernels);
+-- 
+2.53.0
+

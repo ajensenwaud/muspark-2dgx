@@ -14,14 +14,15 @@ Muspark is built on other people's work. Thank you to:
   (`scripts/quantise_drafter.sh`).
 - **TensorFold** ([ashhart/TensorFold](https://github.com/ashhart/TensorFold), Apache-2.0) by Ash Hart
   ([@ashxhart](https://x.com/ashxhart)) and its contributors. The engine, its native server, lanes scheduler, kernels
-  and tooling are TensorFold's; Muspark is a set of patches on top of release v1.0.11 (`patches-zig/`).
-- **Jay Leaton** ([@jayleaton](https://github.com/jayleaton)). Patches 0001-0002 and 0004-0034 in `patches-zig/` are
-  his commits (cherry-picked with `-x`): the keyed CUDA graph cache and device arena, tensor parallelism across CUDA
-  processes, the one-shot RoCE exchange between the Sparks, the server's stop and drain handling and the family hooks.
-  The Muse port follows the method of his DeepSeek-V4.1 port to the Zig engine.
-- **Jonathan Regan-Beasley** ([@jregan-beasley-smc](https://github.com/jregan-beasley-smc)), author of patch 0003
-  (the RDMA VMM capability fix).
-- **b12x "RoCEnante"** (Apache-2.0): the RoCE all-gather in the patches adapts its protocol.
+  and tooling are TensorFold's; Muspark is a set of patches on top of TensorFold main at commit `40c6406b`
+  (`patches-zig/`). Muspark v1.0 patched release v1.0.11.
+- **Jay Leaton** ([@jayleaton](https://github.com/jayleaton)) for the keyed CUDA graph cache and device arena, tensor
+  parallelism across CUDA processes, the one-shot RoCE exchange between the Sparks, the server's stop and drain
+  handling and the family hooks: Muspark v1.0 carried them as patches 0001-0002 and 0004-0034; they are now part of
+  TensorFold. The Muse port follows the method of his DeepSeek-V4.1 port to the Zig engine.
+- **Jonathan Regan-Beasley** ([@jregan-beasley-smc](https://github.com/jregan-beasley-smc)), author of the RDMA VMM
+  capability fix (v1.0's patch 0003, now in TensorFold).
+- **b12x "RoCEnante"** (Apache-2.0): the RoCE all-gather between the Sparks adapts its protocol.
 - **turboderp** for [exllamav3](https://github.com/turboderp-org/exllamav3) (MIT): the EXL3 format, the quantiser
   (with `patches-exl3/` adding the `muse_spark` architecture), the sensitivity tools `sc_measure` / `sc_optimize` that
   set the per-tensor bit rates, and the reference forward and perplexity method the engine is checked against.

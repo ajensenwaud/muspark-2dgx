@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time setup on the head (rank 0), idempotent: everything except the model pack (scripts/fetch_pack.sh).
 #   1. the CUDA base image (pulled once if it is not here) and the Zig build image, both copied to the worker
-#   2. the engine: TensorFold ZIG_TF_TAG + patches-zig/, tree checked against ZIG_TREE, built in a container,
+#   2. the engine: TensorFold ZIG_TF_COMMIT + patches-zig/, tree checked against ZIG_TREE, built in a container,
 #      zig-out/ copied to the worker (scripts/zig_prepare.sh)
 #   3. the DFlash2 drafter: RadixArk's bf16 original fetched at DRAFTER_REV, quantised to EXL3 4.0 bpw on this node's
 #      GPU (a few minutes; needs the exllamav3 image, scripts/build-image.sh, ~30-60 min the first time), copied to

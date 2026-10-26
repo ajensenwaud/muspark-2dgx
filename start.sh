@@ -2,24 +2,24 @@
 # Start Muse Spark Open on TensorFold's Zig engine across both Sparks: rank 1 (`tf-muse follow`) on the worker, then
 # the OpenAI-compatible server here (rank 0) on :$PORT. The pack ($MODEL_DIR) and the build ($ZIG_DIR/zig-out, from
 # scripts/prepare.sh) sit at the same paths on both nodes. Waits for /health, then sends one warm-up request.
-#   ./start.sh                  PROFILE=long: 1 slot, the longest context that fits (~905K tokens)
-#   PROFILE=multi ./start.sh    4 slots x 196,608 tokens
+#   ./start.sh                  PROFILE=long: 1 slot, the longest context that fits (~450K-470K tokens)
+#   PROFILE=multi ./start.sh    4 slots, the longest context each that fits (~110K tokens)
 #   ./start.sh restart          ./stop.sh first (saves both ranks' logs), then start
-# Both profiles serve the DFlash2 drafter (DRAFTER=0: off), the 8-bit KV cache (KV8=0: fp16) and the prompt cache
-# (PROMPT_CACHE=0: off); ZIG_CONTEXT= / PARALLEL= override a profile's numbers (scripts/config.sh).
-# Engine levers for both ranks: ZIG_LEVERS (scripts/config.sh; ZIG_LEVERS=" " for none); extra environment:
-# ZIG_ENV="-e TF_MUSE_DEPTH=geometric ..."; another build: ZIG_BIN=dir.
+# Both profiles serve the DFlash2 drafter (DRAFTER=0: off) and the prompt cache (PROMPT_CACHE=0: off) with an fp16 KV
+# cache; ZIG_CONTEXT= / PARALLEL= override a profile's numbers (scripts/config.sh).
+# Environment for both ranks: ZIG_LEVERS (scripts/config.sh; ZIG_LEVERS=" " for none) and ZIG_ENV="-e NAME=value ...";
+# another build: ZIG_BIN=dir.
 set -euo pipefail
 cd "$(dirname "$0")"
 source scripts/config.sh
 need_hosts HEAD WORKER MASTER
 
 [[ "${1:-}" == restart ]] && ./stop.sh
-release_env=""
-[[ "$KV8" == 1 ]] && release_env+=" -e TF_MUSE_KV8=1"
-[[ "$PROMPT_CACHE" == 1 ]] && release_env+=" -e TF_MUSE_PROMPT_CACHE=1 -e TF_MUSE_PROMPT_CACHE_GIB=$PROMPT_CACHE_GIB"
-ZIG_ENV="$release_env ${ZIG_ENV:-}"
-log "profile $PROFILE: $PARALLEL slot(s) x $ZIG_CONTEXT tokens asked, KV $([[ "$KV8" == 1 ]] && echo int8 || echo fp16), prompt cache $([[ "$PROMPT_CACHE" == 1 ]] && echo on || echo off), drafter $([[ "$DRAFTER" == 1 ]] && echo on || echo off)"
+# the prompt cache is on by default in the engine (1 GiB a rank); a serve flag sets another budget or 0 = off
+pc_arg=""
+if [[ "$PROMPT_CACHE" != 1 ]]; then pc_arg="--prompt-cache-gib 0"
+elif [[ -n "$PROMPT_CACHE_GIB" ]]; then pc_arg="--prompt-cache-gib $PROMPT_CACHE_GIB"; fi
+log "profile $PROFILE: $PARALLEL slot(s) x $ZIG_CONTEXT tokens asked, KV fp16, prompt cache $([[ "$PROMPT_CACHE" == 1 ]] && echo "on${PROMPT_CACHE_GIB:+ ($PROMPT_CACHE_GIB GiB)}" || echo off), drafter $([[ "$DRAFTER" == 1 ]] && echo on || echo off)"
 BIN="${ZIG_BIN:-$ZIG_DIR/zig-out}"
 [[ -x "$BIN/native/bin/tensorfold-native" && -x "$BIN/bin/tf-muse" ]] || die "no Zig build in $BIN: scripts/prepare.sh"
 [[ -f "$MODEL_DIR/config.json" ]] || die "no pack at $MODEL_DIR"
@@ -32,11 +32,11 @@ for n in "" "$WORKER"; do   # another GPU job (a conversion, a test) holds a nod
   [[ -z "$lock" || "$lock" == "G6 queue"* ]] || die "GPU lock on ${n:-$HEAD}: $lock"
 done
 
-draft_env=""; draft_arg="--no-drafts"
+draft_env=""; draft_arg="--no-drafts"; follow_drafter=""
 if [[ "$DRAFTER" == 1 ]]; then
   [[ -f "$DRAFTER_DIR/config.json" ]] || die "DRAFTER=1 but no drafter pack at $DRAFTER_DIR (scripts/quantise_drafter.sh)"
   ssh "$WORKER" "test -f '$DRAFTER_DIR/config.json'" </dev/null || die "the worker lacks the drafter pack at $DRAFTER_DIR"
-  draft_env="-e TF_MUSE_DRAFTER=/drafter -v $DRAFTER_DIR:/drafter:ro"; draft_arg=""
+  draft_env="-v $DRAFTER_DIR:/drafter:ro"; draft_arg="--drafter /drafter"; follow_drafter=/drafter
 fi
 
 # Memory check before anything loads (unified memory: an oversized KV allocation does not fail, it takes the host
@@ -44,14 +44,11 @@ fi
 # against both nodes' MemAvailable now and refuses when a rank would keep under MEM_MIN_FREE_GIB. CONTEXT_AUTO=1
 # serves the largest context that fits instead; MEM_CHECK=0 skips the check (the in-run guard below still runs).
 if [[ "${MEM_CHECK:-1}" == 1 ]]; then
-  env_all="$ZIG_LEVERS ${ZIG_ENV:-}"
-  kv8=0; [[ "$env_all" =~ TF_MUSE_KV8=[12] ]] && kv8=1
-  eh=0; [[ "$env_all" =~ TF_MUSE_EMBED_HOST=1 ]] && eh=1
   ha=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
   wa=$(ssh "$WORKER" "awk '/MemAvailable/ {print int(\$2/1024)}' /proc/meminfo" </dev/null) || die "the worker did not report MemAvailable"
   rc=0
   est=$(/usr/bin/python3 tools/mem/estimate.py "$MODEL_DIR" $([[ "$DRAFTER" == 1 ]] && echo "--drafter $DRAFTER_DIR") \
-        --context "$ZIG_CONTEXT" --slots "$PARALLEL" --kv8 "$kv8" --embed-host "$eh" --avail-mib "$ha" "$wa" \
+        --context "$ZIG_CONTEXT" --slots "$PARALLEL" --avail-mib "$ha" "$wa" \
         --min-free-gib "$MEM_MIN_FREE_GIB" --fixed-gib "$MEM_FIXED_GIB") || rc=$?
   log "$(head -1 <<< "$est")"
   if (( rc != 0 )); then
@@ -79,7 +76,7 @@ zig_args() {   # RANK: docker run arguments for one rank
 mkdir -p logs
 log "rank 1 on $WORKER ($PACK_NAME, drafter $([[ "$DRAFTER" == 1 ]] && basename "$DRAFTER_DIR" || echo off))"
 ssh "$WORKER" "docker rm -f $ZIG_CONTAINER-follow >/dev/null 2>&1;
-  docker run -d --name $ZIG_CONTAINER-follow $(zig_args 1) --entrypoint /zig/bin/tf-muse $ZIG_RUN_IMAGE follow /model >/dev/null" </dev/null
+  docker run -d --name $ZIG_CONTAINER-follow $(zig_args 1) --entrypoint /zig/bin/tf-muse $ZIG_RUN_IMAGE follow /model $follow_drafter >/dev/null" </dev/null
 # In-run memory guard on each node (tools/mem/mem_guard.sh): under GUARD_MIB MemAvailable on either node, or the
 # worker silent, both ranks are removed so neither host goes out of memory; it ends itself when the serve stops.
 # GUARD=0 runs without it (never for a context that has not served before).
@@ -91,19 +88,20 @@ docker rm -f "$ZIG_CONTAINER" >/dev/null 2>&1 || true
 # shellcheck disable=SC2046,SC2086
 docker run -d --name "$ZIG_CONTAINER" $(zig_args 0) --entrypoint /zig/native/bin/tensorfold-native "$ZIG_RUN_IMAGE" \
   serve /model --host "$HOST" --port "$PORT" --name "$SERVED_NAME" --parallel "$PARALLEL" --context "$ZIG_CONTEXT" \
-  --max-tokens "$MAX_TOKENS" $SAMPLING_ARGS $draft_arg >/dev/null
+  --max-tokens "$MAX_TOKENS" $SAMPLING_ARGS $draft_arg $pc_arg >/dev/null
 if [[ "${GUARD:-1}" == 1 ]]; then
   GUARD_MIB=$GUARD_MIB GUARD_DIR=$WORK_ROOT setsid nohup tools/mem/mem_guard.sh "$ZIG_CONTAINER" "$WORKER" "$ZIG_CONTAINER-follow" \
     >/dev/null 2>&1 </dev/null &
 fi
 { echo "# $(date -Is) PROFILE=$PROFILE ./start.sh"; echo "pack $MODEL_DIR"; echo "build $BIN ($(cat "$BIN/SHA256SUMS" 2>/dev/null | grep native | cut -c1-16))"
   echo "drafter $([[ "$DRAFTER" == 1 ]] && echo "$DRAFTER_DIR" || echo off)"; echo "levers $ZIG_LEVERS ${ZIG_ENV:-}"; echo "rank0 $(zig_args 0)"
-  echo "serve --parallel $PARALLEL --context $ZIG_CONTEXT --max-tokens $MAX_TOKENS $SAMPLING_ARGS $draft_arg"; } > logs/serve-config.txt
+  echo "serve --parallel $PARALLEL --context $ZIG_CONTEXT --max-tokens $MAX_TOKENS $SAMPLING_ARGS $draft_arg $pc_arg"; } > logs/serve-config.txt
 
 log "loading (a few minutes): docker logs -f $ZIG_CONTAINER"
 for i in $(seq 1 240); do
   if curl -fsS -m 3 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; then
     log "up after $((i * 5)) s; warm-up request"
+    log "engine: $(docker logs "$ZIG_CONTAINER" 2>&1 | grep -m1 'CUDA sm_' | sed 's/^\[tensorfold\] //' | cut -c1-300)"
     t0=$(date +%s.%N)
     out=$(curl -fsS -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
       -d "{\"model\": \"$SERVED_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"Say hello in five words.\"}],

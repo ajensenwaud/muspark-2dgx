@@ -1,5 +1,5 @@
 # Build image for the Muse Zig engine: the pinned TensorFold CUDA base (nvcc 13.3, ptxas 13.3, Triton 3.7.1,
-# PyTorch 2.13) plus Zig 0.17.0, the version TensorFold v1.0.11 pins in .zig-version. Same recipe as the MiMo
+# PyTorch 2.13) plus Zig 0.17.0, the version TensorFold pins in .zig-version. Same recipe as the MiMo
 # project's mimo-zig-build image. Container only: nothing is installed on the hosts.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
